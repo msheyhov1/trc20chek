@@ -100,6 +100,8 @@ curl http://localhost:8000/check/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 - `railway.json` задаёт healthcheck `/health` и restart policy
 - **Обязательно добавить volume на `/data`** иначе SQLite-кеш умрёт при каждом деплое
 - `PORT` Railway передаёт сам — в Dockerfile `CMD` использует `${PORT:-8000}`
+- **НЕ задавать `startCommand` в `railway.json`** — Railway запускает его без шелла, и `$PORT` не разворачивается (uvicorn падает `Invalid value for '--port': '$PORT'`). Команду берём из `Dockerfile` `CMD` (shell-форма, `${PORT:-8000}` разворачивается)
+- **`TRONSCAN_API_KEY` теперь де-факто обязателен**: без ключа эндпоинт `/api/accountv2` отдаёт `401 Unauthorized`, метки бирж/контрактов не приходят, и всё определяется как `unknown`. Ключ берётся бесплатно на tronscan.org → My Account → API Keys. GoPlus при этом работает без ключа (отдаёт только риск-флаги, не метки сущностей)
 
 ## Что НЕ делать
 
