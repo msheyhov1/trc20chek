@@ -66,12 +66,13 @@ async def test_exchange_detection():
 @pytest.mark.asyncio
 async def test_contract_detection():
     """Контракт USDT"""
+    # Реальная структура ответа TronScan accountv2 для контракта:
+    # accountType == 2, адрес присутствует ключом в contractMap, имя в name.
     ts_resp = {
         "address": VALID_ADDR,
         "name": "Tether USD",
-        "tag1": "USDT Token",
-        "publicTag": "USDT Token",
-        "accountType": 1,
+        "contractMap": {VALID_ADDR: True},
+        "accountType": 2,
         "vip": True,
     }
     with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \

@@ -90,7 +90,10 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
         return
 
     # 3. Контракт
-    if data.get("accountType") == 1 or data.get("isContract"):
+    # TronScan accountv2: контракт = accountType == 2, а сам адрес присутствует
+    # ключом в contractMap со значением true. Поля isContract в ответе нет.
+    contract_map = data.get("contractMap") or {}
+    if data.get("accountType") == 2 or verdict.address in contract_map:
         verdict.entity_type = EntityType.CONTRACT
         verdict.entity = data.get("name") or data.get("tag1") or "Smart contract"
         verdict.risk_level = RiskLevel.SAFE if data.get("vip") else RiskLevel.CAUTION

@@ -87,6 +87,20 @@ curl http://localhost:8000/check/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 
 `core/aggregator.py` → словарь `EXCHANGE_KEYWORDS`. Ключ — подстрока в `publicTag` от TronScan в нижнем регистре, значение — каноническое имя для UI.
 
+## Реальная структура ответа TronScan `accountv2` (важно для `_apply_tronscan`)
+
+Проверено на живом API (нужен `TRONSCAN_API_KEY`):
+
+| Тип адреса | `accountType` | Как распознать | Где имя |
+|---|---|---|---|
+| Контракт | `2` | сам адрес присутствует ключом в `contractMap` со значением `true` | `name` (напр. `"TetherToken"`) |
+| Биржа / размеченный | `0` | `publicTag` / `addressTag` (напр. `"Binance-Hot 4"`, `"HTX 1"`) | `publicTag` |
+| Неразмеченный (в т.ч. депозитники бирж) | `0` | тегов нет (`publicTag: null`) | — → `unknown` |
+
+- **Поля `isContract` в ответе НЕТ** — не полагаться на него (была причина бага: контракты не определялись).
+- `publicTag`/`addressTag` могут приходить как `null`, а не `""` — фильтровать через `if v`.
+- Депозитные адреса бирж индивидуальны и **не размечены** — корректный ответ `unknown`, не баг.
+
 ## Известные ограничения
 
 - **Нельзя определить клиентский кошелёк** (TronLink, Trust Wallet и т.д.) — это софт, а не on-chain сущность
