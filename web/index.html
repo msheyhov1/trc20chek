@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TRC20 Address Checker</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>TRC20 Checker</h1>
+    <p class="subtitle">Проверка принадлежности TRON-адреса</p>
+
+    <form id="form">
+      <input
+        id="addr"
+        type="text"
+        placeholder="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+        autocomplete="off"
+        spellcheck="false"
+        required
+      />
+      <button type="submit" id="submitBtn">Проверить</button>
+    </form>
+
+    <div id="result" class="result hidden"></div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
