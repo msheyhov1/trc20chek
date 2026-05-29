@@ -46,6 +46,14 @@ EMPTY_GP = {"code": 1, "result": {
 }}
 
 
+@pytest.fixture(autouse=True)
+def _no_flow_by_default():
+    """flow-провайдер по умолчанию возвращает пусто — тесты не ходят в сеть.
+    Тесту про flow достаточно переопределить этот патч своим внутри `with`."""
+    with patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_exchange_detection():
     """Биржевой кошелёк с publicTag='Binance-Hot'"""
@@ -130,3 +138,44 @@ async def test_invalid_address_short_circuit():
     assert "Invalid" in (v.entity or "")
     ts_mock.assert_not_called()
     gp_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_flow_exchange_links():
+    """Адрес без прямой метки, но по переводам видно связь с биржами."""
+    addr = VALID_ADDR
+    transfers = [
+        {"from_address": addr, "to_address": "Ta",
+         "to_address_tag": {"to_address_tag": "Bybit"}},
+        {"from_address": addr, "to_address": "Tb",
+         "to_address_tag": {"to_address_tag": "Bybit"}},
+        {"from_address": "Tc", "to_address": addr,
+         "from_address_tag": {"from_address_tag": "Bitget 9"}},
+        {"from_address": addr, "to_address": "Td",
+         "to_address_tag": {"to_address_tag": ""}},  # контрагент без метки — игнор
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.WALLET
+    assert "Bybit" in (v.entity or "")
+    assert {e["name"] for e in v.exchange_links} == {"Bybit", "Bitget"}
+    bybit = next(e for e in v.exchange_links if e["name"] == "Bybit")
+    assert bybit["deposits"] == 2 and bybit["withdrawals"] == 0
+    assert "TronScan flow" in v.sources
+
+
+@pytest.mark.asyncio
+async def test_flow_does_not_override_contract():
+    """Если TronScan уже опознал контракт — flow его не понижает до кошелька."""
+    ts_resp = {"address": VALID_ADDR, "accountType": 2,
+               "contractMap": {VALID_ADDR: True}, "name": "TetherToken"}
+    transfers = [{"from_address": "Tx", "to_address": VALID_ADDR,
+                  "from_address_tag": {"from_address_tag": "Binance-Hot 4"}}]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.CONTRACT  # тип не перебит
+    assert any(e["name"] == "Binance" for e in v.exchange_links)  # но связи зафиксированы

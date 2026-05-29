@@ -31,6 +31,7 @@ TYPE_RU = {
     EntityType.PROJECT: "Проект",
     EntityType.SCAM: "СКАМ",
     EntityType.LABELED: "Маркированный",
+    EntityType.WALLET: "Кошелёк",
     EntityType.UNKNOWN: "Неизвестно",
 }
 
@@ -51,6 +52,16 @@ def format_verdict(v: AddressVerdict) -> str:
         "",
         f"<code>{v.address}</code>",
     ]
+    if v.exchange_links:
+        lines.append("")
+        lines.append("<b>Связи с биржами:</b>")
+        for e in v.exchange_links[:5]:
+            parts = []
+            if e.get("deposits"):
+                parts.append(f"депозиты ×{e['deposits']}")
+            if e.get("withdrawals"):
+                parts.append(f"выводы ×{e['withdrawals']}")
+            lines.append(f"  • {e['name']}: {', '.join(parts)}")
     if v.risk_flags:
         lines.append("")
         lines.append("<b>Флаги:</b>")

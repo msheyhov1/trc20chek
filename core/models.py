@@ -19,6 +19,7 @@ class EntityType(str, Enum):
     PROJECT = "project"
     SCAM = "scam"
     LABELED = "labeled"
+    WALLET = "wallet"  # личный кошелёк, опознан по связям с биржами (flow-анализ)
     UNKNOWN = "unknown"
 
 
@@ -31,6 +32,8 @@ class AddressVerdict:
     risk_flags: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     raw_labels: dict[str, Any] = field(default_factory=dict)
+    # Связи с биржами по анализу переводов (flow): [{name, deposits, withdrawals, total}]
+    exchange_links: list[dict[str, Any]] = field(default_factory=list)
     cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +45,7 @@ class AddressVerdict:
             "risk_flags": self.risk_flags,
             "sources": self.sources,
             "raw_labels": self.raw_labels,
+            "exchange_links": self.exchange_links,
             "cached": self.cached,
         }
 

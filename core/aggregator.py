@@ -8,7 +8,7 @@ import httpx
 
 from . import cache
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
-from .providers import goplus, local, tronscan
+from .providers import flow, goplus, local, tronscan
 
 # Нормализация биржевых меток
 EXCHANGE_KEYWORDS: dict[str, str] = {
@@ -145,6 +145,58 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
         verdict.risk_level = RiskLevel.CAUTION
 
 
+def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> None:
+    """Анализ контрагентов: с какими биржами и как часто взаимодействует адрес.
+
+    Не утверждает «адрес = биржа» — определяет, что это кошелёк, связанный с
+    биржей (депозиты/выводы). Обогащает вердикт только если адрес не опознан
+    более сильным источником (контракт, прямая метка, скам)."""
+    if not transfers:
+        return
+
+    counts: dict[str, dict[str, int]] = {}
+    addr = verdict.address
+    for t in transfers:
+        if addr == t.get("from_address"):
+            tag = (t.get("to_address_tag") or {}).get("to_address_tag")
+            direction = "deposits"  # адрес отправил на контрагента
+        elif addr == t.get("to_address"):
+            tag = (t.get("from_address_tag") or {}).get("from_address_tag")
+            direction = "withdrawals"  # адрес получил от контрагента
+        else:
+            continue
+        exch = _normalize_exchange(tag)
+        if not exch:
+            continue
+        c = counts.setdefault(exch, {"deposits": 0, "withdrawals": 0})
+        c[direction] += 1
+
+    if not counts:
+        return
+
+    links = sorted(
+        (
+            {
+                "name": name,
+                "deposits": v["deposits"],
+                "withdrawals": v["withdrawals"],
+                "total": v["deposits"] + v["withdrawals"],
+            }
+            for name, v in counts.items()
+        ),
+        key=lambda x: -x["total"],
+    )
+    verdict.exchange_links = links
+    verdict.raw_labels["flow"] = {"exchange_links": links}
+    verdict.sources.append("TronScan flow")
+
+    # Обогащаем, только если сильнее ничего не нашли
+    if verdict.entity_type == EntityType.UNKNOWN:
+        top = links[0]["name"]
+        verdict.entity_type = EntityType.WALLET
+        verdict.entity = f"Кошелёк (связан с {top})"
+
+
 def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
     if not data:
         return
@@ -196,20 +248,23 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
                 risk_flags=cached.get("risk_flags", []),
                 sources=cached.get("sources", []),
                 raw_labels=cached.get("raw_labels", {}),
+                exchange_links=cached.get("exchange_links", []),
                 cached=True,
             )
             return v
 
     # Параллельный запрос провайдеров
     async with httpx.AsyncClient() as client:
-        ts_data, gp_data = await asyncio.gather(
+        ts_data, gp_data, flow_data = await asyncio.gather(
             tronscan.fetch_account(address, client),
             goplus.fetch_address_security(address, client),
+            flow.fetch_transfers(address, client),
         )
 
     verdict = AddressVerdict(address=address)
     _apply_tronscan(ts_data, verdict)
     _apply_goplus(gp_data, verdict)
+    _apply_flow(flow_data, verdict)
     _apply_local(local.lookup(address), verdict)
 
     # Fallback

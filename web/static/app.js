@@ -9,6 +9,7 @@ const TYPE_RU = {
   project: "Проект",
   scam: "СКАМ",
   labeled: "Маркированный",
+  wallet: "Кошелёк",
   unknown: "Неизвестно",
 };
 
@@ -31,6 +32,12 @@ function escapeHtml(s) {
 function render(verdict) {
   const flags = (verdict.risk_flags || []).map(f => `<div class="flag">${escapeHtml(f)}</div>`).join("");
   const sources = (verdict.sources || []).join(", ") || "—";
+  const links = (verdict.exchange_links || []).map(e => {
+    const parts = [];
+    if (e.deposits) parts.push(`депозиты ×${e.deposits}`);
+    if (e.withdrawals) parts.push(`выводы ×${e.withdrawals}`);
+    return `<div class="flag">${escapeHtml(e.name)}: ${escapeHtml(parts.join(", "))}</div>`;
+  }).join("");
   result.innerHTML = `
     <div class="verdict-header">
       <span class="dot ${escapeHtml(verdict.risk_level)}"></span>
@@ -39,6 +46,7 @@ function render(verdict) {
     <div class="meta">Тип: ${TYPE_RU[verdict.entity_type] || verdict.entity_type}</div>
     <div class="meta">Риск: ${RISK_RU[verdict.risk_level] || verdict.risk_level}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
+    ${links ? `<div class="flags"><h3>Связи с биржами</h3>${links}</div>` : ""}
     ${flags ? `<div class="flags"><h3>Флаги</h3>${flags}</div>` : ""}
     <div class="sources">Источники: ${escapeHtml(sources)}${verdict.cached ? " · из кеша" : ""}</div>
   `;
