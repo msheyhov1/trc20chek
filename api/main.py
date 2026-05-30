@@ -85,7 +85,7 @@ async def health():
 @app.get("/check/{address}")
 async def check(
     address: str,
-    no_cache: bool = Query(False, description="Принудительно обновить, минуя кеш"),
+    cache: bool = Query(False, description="Использовать кеш (по умолчанию выкл — всегда свежие данные для AML)"),
     api_key: str | None = Query(None, description="API key (если включена защита)"),
 ):
     if API_KEY and api_key != API_KEY:
@@ -94,7 +94,9 @@ async def check(
     if not is_valid_trc20_address(address):
         raise HTTPException(status_code=400, detail="Invalid TRC20 address format")
 
-    verdict = await check_address(address, use_cache=not no_cache)
+    # По умолчанию свежий запрос (AML требует актуальных транзакций).
+    # Кеш — только по явному ?cache=true.
+    verdict = await check_address(address, use_cache=cache)
     return verdict.to_dict()
 
 
