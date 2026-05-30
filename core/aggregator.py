@@ -54,6 +54,8 @@ SANCTIONED_EXCHANGE_NAMES = set(SANCTIONED_EXCHANGES.values())
 HOP2_ENABLED = os.getenv("AML_HOP2", "1") not in ("0", "false", "False", "")
 HOP2_LIMIT = int(os.getenv("AML_HOP2_LIMIT", "12"))  # сколько посредников раскрывать
 HOP2_WEIGHT = 0.6  # вес косвенной (2-хоп) экспозиции относительно прямой
+# Ограничение параллелизма hop2, чтобы не бить в QPS-лимит TronScan-ключа.
+HOP2_CONCURRENCY = int(os.getenv("AML_HOP2_CONCURRENCY", "4"))
 
 # Серьёзные риск-флаги GoPlus → dangerous
 CRITICAL_GOPLUS_FLAGS = {
@@ -288,8 +290,11 @@ async def _fetch_hop2(
     if not intermediaries:
         return None
 
+    sem = asyncio.Semaphore(HOP2_CONCURRENCY)
+
     async def _one(cp: str, vol: float) -> dict[str, Any] | None:
-        sub_transfers = await flow.fetch_transfers(cp, client)
+        async with sem:
+            sub_transfers = await flow.fetch_transfers(cp, client)
         sub_total, sub_cp = _parse_transfers(cp, sub_transfers, sanctioned)
         if sub_total <= 0:
             return None

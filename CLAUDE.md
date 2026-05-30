@@ -87,6 +87,7 @@ curl http://localhost:8000/check/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 | `CACHE_TTL_SECONDS` | нет | TTL кеша (по умолчанию 604800 = 7 дней) |
 | `AML_HOP2` | нет | 2-хоп анализ связанных кошельков (по умолч. вкл; `0` — выкл) |
 | `AML_HOP2_LIMIT` | нет | Сколько посредников раскрывать во 2-м хопе (по умолч. 12) |
+| `AML_HOP2_CONCURRENCY` | нет | Лимит параллельных hop2-запросов к TronScan (по умолч. 4, чтобы не бить в QPS) |
 | `PORT` | нет | Порт HTTP, Railway задаёт сам |
 
 ## Соглашения в коде
