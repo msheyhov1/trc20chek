@@ -97,6 +97,11 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
         verdict.raw_labels["tronscan"] = tags
         verdict.sources.append("TronScan")
 
+    # Активность адреса — для отличия личного кошелька от нетегированного сервиса
+    activity = data.get("totalTransactionCount") or data.get("transactions")
+    if isinstance(activity, int):
+        verdict.raw_labels["activity_tx"] = activity
+
     # 1. Красный тег = скам/опасный
     if data.get("redTag"):
         verdict.entity_type = EntityType.SCAM
@@ -214,11 +219,25 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
     verdict.raw_labels["flow"] = {"exchange_links": links}
     verdict.sources.append("TronScan flow")
 
-    # Обогащаем, только если сильнее ничего не нашли
+    # Обогащаем, только если сильнее ничего не нашли. Это ЛИЧНЫЙ кошелёк
+    # (у самого адреса нет биржевой метки — иначе он был бы EXCHANGE выше);
+    # метку имеет контрагент, поэтому пишем «связан с», а не «принадлежит».
     if verdict.entity_type == EntityType.UNKNOWN:
         top = links[0]["name"]
         verdict.entity_type = EntityType.WALLET
-        verdict.entity = f"Кошелёк (связан с {top})"
+        verdict.entity = f"Личный кошелёк (связан с {top})"
+        verdict.risk_flags.append(
+            "ℹ️ Личный кошелёк, не биржа: на самом адресе нет биржевой метки, "
+            "связь определена по контрагентам переводов"
+        )
+        # Эвристика: огромная активность → возможно нетегированный сервис/биржа
+        activity = verdict.raw_labels.get("activity_tx") or 0
+        if isinstance(activity, int) and activity > 50_000:
+            verdict.entity = f"Возможно сервис/биржа (связан с {top}, нетегирован)"
+            verdict.risk_flags.append(
+                f"⚠️ Очень высокая активность ({activity:,} транзакций) — "
+                "возможно нетегированный сервис, а не личный кошелёк"
+            )
 
 
 def _amount(t: dict[str, Any]) -> float:

@@ -302,3 +302,29 @@ async def test_hop2_indirect_sanction():
     assert v.risk_score == 60   # 100% косвенно × вес 0.6
     assert v.risk_level == RiskLevel.CAUTION
     assert any("посредник" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_personal_wallet_not_exchange():
+    """Адрес без своей метки, но шлёт на Bybit → ЛИЧНЫЙ кошелёк, не биржа."""
+    transfers = [_tr(VALID_ADDR, "Tbybit", 1_000_000, to_tag="Bybit 9")]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.WALLET          # НЕ exchange
+    assert "Личный кошелёк" in (v.entity or "")
+    assert any("не биржа" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_untagged_high_activity_flagged_as_service():
+    """Без метки, но 200k транзакций → возможно нетегированный сервис/биржа."""
+    ts_resp = {"address": VALID_ADDR, "totalTransactionCount": 200_000}
+    transfers = [_tr(VALID_ADDR, "Tbybit", 1_000_000, to_tag="Bybit 9")]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert "сервис" in (v.entity or "").lower()
+    assert any("нетегир" in f for f in v.risk_flags)
