@@ -68,9 +68,13 @@ def format_verdict(v: AddressVerdict) -> str:
         ot = aml.get("other_exposure_pct", 0)
         lines.append("")
         lines.append(f"<b>AML-экспозиция</b> (по {aml['transfers_analyzed']} переводам):")
+        ind = aml.get("indirect_sanctions_pct", 0)
         lines.append(f"  🚨 санкц. адреса: {s}%")
         if se:
             lines.append(f"  🚫 санкц. биржи: {se}%")
+        if ind:
+            n = aml.get("hop2_intermediaries_checked", 0)
+            lines.append(f"  🔗 косвенно (2-й хоп): ~{ind}%")
         lines.append(f"  🏦 биржи: {ex}%")
         lines.append(f"  ❔ прочее: {ot}%")
     if v.exchange_links:

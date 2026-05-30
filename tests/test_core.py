@@ -276,3 +276,29 @@ async def test_sanctioned_exchange_exposure():
     assert "HTX (Huobi)" in v.aml["sanctioned_exchanges"]
     assert v.risk_score == 70
     assert v.risk_level == RiskLevel.DANGEROUS
+
+
+@pytest.mark.asyncio
+async def test_hop2_indirect_sanction():
+    """2-й хоп: деньги пришли через посредника, который сам шлёт на санкционный
+    адрес → косвенная экспозиция поднимает риск (с весом HOP2_WEIGHT=0.6)."""
+    mid = "Tmiddleman000000000000000000000000"
+    # hop1: проверяемый адрес получил всё от посредника mid (без метки)
+    hop1 = [_tr(mid, VALID_ADDR, 1_000_000_000)]
+    # hop2: посредник mid слил 100% объёма на санкционный адрес
+    hop2 = [_tr(mid, SANCTIONED_ADDR, 1_000_000_000)]
+    transfers_by_addr = {VALID_ADDR: hop1, mid: hop2}
+
+    async def fake_transfers(addr, client):
+        return transfers_by_addr.get(addr, [])
+
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=fake_transfers), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value={SANCTIONED_ADDR})):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["hop2_intermediaries_checked"] == 1
+    assert v.aml["indirect_sanctions_pct"] == 100.0
+    assert v.risk_score == 60   # 100% косвенно × вес 0.6
+    assert v.risk_level == RiskLevel.CAUTION
+    assert any("посредник" in f for f in v.risk_flags)

@@ -45,9 +45,11 @@ function render(verdict) {
   let amlBlock = "";
   if (aml.transfers_analyzed) {
     const se = aml.sanctioned_exchange_exposure_pct || 0;
+    const ind = aml.indirect_sanctions_pct || 0;
     amlBlock = `<div class="flags"><h3>AML-экспозиция (по ${aml.transfers_analyzed} переводам)</h3>`
       + `<div class="flag">🚨 санкц. адреса: ${aml.sanctions_exposure_pct || 0}%</div>`
       + (se ? `<div class="flag">🚫 санкц. биржи: ${se}%</div>` : "")
+      + (ind ? `<div class="flag">🔗 косвенно (2-й хоп): ~${ind}%</div>` : "")
       + `<div class="flag">🏦 биржи: ${aml.exchange_exposure_pct || 0}%</div>`
       + `<div class="flag">❔ прочее: ${aml.other_exposure_pct || 0}%</div></div>`;
   }

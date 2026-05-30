@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import httpx
@@ -47,6 +48,12 @@ SANCTIONED_EXCHANGES: dict[str, str] = {
     "cryptex": "Cryptex",
 }
 SANCTIONED_EXCHANGE_NAMES = set(SANCTIONED_EXCHANGES.values())
+
+# 2-хоп анализ связанных кошельков (косвенная санкционная экспозиция).
+# Раскрываем топ-N неизвестных посредников и смотрим ИХ санкционную экспозицию.
+HOP2_ENABLED = os.getenv("AML_HOP2", "1") not in ("0", "false", "False", "")
+HOP2_LIMIT = int(os.getenv("AML_HOP2_LIMIT", "12"))  # сколько посредников раскрывать
+HOP2_WEIGHT = 0.6  # вес косвенной (2-хоп) экспозиции относительно прямой
 
 # Серьёзные риск-флаги GoPlus → dangerous
 CRITICAL_GOPLUS_FLAGS = {
@@ -226,10 +233,99 @@ def _amount(t: dict[str, Any]) -> float:
         return 0.0
 
 
+def _parse_transfers(
+    addr: str, transfers: list[dict[str, Any]], sanctioned: set[str]
+) -> tuple[float, dict[str, dict[str, Any]]]:
+    """Сводит переводы в объёмы по контрагентам.
+
+    Возвращает (total_volume, {cp_address: {volume, exch, sanctioned}}).
+    Используется и для 1-хоп категорий, и для выбора посредников 2-го хопа."""
+    total = 0.0
+    per_cp: dict[str, dict[str, Any]] = {}
+    for t in transfers:
+        if addr == t.get("from_address"):
+            cp = t.get("to_address")
+            tag = (t.get("to_address_tag") or {}).get("to_address_tag")
+        elif addr == t.get("to_address"):
+            cp = t.get("from_address")
+            tag = (t.get("from_address_tag") or {}).get("from_address_tag")
+        else:
+            continue
+        if not cp:
+            continue
+        amt = _amount(t)
+        total += amt
+        d = per_cp.setdefault(
+            cp, {"volume": 0.0, "exch": None, "sanctioned": cp in sanctioned}
+        )
+        d["volume"] += amt
+        if d["exch"] is None:
+            d["exch"] = _normalize_exchange(tag)
+    return total, per_cp
+
+
+async def _fetch_hop2(
+    per_cp: dict[str, dict[str, Any]],
+    total: float,
+    sanctioned: set[str],
+    client: httpx.AsyncClient,
+) -> dict[str, Any] | None:
+    """2-й хоп: раскрывает топ-N неизвестных посредников (личных кошельков,
+    через которые шли деньги) и считает ИХ собственную санкционную экспозицию.
+    Так ловятся деньги, отмытые через промежуточный кошелёк."""
+    if total <= 0 or HOP2_LIMIT <= 0:
+        return None
+    # Раскрываем только неизвестные кошельки (не биржи и не санкц. адреса):
+    # именно там прячут отмывание. Биржи-контрагенты бессмысленно раскрывать.
+    intermediaries = sorted(
+        (
+            (cp, d["volume"])
+            for cp, d in per_cp.items()
+            if not d["sanctioned"] and not d["exch"]
+        ),
+        key=lambda x: -x[1],
+    )[:HOP2_LIMIT]
+    if not intermediaries:
+        return None
+
+    async def _one(cp: str, vol: float) -> dict[str, Any] | None:
+        sub_transfers = await flow.fetch_transfers(cp, client)
+        sub_total, sub_cp = _parse_transfers(cp, sub_transfers, sanctioned)
+        if sub_total <= 0:
+            return None
+        dirty = sum(
+            d["volume"]
+            for d in sub_cp.values()
+            if d["sanctioned"] or (d["exch"] in SANCTIONED_EXCHANGE_NAMES)
+        )
+        if dirty <= 0:
+            return None
+        exchs = sorted(
+            {d["exch"] for d in sub_cp.values() if d["exch"] in SANCTIONED_EXCHANGE_NAMES}
+        )
+        return {
+            "address": cp,
+            "our_share": round(vol / total, 4),
+            "their_risk_pct": round(dirty / sub_total * 100, 1),
+            "sanctioned_exchanges": exchs,
+        }
+
+    results = await asyncio.gather(*[_one(cp, vol) for cp, vol in intermediaries])
+    flagged = [r for r in results if r]
+    # Косвенная экспозиция = Σ (наша доля через посредника × его «грязность»)
+    indirect = sum(r["our_share"] * (r["their_risk_pct"] / 100) for r in flagged)
+    return {
+        "intermediaries_checked": len(intermediaries),
+        "flagged": flagged,
+        "indirect_exposure_pct": round(indirect * 100, 1),
+    }
+
+
 def _compute_aml(
     verdict: AddressVerdict,
     transfers: list[dict[str, Any]],
     sanctioned: set[str],
+    hop2: dict[str, Any] | None = None,
 ) -> None:
     """Централизованная риск-модель (AML).
 
@@ -238,6 +334,8 @@ def _compute_aml(
     - КОСВЕННАЯ экспозиция (переводы с/на санкционные адреса) измеряется в %
       объёма, а не «да/нет» — поэтому биржи не клеймятся грязными за то, что
       через них текут любые деньги.
+    - 2-й хоп: деньги, пришедшие через посредника, который сам связан с
+      санкциями (с понижающим весом HOP2_WEIGHT).
     - Известные сервисы (биржа/контракт) не понижаются в риске за косвенную
       экспозицию (только прямая санкция/скам их роняет)."""
     addr = verdict.address
@@ -250,29 +348,19 @@ def _compute_aml(
     )
 
     # 1-хоп экспозиция по объёму контрагентов
+    total, per_cp = _parse_transfers(addr, transfers, sanctioned)
     vol = {"sanctions": 0.0, "sanctioned_exchange": 0.0, "exchange": 0.0, "other": 0.0}
-    total = 0.0
     sanctioned_cps: set[str] = set()
     risky_exchanges: set[str] = set()
-    for t in transfers:
-        if addr == t.get("from_address"):
-            cp = t.get("to_address")
-            tag = (t.get("to_address_tag") or {}).get("to_address_tag")
-        elif addr == t.get("to_address"):
-            cp = t.get("from_address")
-            tag = (t.get("from_address_tag") or {}).get("from_address_tag")
-        else:
-            continue
-        amt = _amount(t)
-        total += amt
-        exch = _normalize_exchange(tag)
-        if cp in sanctioned:
+    for cp, d in per_cp.items():
+        amt = d["volume"]
+        if d["sanctioned"]:
             vol["sanctions"] += amt
             sanctioned_cps.add(cp)
-        elif exch and exch in SANCTIONED_EXCHANGE_NAMES:
+        elif d["exch"] in SANCTIONED_EXCHANGE_NAMES:
             vol["sanctioned_exchange"] += amt
-            risky_exchanges.add(exch)
-        elif exch:
+            risky_exchanges.add(d["exch"])
+        elif d["exch"]:
             vol["exchange"] += amt
         else:
             vol["other"] += amt
@@ -284,6 +372,7 @@ def _compute_aml(
     goplus_critical = sorted(f for f in flags_raised if f in CRITICAL_GOPLUS_FLAGS)
     # «Грязный» объём = прямые санкционные адреса + санкционные биржи
     risky_pct = pct(vol["sanctions"] + vol["sanctioned_exchange"])
+    indirect_pct = (hop2 or {}).get("indirect_exposure_pct", 0.0) or 0.0
 
     verdict.aml = {
         "direct_sanctioned": direct,
@@ -292,6 +381,9 @@ def _compute_aml(
         "exchange_exposure_pct": pct(vol["exchange"]),
         "other_exposure_pct": pct(vol["other"]),
         "risky_exposure_pct": risky_pct,
+        "indirect_sanctions_pct": indirect_pct,
+        "hop2_intermediaries_checked": (hop2 or {}).get("intermediaries_checked", 0),
+        "hop2_flagged": (hop2 or {}).get("flagged", []),
         "transfers_analyzed": len(transfers),
         "sanctioned_counterparties": sorted(sanctioned_cps),
         "sanctioned_exchanges": sorted(risky_exchanges),
@@ -313,7 +405,8 @@ def _compute_aml(
     elif known_service:
         score = 10.0 if flags_raised else 0.0
     else:
-        score = risky_pct  # экспозиция к санкциям и санкционным биржам — драйвер
+        # прямая экспозиция + косвенная (2-хоп) с понижающим весом
+        score = risky_pct + indirect_pct * HOP2_WEIGHT
         if flags_raised:
             score = max(score, 20.0)
     verdict.risk_score = int(round(min(100.0, score)))
@@ -362,6 +455,12 @@ def _compute_aml(
         verdict.risk_flags.append(
             f"⚠️ Переводы с санкционными биржами ({', '.join(sorted(risky_exchanges))}): "
             f"{pct(vol['sanctioned_exchange'])}% объёма — деньги могут заморозить"
+        )
+    if indirect_pct > 0 and not direct_danger:
+        n = len((hop2 or {}).get("flagged", []))
+        verdict.risk_flags.append(
+            f"Косвенная связь с санкциями через {n} посредник(ов): "
+            f"~{indirect_pct}% объёма (2-й хоп)"
         )
 
 
@@ -432,17 +531,31 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
             ofac.fetch_sanctioned_set(client),
         )
 
-    verdict = AddressVerdict(address=address)
-    _apply_tronscan(ts_data, verdict)
-    _apply_goplus(gp_data, verdict)
-    _apply_flow(flow_data, verdict)
-    _compute_aml(verdict, flow_data, sanctioned)
+        verdict = AddressVerdict(address=address)
+        _apply_tronscan(ts_data, verdict)
+        _apply_goplus(gp_data, verdict)
+        _apply_flow(flow_data, verdict)
+
+        # 2-й хоп: только для кошельков/неизвестных (биржи/контракты/прямые
+        # санкции раскрывать бессмысленно — их контрагенты это «все подряд»).
+        hop2 = None
+        if (
+            HOP2_ENABLED
+            and address not in sanctioned
+            and verdict.entity_type not in (EntityType.EXCHANGE, EntityType.CONTRACT)
+        ):
+            total_h, per_cp_h = _parse_transfers(address, flow_data, sanctioned)
+            hop2 = await _fetch_hop2(per_cp_h, total_h, sanctioned, client)
+
+    _compute_aml(verdict, flow_data, sanctioned, hop2)
+    if hop2 and hop2.get("flagged"):
+        verdict.sources.append("TronScan flow (2-hop)")
     _apply_local(local.lookup(address), verdict)
 
-    # Fallback
+    # Fallback: нет публичной метки. risk_level НЕ трогаем — его уже выставил
+    # _compute_aml (у адреса может быть реальный риск от экспозиции/2-хопа).
     if verdict.entity_type == EntityType.UNKNOWN and not verdict.entity:
         verdict.entity = "No public labels"
-        verdict.risk_level = RiskLevel.UNKNOWN
 
     # Кеш
     if use_cache:
