@@ -246,3 +246,33 @@ async def test_exchange_not_branded_by_indirect_exposure():
     assert v.risk_level == RiskLevel.SAFE            # НЕ заклеймена грязной
     assert v.risk_score <= 10                        # скор сервиса низкий
     assert v.aml["sanctions_exposure_pct"] == 90.0   # но экспозиция показана честно
+
+
+@pytest.mark.asyncio
+async def test_sanctioned_exchange_self():
+    """Сам адрес — хот-кошелёк санкционной биржи (HTX, UK A7) → SANCTIONED."""
+    ts_resp = {"address": VALID_ADDR, "publicTag": "HTX 1", "addressTag": "HTX 1"}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 100
+    assert "HTX" in (v.entity or "")
+
+
+@pytest.mark.asyncio
+async def test_sanctioned_exchange_exposure():
+    """Кошелёк получил 70% объёма с санкционной биржи (HTX) → DANGEROUS."""
+    transfers = [
+        _tr("Thtxhotwallet", VALID_ADDR, 700_000_000, from_tag="HTX 3"),  # 700 c HTX
+        _tr(VALID_ADDR, "Tclean", 300_000_000),                            # 300 прочее
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["sanctioned_exchange_exposure_pct"] == 70.0
+    assert "HTX (Huobi)" in v.aml["sanctioned_exchanges"]
+    assert v.risk_score == 70
+    assert v.risk_level == RiskLevel.DANGEROUS

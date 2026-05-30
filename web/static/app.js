@@ -37,16 +37,17 @@ function render(verdict) {
     const parts = [];
     if (e.deposits) parts.push(`депозиты ×${e.deposits}`);
     if (e.withdrawals) parts.push(`выводы ×${e.withdrawals}`);
-    return `<div class="flag">${escapeHtml(e.name)}: ${escapeHtml(parts.join(", "))}</div>`;
+    const mark = e.sanctioned ? " 🚫 САНКЦ." : "";
+    return `<div class="flag">${escapeHtml(e.name)}${mark}: ${escapeHtml(parts.join(", "))}</div>`;
   }).join("");
   const aml = verdict.aml || {};
   const score = verdict.risk_score || 0;
   let amlBlock = "";
-  if (aml.direct_sanctioned) {
-    amlBlock = `<div class="flags"><h3>AML</h3><div class="flag">🚨 Адрес в санкционном списке OFAC SDN</div></div>`;
-  } else if (aml.transfers_analyzed) {
+  if (aml.transfers_analyzed) {
+    const se = aml.sanctioned_exchange_exposure_pct || 0;
     amlBlock = `<div class="flags"><h3>AML-экспозиция (по ${aml.transfers_analyzed} переводам)</h3>`
-      + `<div class="flag">🚨 санкции: ${aml.sanctions_exposure_pct || 0}%</div>`
+      + `<div class="flag">🚨 санкц. адреса: ${aml.sanctions_exposure_pct || 0}%</div>`
+      + (se ? `<div class="flag">🚫 санкц. биржи: ${se}%</div>` : "")
       + `<div class="flag">🏦 биржи: ${aml.exchange_exposure_pct || 0}%</div>`
       + `<div class="flag">❔ прочее: ${aml.other_exposure_pct || 0}%</div></div>`;
   }

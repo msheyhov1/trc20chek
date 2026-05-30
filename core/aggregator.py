@@ -16,8 +16,6 @@ EXCHANGE_KEYWORDS: dict[str, str] = {
     "okx": "OKX",
     "okex": "OKX",
     "bybit": "Bybit",
-    "huobi": "HTX (Huobi)",
-    "htx": "HTX (Huobi)",
     "kucoin": "KuCoin",
     "gate.io": "Gate.io",
     "gateio": "Gate.io",
@@ -31,6 +29,25 @@ EXCHANGE_KEYWORDS: dict[str, str] = {
     "bitstamp": "Bitstamp",
 }
 
+# Биржи под санкциями. Деньги с них блокируются комплаенсом ("заморозка").
+# Источники: UK A7-пакет от 26.05.2026 (HTX/Huobi, EXMO, Bitpapa, Rapira,
+# Aifory, Arvix, ABCEX) + OFAC (Garantex/Grinex/Cryptex).
+# Ловим по тегам TronScan: и сам хот-кошелёк биржи, и переводы с/на него.
+SANCTIONED_EXCHANGES: dict[str, str] = {
+    "exmo": "EXMO",
+    "rapira": "Rapira",
+    "abcex": "ABCEX",
+    "bitpapa": "Bitpapa",
+    "htx": "HTX (Huobi)",
+    "huobi": "HTX (Huobi)",
+    "arvix": "Arvix",
+    "aifory": "Aifory",
+    "garantex": "Garantex",
+    "grinex": "Grinex",
+    "cryptex": "Cryptex",
+}
+SANCTIONED_EXCHANGE_NAMES = set(SANCTIONED_EXCHANGES.values())
+
 # Серьёзные риск-флаги GoPlus → dangerous
 CRITICAL_GOPLUS_FLAGS = {
     "phishing_activities",
@@ -43,11 +60,14 @@ CRITICAL_GOPLUS_FLAGS = {
 }
 
 
+_ALL_EXCHANGES = {**EXCHANGE_KEYWORDS, **SANCTIONED_EXCHANGES}
+
+
 def _normalize_exchange(tag: str | None) -> str | None:
     if not tag:
         return None
     t = tag.lower()
-    for key, name in EXCHANGE_KEYWORDS.items():
+    for key, name in _ALL_EXCHANGES.items():
         if key in t:
             return name
     return None
@@ -175,6 +195,7 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
                 "deposits": v["deposits"],
                 "withdrawals": v["withdrawals"],
                 "total": v["deposits"] + v["withdrawals"],
+                "sanctioned": name in SANCTIONED_EXCHANGE_NAMES,
             }
             for name, v in counts.items()
         ),
@@ -222,10 +243,17 @@ def _compute_aml(
     addr = verdict.address
     direct = addr in sanctioned
 
+    # Сам адрес — хот-кошелёк санкционной биржи? (по тегу TronScan)
+    self_sanctioned_exch = (
+        verdict.entity_type == EntityType.EXCHANGE
+        and verdict.entity in SANCTIONED_EXCHANGE_NAMES
+    )
+
     # 1-хоп экспозиция по объёму контрагентов
-    vol = {"sanctions": 0.0, "exchange": 0.0, "other": 0.0}
+    vol = {"sanctions": 0.0, "sanctioned_exchange": 0.0, "exchange": 0.0, "other": 0.0}
     total = 0.0
     sanctioned_cps: set[str] = set()
+    risky_exchanges: set[str] = set()
     for t in transfers:
         if addr == t.get("from_address"):
             cp = t.get("to_address")
@@ -237,10 +265,14 @@ def _compute_aml(
             continue
         amt = _amount(t)
         total += amt
+        exch = _normalize_exchange(tag)
         if cp in sanctioned:
             vol["sanctions"] += amt
             sanctioned_cps.add(cp)
-        elif _normalize_exchange(tag):
+        elif exch and exch in SANCTIONED_EXCHANGE_NAMES:
+            vol["sanctioned_exchange"] += amt
+            risky_exchanges.add(exch)
+        elif exch:
             vol["exchange"] += amt
         else:
             vol["other"] += amt
@@ -250,32 +282,39 @@ def _compute_aml(
 
     flags_raised = (verdict.raw_labels.get("goplus") or {}).get("flags_raised") or []
     goplus_critical = sorted(f for f in flags_raised if f in CRITICAL_GOPLUS_FLAGS)
+    # «Грязный» объём = прямые санкционные адреса + санкционные биржи
+    risky_pct = pct(vol["sanctions"] + vol["sanctioned_exchange"])
 
     verdict.aml = {
         "direct_sanctioned": direct,
         "sanctions_exposure_pct": pct(vol["sanctions"]),
+        "sanctioned_exchange_exposure_pct": pct(vol["sanctioned_exchange"]),
         "exchange_exposure_pct": pct(vol["exchange"]),
         "other_exposure_pct": pct(vol["other"]),
+        "risky_exposure_pct": risky_pct,
         "transfers_analyzed": len(transfers),
         "sanctioned_counterparties": sorted(sanctioned_cps),
+        "sanctioned_exchanges": sorted(risky_exchanges),
         "goplus_critical_flags": goplus_critical,
     }
 
-    # Известный сервис (биржа/контракт): косвенная экспозиция через него
-    # ОЖИДАЕМА и НЕ делает его грязным — иначе все биржи станут «санкционными».
-    known_service = verdict.entity_type in (EntityType.EXCHANGE, EntityType.CONTRACT)
+    # Известный ЛЕГАЛЬНЫЙ сервис (биржа/контракт, НЕ санкционный): косвенная
+    # экспозиция через него ОЖИДАЕМА и не делает его грязным.
+    known_service = (
+        verdict.entity_type in (EntityType.EXCHANGE, EntityType.CONTRACT)
+        and not self_sanctioned_exch
+    )
 
     # ---- Скор 0-100 ----
-    if direct or verdict.entity_type == EntityType.SCAM:
+    if direct or self_sanctioned_exch or verdict.entity_type == EntityType.SCAM:
         score = 100.0  # прямой сигнал об адресе — бьёт всё
     elif goplus_critical:
         score = 90.0
     elif known_service:
-        # сервис: его собственный риск низкий; флаги GoPlus лишь слегка поднимают
         score = 10.0 if flags_raised else 0.0
     else:
-        score = pct(vol["sanctions"])  # прямая экспозиция к санкциям — драйвер
-        if flags_raised:  # некритичные флаги GoPlus (напр. blacklist_doubt)
+        score = risky_pct  # экспозиция к санкциям и санкционным биржам — драйвер
+        if flags_raised:
             score = max(score, 20.0)
     verdict.risk_score = int(round(min(100.0, score)))
 
@@ -288,17 +327,20 @@ def _compute_aml(
         if "OFAC SDN" not in verdict.sources:
             verdict.sources.append("OFAC SDN")
 
-    # ---- GoPlus critical на самом адресе (без прямой санкции) ----
+    # ---- Сам адрес — кошелёк санкционной биржи ----
+    elif self_sanctioned_exch:
+        verdict.entity_type = EntityType.SANCTIONED
+        verdict.entity = f"{verdict.entity} (санкционная биржа)"
+        verdict.risk_flags.insert(0, "🚨 Хот-кошелёк санкционной биржи (UK/OFAC)")
+
+    # ---- GoPlus critical на самом адресе ----
     if goplus_critical and not direct and verdict.entity_type == EntityType.UNKNOWN:
         verdict.entity_type = EntityType.SCAM
         verdict.entity = verdict.entity or "Вредоносный адрес (GoPlus)"
 
     # ---- Синтез risk_level ----
-    # Прямые сигналы (санкция/скам/critical) эскалируют ВСЕГДА, даже для сервисов
-    # (санкционная биржа типа Garantex обязана быть DANGEROUS). Косвенная
-    # экспозиция эскалирует только НЕ-сервисы.
     direct_danger = (
-        direct or bool(goplus_critical)
+        direct or self_sanctioned_exch or bool(goplus_critical)
         or verdict.entity_type in (EntityType.SCAM, EntityType.SANCTIONED)
     )
     if direct_danger:
@@ -310,11 +352,16 @@ def _compute_aml(
             verdict.risk_level = RiskLevel.CAUTION
     # иначе оставляем то, что выставил TronScan (SAFE для биржи и т.п.)
 
-    # Пояснение про косвенную экспозицию (показываем даже для сервисов — прозрачность)
+    # ---- Поясняющие флаги экспозиции ----
     if vol["sanctions"] > 0 and not direct:
         verdict.risk_flags.append(
-            f"Прямая экспозиция к санкционным адресам: {pct(vol['sanctions'])}% объёма "
+            f"Экспозиция к санкционным адресам: {pct(vol['sanctions'])}% объёма "
             f"({len(sanctioned_cps)} контрагент(ов))"
+        )
+    if vol["sanctioned_exchange"] > 0 and not self_sanctioned_exch:
+        verdict.risk_flags.append(
+            f"⚠️ Переводы с санкционными биржами ({', '.join(sorted(risky_exchanges))}): "
+            f"{pct(vol['sanctioned_exchange'])}% объёма — деньги могут заморозить"
         )
 
 

@@ -61,16 +61,16 @@ def format_verdict(v: AddressVerdict) -> str:
         f"<code>{v.address}</code>",
     ]
     aml = v.aml or {}
-    if aml.get("direct_sanctioned"):
-        lines.append("")
-        lines.append("🚨 <b>Адрес в санкционном списке OFAC SDN</b>")
-    elif aml.get("transfers_analyzed"):
+    if aml.get("transfers_analyzed"):
         s = aml.get("sanctions_exposure_pct", 0)
+        se = aml.get("sanctioned_exchange_exposure_pct", 0)
         ex = aml.get("exchange_exposure_pct", 0)
         ot = aml.get("other_exposure_pct", 0)
         lines.append("")
         lines.append(f"<b>AML-экспозиция</b> (по {aml['transfers_analyzed']} переводам):")
-        lines.append(f"  🚨 санкции: {s}%")
+        lines.append(f"  🚨 санкц. адреса: {s}%")
+        if se:
+            lines.append(f"  🚫 санкц. биржи: {se}%")
         lines.append(f"  🏦 биржи: {ex}%")
         lines.append(f"  ❔ прочее: {ot}%")
     if v.exchange_links:
@@ -82,7 +82,8 @@ def format_verdict(v: AddressVerdict) -> str:
                 parts.append(f"депозиты ×{e['deposits']}")
             if e.get("withdrawals"):
                 parts.append(f"выводы ×{e['withdrawals']}")
-            lines.append(f"  • {e['name']}: {', '.join(parts)}")
+            mark = " 🚫<b>САНКЦ.</b>" if e.get("sanctioned") else ""
+            lines.append(f"  • {e['name']}{mark}: {', '.join(parts)}")
     if v.risk_flags:
         lines.append("")
         lines.append("<b>Флаги:</b>")
