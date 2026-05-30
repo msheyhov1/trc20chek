@@ -128,7 +128,9 @@ async def on_text(message: Message):
             )
             continue
         try:
-            v = await check_address(addr)
+            # Бот всегда проверяет заново (use_cache=False): для AML важна
+            # свежесть — у адреса могли появиться новые «грязные» транзакции.
+            v = await check_address(addr, use_cache=False)
             await message.answer(format_verdict(v), parse_mode=ParseMode.HTML)
         except Exception as e:
             log.exception("check failed")
