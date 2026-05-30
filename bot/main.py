@@ -30,10 +30,17 @@ TYPE_RU = {
     EntityType.CONTRACT: "Смарт-контракт",
     EntityType.PROJECT: "Проект",
     EntityType.SCAM: "СКАМ",
+    EntityType.SANCTIONED: "САНКЦИОННЫЙ (OFAC)",
     EntityType.LABELED: "Маркированный",
     EntityType.WALLET: "Кошелёк",
     EntityType.UNKNOWN: "Неизвестно",
 }
+
+
+def _score_bar(score: int) -> str:
+    """Визуальная шкала риск-скора 0-100."""
+    filled = round(score / 10)
+    return "█" * filled + "░" * (10 - filled)
 
 RISK_RU = {
     RiskLevel.SAFE: "безопасно",
@@ -48,10 +55,24 @@ def format_verdict(v: AddressVerdict) -> str:
     lines = [
         f"{emoji} <b>{v.entity or '—'}</b>",
         f"<i>Тип:</i> {TYPE_RU[v.entity_type]}",
-        f"<i>Риск:</i> {RISK_RU[v.risk_level]}",
+        f"<i>Риск:</i> {RISK_RU[v.risk_level]} · скор {v.risk_score}/100",
+        f"<code>{_score_bar(v.risk_score)}</code>",
         "",
         f"<code>{v.address}</code>",
     ]
+    aml = v.aml or {}
+    if aml.get("direct_sanctioned"):
+        lines.append("")
+        lines.append("🚨 <b>Адрес в санкционном списке OFAC SDN</b>")
+    elif aml.get("transfers_analyzed"):
+        s = aml.get("sanctions_exposure_pct", 0)
+        ex = aml.get("exchange_exposure_pct", 0)
+        ot = aml.get("other_exposure_pct", 0)
+        lines.append("")
+        lines.append(f"<b>AML-экспозиция</b> (по {aml['transfers_analyzed']} переводам):")
+        lines.append(f"  🚨 санкции: {s}%")
+        lines.append(f"  🏦 биржи: {ex}%")
+        lines.append(f"  ❔ прочее: {ot}%")
     if v.exchange_links:
         lines.append("")
         lines.append("<b>Связи с биржами:</b>")

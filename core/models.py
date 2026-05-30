@@ -18,6 +18,7 @@ class EntityType(str, Enum):
     CONTRACT = "contract"
     PROJECT = "project"
     SCAM = "scam"
+    SANCTIONED = "sanctioned"  # адрес в официальном санкционном списке (OFAC SDN)
     LABELED = "labeled"
     WALLET = "wallet"  # личный кошелёк, опознан по связям с биржами (flow-анализ)
     UNKNOWN = "unknown"
@@ -34,6 +35,9 @@ class AddressVerdict:
     raw_labels: dict[str, Any] = field(default_factory=dict)
     # Связи с биржами по анализу переводов (flow): [{name, deposits, withdrawals, total}]
     exchange_links: list[dict[str, Any]] = field(default_factory=list)
+    # AML: числовой скор 0-100 + разбивка экспозиции по контрагентам
+    risk_score: int = 0
+    aml: dict[str, Any] = field(default_factory=dict)
     cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +46,8 @@ class AddressVerdict:
             "entity": self.entity,
             "entity_type": self.entity_type.value,
             "risk_level": self.risk_level.value,
+            "risk_score": self.risk_score,
+            "aml": self.aml,
             "risk_flags": self.risk_flags,
             "sources": self.sources,
             "raw_labels": self.raw_labels,

@@ -47,10 +47,11 @@ EMPTY_GP = {"code": 1, "result": {
 
 
 @pytest.fixture(autouse=True)
-def _no_flow_by_default():
-    """flow-провайдер по умолчанию возвращает пусто — тесты не ходят в сеть.
-    Тесту про flow достаточно переопределить этот патч своим внутри `with`."""
-    with patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])):
+def _no_network_by_default():
+    """flow и OFAC по умолчанию пустые — тесты не ходят в сеть.
+    Конкретный тест переопределяет нужный патч своим внутри `with`."""
+    with patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
         yield
 
 
@@ -179,3 +180,69 @@ async def test_flow_does_not_override_contract():
         v = await check_address(VALID_ADDR, use_cache=False)
     assert v.entity_type == EntityType.CONTRACT  # тип не перебит
     assert any(e["name"] == "Binance" for e in v.exchange_links)  # но связи зафиксированы
+
+
+# ---------- AML: санкции и экспозиция ----------
+
+SANCTIONED_ADDR = "TBADaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def _tr(frm, to, quant, *, from_tag="", to_tag=""):
+    return {
+        "from_address": frm, "to_address": to,
+        "from_address_tag": {"from_address_tag": from_tag},
+        "to_address_tag": {"to_address_tag": to_tag},
+        "quant": str(quant), "tokenInfo": {"tokenDecimal": 6},
+    }
+
+
+@pytest.mark.asyncio
+async def test_ofac_direct_sanction():
+    """Сам адрес в OFAC SDN → санкционный, скор 100, DANGEROUS."""
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value={VALID_ADDR})):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert v.risk_score == 100
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.aml["direct_sanctioned"] is True
+    assert "OFAC SDN" in v.sources
+
+
+@pytest.mark.asyncio
+async def test_sanction_exposure_scoring():
+    """Кошелёк льёт 80% объёма на санкционный адрес → скор 80, DANGEROUS."""
+    transfers = [
+        _tr(VALID_ADDR, SANCTIONED_ADDR, 800_000_000),               # 800 на санкционный
+        _tr("Tgood", VALID_ADDR, 200_000_000, from_tag="Binance-Hot 2"),  # 200 с биржи
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value={SANCTIONED_ADDR})):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["sanctions_exposure_pct"] == 80.0
+    assert v.aml["exchange_exposure_pct"] == 20.0
+    assert v.risk_score == 80
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert SANCTIONED_ADDR in v.aml["sanctioned_counterparties"]
+
+
+@pytest.mark.asyncio
+async def test_exchange_not_branded_by_indirect_exposure():
+    """Биржу НЕ клеймим грязной за косвенную экспозицию, но показываем её в AML."""
+    ts_resp = {"address": VALID_ADDR, "publicTag": "Binance-Hot 2", "addressTag": "Binance-Hot 2"}
+    transfers = [
+        _tr(VALID_ADDR, SANCTIONED_ADDR, 900_000_000),  # 90% объёма «грязного»
+        _tr(VALID_ADDR, "Tclean", 100_000_000),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value={SANCTIONED_ADDR})):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE      # осталась биржей
+    assert v.risk_level == RiskLevel.SAFE            # НЕ заклеймена грязной
+    assert v.risk_score <= 10                        # скор сервиса низкий
+    assert v.aml["sanctions_exposure_pct"] == 90.0   # но экспозиция показана честно

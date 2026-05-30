@@ -8,7 +8,7 @@ import httpx
 
 from . import cache
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
-from .providers import flow, goplus, local, tronscan
+from .providers import flow, goplus, local, ofac, tronscan
 
 # Нормализация биржевых меток
 EXCHANGE_KEYWORDS: dict[str, str] = {
@@ -116,6 +116,8 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
 
 
 def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
+    """Только собирает риск-флаги GoPlus. Решения о risk_level/entity_type
+    принимает _compute_aml (централизованная риск-модель)."""
     result = (data or {}).get("result") or {}
     if not result:
         return
@@ -135,14 +137,6 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
     verdict.sources.append(f"GoPlus ({src})")
     for f in raised:
         verdict.risk_flags.append(f"GoPlus: {f.replace('_', ' ')}")
-
-    if any(f in CRITICAL_GOPLUS_FLAGS for f in raised):
-        verdict.risk_level = RiskLevel.DANGEROUS
-        if verdict.entity_type == EntityType.UNKNOWN:
-            verdict.entity_type = EntityType.SCAM
-            verdict.entity = "Malicious address (GoPlus)"
-    elif verdict.risk_level == RiskLevel.UNKNOWN:
-        verdict.risk_level = RiskLevel.CAUTION
 
 
 def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> None:
@@ -197,6 +191,133 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
         verdict.entity = f"Кошелёк (связан с {top})"
 
 
+def _amount(t: dict[str, Any]) -> float:
+    """Нормализованная сумма перевода (с учётом decimals). 0 при сбое.
+
+    Прим.: суммируем разные токены как сопоставимые — это аппроксимация.
+    В TRC20 подавляющая часть оборота — USDT (≈$1), так что для оценки
+    ДОЛИ экспозиции этого достаточно."""
+    try:
+        q = int(t.get("quant") or 0)
+        dec = int((t.get("tokenInfo") or {}).get("tokenDecimal", 6))
+        return q / (10 ** dec)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compute_aml(
+    verdict: AddressVerdict,
+    transfers: list[dict[str, Any]],
+    sanctioned: set[str],
+) -> None:
+    """Централизованная риск-модель (AML).
+
+    Логика как у профессиональных AML-инструментов:
+    - ПРЯМОЕ попадание в OFAC SDN → санкционный, скор 100.
+    - КОСВЕННАЯ экспозиция (переводы с/на санкционные адреса) измеряется в %
+      объёма, а не «да/нет» — поэтому биржи не клеймятся грязными за то, что
+      через них текут любые деньги.
+    - Известные сервисы (биржа/контракт) не понижаются в риске за косвенную
+      экспозицию (только прямая санкция/скам их роняет)."""
+    addr = verdict.address
+    direct = addr in sanctioned
+
+    # 1-хоп экспозиция по объёму контрагентов
+    vol = {"sanctions": 0.0, "exchange": 0.0, "other": 0.0}
+    total = 0.0
+    sanctioned_cps: set[str] = set()
+    for t in transfers:
+        if addr == t.get("from_address"):
+            cp = t.get("to_address")
+            tag = (t.get("to_address_tag") or {}).get("to_address_tag")
+        elif addr == t.get("to_address"):
+            cp = t.get("from_address")
+            tag = (t.get("from_address_tag") or {}).get("from_address_tag")
+        else:
+            continue
+        amt = _amount(t)
+        total += amt
+        if cp in sanctioned:
+            vol["sanctions"] += amt
+            sanctioned_cps.add(cp)
+        elif _normalize_exchange(tag):
+            vol["exchange"] += amt
+        else:
+            vol["other"] += amt
+
+    def pct(x: float) -> float:
+        return round(x / total * 100, 1) if total > 0 else 0.0
+
+    flags_raised = (verdict.raw_labels.get("goplus") or {}).get("flags_raised") or []
+    goplus_critical = sorted(f for f in flags_raised if f in CRITICAL_GOPLUS_FLAGS)
+
+    verdict.aml = {
+        "direct_sanctioned": direct,
+        "sanctions_exposure_pct": pct(vol["sanctions"]),
+        "exchange_exposure_pct": pct(vol["exchange"]),
+        "other_exposure_pct": pct(vol["other"]),
+        "transfers_analyzed": len(transfers),
+        "sanctioned_counterparties": sorted(sanctioned_cps),
+        "goplus_critical_flags": goplus_critical,
+    }
+
+    # Известный сервис (биржа/контракт): косвенная экспозиция через него
+    # ОЖИДАЕМА и НЕ делает его грязным — иначе все биржи станут «санкционными».
+    known_service = verdict.entity_type in (EntityType.EXCHANGE, EntityType.CONTRACT)
+
+    # ---- Скор 0-100 ----
+    if direct or verdict.entity_type == EntityType.SCAM:
+        score = 100.0  # прямой сигнал об адресе — бьёт всё
+    elif goplus_critical:
+        score = 90.0
+    elif known_service:
+        # сервис: его собственный риск низкий; флаги GoPlus лишь слегка поднимают
+        score = 10.0 if flags_raised else 0.0
+    else:
+        score = pct(vol["sanctions"])  # прямая экспозиция к санкциям — драйвер
+        if flags_raised:  # некритичные флаги GoPlus (напр. blacklist_doubt)
+            score = max(score, 20.0)
+    verdict.risk_score = int(round(min(100.0, score)))
+
+    # ---- Прямое попадание в OFAC ----
+    if direct:
+        verdict.entity_type = EntityType.SANCTIONED
+        if not verdict.entity or verdict.entity == "No public labels":
+            verdict.entity = "Санкционный адрес (OFAC SDN)"
+        verdict.risk_flags.insert(0, "🚨 Адрес в санкционном списке OFAC SDN")
+        if "OFAC SDN" not in verdict.sources:
+            verdict.sources.append("OFAC SDN")
+
+    # ---- GoPlus critical на самом адресе (без прямой санкции) ----
+    if goplus_critical and not direct and verdict.entity_type == EntityType.UNKNOWN:
+        verdict.entity_type = EntityType.SCAM
+        verdict.entity = verdict.entity or "Вредоносный адрес (GoPlus)"
+
+    # ---- Синтез risk_level ----
+    # Прямые сигналы (санкция/скам/critical) эскалируют ВСЕГДА, даже для сервисов
+    # (санкционная биржа типа Garantex обязана быть DANGEROUS). Косвенная
+    # экспозиция эскалирует только НЕ-сервисы.
+    direct_danger = (
+        direct or bool(goplus_critical)
+        or verdict.entity_type in (EntityType.SCAM, EntityType.SANCTIONED)
+    )
+    if direct_danger:
+        verdict.risk_level = RiskLevel.DANGEROUS
+    elif not known_service:
+        if verdict.risk_score >= 70:
+            verdict.risk_level = RiskLevel.DANGEROUS
+        elif verdict.risk_score >= 20:
+            verdict.risk_level = RiskLevel.CAUTION
+    # иначе оставляем то, что выставил TronScan (SAFE для биржи и т.п.)
+
+    # Пояснение про косвенную экспозицию (показываем даже для сервисов — прозрачность)
+    if vol["sanctions"] > 0 and not direct:
+        verdict.risk_flags.append(
+            f"Прямая экспозиция к санкционным адресам: {pct(vol['sanctions'])}% объёма "
+            f"({len(sanctioned_cps)} контрагент(ов))"
+        )
+
+
 def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
     if not data:
         return
@@ -249,22 +370,26 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
                 sources=cached.get("sources", []),
                 raw_labels=cached.get("raw_labels", {}),
                 exchange_links=cached.get("exchange_links", []),
+                risk_score=cached.get("risk_score", 0),
+                aml=cached.get("aml", {}),
                 cached=True,
             )
             return v
 
     # Параллельный запрос провайдеров
     async with httpx.AsyncClient() as client:
-        ts_data, gp_data, flow_data = await asyncio.gather(
+        ts_data, gp_data, flow_data, sanctioned = await asyncio.gather(
             tronscan.fetch_account(address, client),
             goplus.fetch_address_security(address, client),
             flow.fetch_transfers(address, client),
+            ofac.fetch_sanctioned_set(client),
         )
 
     verdict = AddressVerdict(address=address)
     _apply_tronscan(ts_data, verdict)
     _apply_goplus(gp_data, verdict)
     _apply_flow(flow_data, verdict)
+    _compute_aml(verdict, flow_data, sanctioned)
     _apply_local(local.lookup(address), verdict)
 
     # Fallback

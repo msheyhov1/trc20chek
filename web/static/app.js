@@ -8,6 +8,7 @@ const TYPE_RU = {
   contract: "Смарт-контракт",
   project: "Проект",
   scam: "СКАМ",
+  sanctioned: "САНКЦИОННЫЙ (OFAC)",
   labeled: "Маркированный",
   wallet: "Кошелёк",
   unknown: "Неизвестно",
@@ -38,14 +39,26 @@ function render(verdict) {
     if (e.withdrawals) parts.push(`выводы ×${e.withdrawals}`);
     return `<div class="flag">${escapeHtml(e.name)}: ${escapeHtml(parts.join(", "))}</div>`;
   }).join("");
+  const aml = verdict.aml || {};
+  const score = verdict.risk_score || 0;
+  let amlBlock = "";
+  if (aml.direct_sanctioned) {
+    amlBlock = `<div class="flags"><h3>AML</h3><div class="flag">🚨 Адрес в санкционном списке OFAC SDN</div></div>`;
+  } else if (aml.transfers_analyzed) {
+    amlBlock = `<div class="flags"><h3>AML-экспозиция (по ${aml.transfers_analyzed} переводам)</h3>`
+      + `<div class="flag">🚨 санкции: ${aml.sanctions_exposure_pct || 0}%</div>`
+      + `<div class="flag">🏦 биржи: ${aml.exchange_exposure_pct || 0}%</div>`
+      + `<div class="flag">❔ прочее: ${aml.other_exposure_pct || 0}%</div></div>`;
+  }
   result.innerHTML = `
     <div class="verdict-header">
       <span class="dot ${escapeHtml(verdict.risk_level)}"></span>
       <span class="entity">${escapeHtml(verdict.entity || "—")}</span>
     </div>
     <div class="meta">Тип: ${TYPE_RU[verdict.entity_type] || verdict.entity_type}</div>
-    <div class="meta">Риск: ${RISK_RU[verdict.risk_level] || verdict.risk_level}</div>
+    <div class="meta">Риск: ${RISK_RU[verdict.risk_level] || verdict.risk_level} · скор ${score}/100</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
+    ${amlBlock}
     ${links ? `<div class="flags"><h3>Связи с биржами</h3>${links}</div>` : ""}
     ${flags ? `<div class="flags"><h3>Флаги</h3>${flags}</div>` : ""}
     <div class="sources">Источники: ${escapeHtml(sources)}${verdict.cached ? " · из кеша" : ""}</div>
