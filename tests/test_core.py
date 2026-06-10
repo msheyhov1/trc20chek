@@ -246,6 +246,43 @@ async def test_sanctioned_exchange_deposit_wallet():
 
 
 @pytest.mark.asyncio
+async def test_deposit_clustering_siblings(tmp_path, monkeypatch):
+    """Кластеризация: два разных депозитника, пересылающих на ОДИН хот-кошелёк
+    биржи, связываются в кластер — второй видит первого как родственный адрес."""
+    from core import cluster
+    monkeypatch.setattr(cluster, "CLUSTER_PATH", tmp_path / "cluster.db")
+    await cluster.init_db()
+
+    addr_a = VALID_ADDR
+    addr_b = "TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8"
+    hot = "THotBybitCollector00000000000000000"
+
+    def _funnel(addr, a1, a2):
+        return [
+            _tr(addr, hot, a1 + a2, to_tag="Bybit"),  # вывод на общий хот-кошелёк
+            _tr("Tsrc1", addr, a1),
+            _tr("Tsrc2", addr, a2),
+        ]
+
+    async def _check(addr, transfers):
+        with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+             patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+             patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+             patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+            return await check_address(addr, use_cache=False)
+
+    va = await _check(addr_a, _funnel(addr_a, 100_000_000, 100_000_000))
+    assert va.raw_labels["cluster"]["siblings_on_anchor"] == 0  # пока один
+
+    vb = await _check(addr_b, _funnel(addr_b, 50_000_000, 50_000_000))
+    cl = vb.raw_labels["cluster"]
+    assert cl["hot_wallet"] == hot
+    assert cl["siblings_on_anchor"] == 1            # видит addr_a на том же якоре
+    assert addr_a in cl["siblings_sample"]
+    assert any("Кластер биржи Bybit" in f for f in vb.risk_flags)
+
+
+@pytest.mark.asyncio
 async def test_two_way_exchange_not_deposit():
     """Личный торговый кошелёк: и заводит на биржу, и ВЫВОДИТ с неё (двусторонний)
     → не депозитник (депозитник от своей биржи ничего не получает)."""

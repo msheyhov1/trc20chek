@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from core import check_address
 from core.cache import init_db
+from core.cluster import init_db as init_cluster_db
 from core.models import is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +52,7 @@ async def _run_bot():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await init_cluster_db()
     bot_task = asyncio.create_task(_run_bot())
     try:
         yield

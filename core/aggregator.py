@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from . import cache
+from . import cache, cluster
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 from .providers import flow, goplus, local, ofac, tronscan
 
@@ -204,6 +204,8 @@ def _detect_exchange_deposit(
     in_sources: set[str] = set()
     in_amounts: list[float] = []
     out_pairs: list[tuple[float, str]] = []
+    # Якоря кластера: адреса хот/сборных кошельков биржи, куда уходит отток
+    anchors: dict[str, dict[str, float]] = {}  # exch -> {hot_wallet_addr: volume}
     for t in transfers:
         amt = _amount(t)
         if amt <= 0:
@@ -213,6 +215,11 @@ def _detect_exchange_deposit(
             if exch:
                 out_exch[exch] = out_exch.get(exch, 0.0) + amt
                 out_pairs.append((amt, exch))
+                dst = t.get("to_address")
+                if dst:
+                    anchors.setdefault(exch, {})[dst] = (
+                        anchors.setdefault(exch, {}).get(dst, 0.0) + amt
+                    )
             else:
                 out_other += amt
         elif addr == t.get("to_address"):
@@ -252,12 +259,17 @@ def _detect_exchange_deposit(
             pool[key] -= 1
             pairs += 1
 
+    # Якорь кластера — хот/сборный кошелёк биржи, на который уходит больше всего.
+    exch_anchors = anchors.get(exch, {})
+    hot_wallet = max(exch_anchors, key=lambda a: exch_anchors[a]) if exch_anchors else None
+
     return {
         "exchange": exch,
         "concentration": round(concentration, 2),
         "forwarded_pct": round(min(out_e / in_other, 9.99) * 100, 1),
         "in_sources": len(in_sources),
         "matched_pairs": pairs,
+        "hot_wallet": hot_wallet,
         "sanctioned": exch in SANCTIONED_EXCHANGE_NAMES,
     }
 
@@ -617,6 +629,36 @@ def _compute_aml(
         )
 
 
+async def _apply_cluster(verdict: AddressVerdict) -> None:
+    """Накопительная кластеризация депозитников бирж.
+
+    Если адрес опознан как депозитный/транзитный адрес биржи (funnel), пишем его
+    в локальную БД с якорем (хот-кошелёк биржи) и дополняем вердикт числом уже
+    известных родственных депозитников того же якоря/биржи."""
+    dp = (verdict.raw_labels.get("flow") or {}).get("deposit_pattern")
+    if not dp:
+        return
+    exch = dp["exchange"]
+    hot = dp.get("hot_wallet")
+    await cluster.record(verdict.address, exch, hot, bool(dp.get("sanctioned")))
+    info = await cluster.cluster_info(exch, hot, exclude=verdict.address)
+    if not info:
+        return
+    verdict.raw_labels["cluster"] = info
+    n_anchor = info.get("siblings_on_anchor", 0)
+    n_exch = info.get("known_deposits_exchange", 0)
+    if n_anchor > 0:
+        verdict.risk_flags.append(
+            f"🔗 Кластер биржи {exch}: ещё {n_anchor} родственных депозитных "
+            f"адрес(ов) пересылают на тот же хот-кошелёк {hot}"
+        )
+    elif n_exch > 0:
+        verdict.risk_flags.append(
+            f"🔗 Кластер биржи {exch}: всего {n_exch} известных депозитных "
+            f"адрес(ов) этой биржи в локальной базе"
+        )
+
+
 def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
     if not data:
         return
@@ -703,6 +745,11 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     _compute_aml(verdict, flow_data, sanctioned, hop2)
     if hop2 and hop2.get("flagged"):
         verdict.sources.append("TronScan flow (2-hop)")
+
+    # Кластеризация: опознан депозитник биржи → пишем в накопительную БД и
+    # обогащаем вердикт числом родственных депозитников того же якоря/биржи.
+    await _apply_cluster(verdict)
+
     _apply_local(local.lookup(address), verdict)
 
     # Fallback: нет публичной метки. risk_level НЕ трогаем — его уже выставил

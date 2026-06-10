@@ -146,7 +146,9 @@ async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env var is required")
     from core.cache import init_db
+    from core.cluster import init_db as init_cluster_db
     await init_db()
+    await init_cluster_db()
     bot = Bot(BOT_TOKEN)
     await dp.start_polling(bot)
 
