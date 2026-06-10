@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections import Counter
 from typing import Any
 
 import httpx
@@ -173,6 +174,60 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
         verdict.risk_flags.append(f"GoPlus: {f.replace('_', ' ')}")
 
 
+def _detect_exchange_deposit(
+    transfers: list[dict[str, Any]], addr: str
+) -> tuple[str, int, float] | None:
+    """Депозитный адрес биржи (sweep-паттерн).
+
+    У биржевого депозитника одна и та же сумма ПРИХОДИТ от стороннего адреса и
+    почти сразу той же суммой УХОДИT на биржу (587.32 in → 587.32 out на Bybit,
+    400 → 400, …). Несколько таких совпадающих пар «приход → вывод на ту же
+    биржу» — устойчивый признак, что адрес принадлежит депозитной инфраструктуре
+    биржи, а не личному кошельку.
+
+    Возвращает (биржа, число_пар, доля_исходящих_на_биржу_покрытых_парами) или
+    None. Совпадение сумм — по центам (sweep переводит ровно полученный USDT,
+    комиссия в TRX/energy, не в токене), что исключает ложные срабатывания на
+    активных трейдерах со случайно похожими суммами."""
+    incoming: list[float] = []           # суммы, пришедшие НЕ с биржи
+    out_to_exch: list[tuple[float, str]] = []  # (сумма, биржа) — выводы на биржу
+    for t in transfers:
+        amt = _amount(t)
+        if amt <= 0:
+            continue
+        if addr == t.get("to_address"):
+            from_tag = (t.get("from_address_tag") or {}).get("from_address_tag")
+            if _normalize_exchange(from_tag):
+                continue  # это вывод С биржи (нам пришло), а не депозит-ин
+            incoming.append(amt)
+        elif addr == t.get("from_address"):
+            to_tag = (t.get("to_address_tag") or {}).get("to_address_tag")
+            exch = _normalize_exchange(to_tag)
+            if exch:
+                out_to_exch.append((amt, exch))
+
+    if len(out_to_exch) < 2 or not incoming:
+        return None
+
+    # Мультимножество входящих сумм (центы гасят float-шум). Каждую входящую
+    # сумму матчим максимум с одним выводом, чтобы не задвоить пары.
+    pool = Counter(round(a, 2) for a in incoming)
+    pairs_by_exch: dict[str, int] = {}
+    for amt, exch in sorted(out_to_exch, key=lambda x: -x[0]):
+        key = round(amt, 2)
+        if pool.get(key, 0) > 0:
+            pool[key] -= 1
+            pairs_by_exch[exch] = pairs_by_exch.get(exch, 0) + 1
+
+    if not pairs_by_exch:
+        return None
+    exch, pairs = max(pairs_by_exch.items(), key=lambda x: x[1])
+    if pairs < 2:  # «несколько» совпадающих пар — иначе это просто перевод
+        return None
+    coverage = round(pairs / len(out_to_exch), 2)
+    return exch, pairs, coverage
+
+
 def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> None:
     """Анализ контрагентов: с какими биржами и как часто взаимодействует адрес.
 
@@ -219,25 +274,46 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
     verdict.raw_labels["flow"] = {"exchange_links": links}
     verdict.sources.append("TronScan flow")
 
-    # Обогащаем, только если сильнее ничего не нашли. Это ЛИЧНЫЙ кошелёк
-    # (у самого адреса нет биржевой метки — иначе он был бы EXCHANGE выше);
-    # метку имеет контрагент, поэтому пишем «связан с», а не «принадлежит».
-    if verdict.entity_type == EntityType.UNKNOWN:
-        top = links[0]["name"]
-        verdict.entity_type = EntityType.WALLET
-        verdict.entity = f"Личный кошелёк (связан с {top})"
+    # Обогащаем, только если сильнее ничего не нашли.
+    if verdict.entity_type != EntityType.UNKNOWN:
+        return
+
+    # Депозитный адрес биржи? (sweep: пришла сумма — ровно столько ушло на биржу).
+    # Для НЕсанкционных бирж это легальная инфраструктура → помечаем как биржу.
+    # Если поток идёт на санкционную биржу — НЕ маскируем риск, отдаём в AML.
+    deposit = _detect_exchange_deposit(transfers, addr)
+    if deposit and deposit[0] not in SANCTIONED_EXCHANGE_NAMES:
+        exch, pairs, coverage = deposit
+        verdict.entity_type = EntityType.EXCHANGE
+        verdict.entity = f"Депозитный кошелёк {exch}"
+        verdict.risk_level = RiskLevel.SAFE
+        verdict.raw_labels["flow"]["deposit_pattern"] = {
+            "exchange": exch, "matched_pairs": pairs, "coverage": coverage,
+        }
         verdict.risk_flags.append(
-            "ℹ️ Личный кошелёк, не биржа: на самом адресе нет биржевой метки, "
-            "связь определена по контрагентам переводов"
+            f"🏦 Депозитный адрес биржи {exch}: {pairs} совпадающих пар "
+            f"«приход → вывод на {exch}» одной суммой (sweep-паттерн), "
+            f"принадлежит инфраструктуре биржи, а не личному кошельку"
         )
-        # Эвристика: огромная активность → возможно нетегированный сервис/биржа
-        activity = verdict.raw_labels.get("activity_tx") or 0
-        if isinstance(activity, int) and activity > 50_000:
-            verdict.entity = f"Возможно сервис/биржа (связан с {top}, нетегирован)"
-            verdict.risk_flags.append(
-                f"⚠️ Очень высокая активность ({activity:,} транзакций) — "
-                "возможно нетегированный сервис, а не личный кошелёк"
-            )
+        return
+
+    # Иначе это ЛИЧНЫЙ кошелёк (у самого адреса нет биржевой метки — иначе он был
+    # бы EXCHANGE выше); метку имеет контрагент, поэтому «связан с», а не «принадлежит».
+    top = links[0]["name"]
+    verdict.entity_type = EntityType.WALLET
+    verdict.entity = f"Личный кошелёк (связан с {top})"
+    verdict.risk_flags.append(
+        "ℹ️ Личный кошелёк, не биржа: на самом адресе нет биржевой метки, "
+        "связь определена по контрагентам переводов"
+    )
+    # Эвристика: огромная активность → возможно нетегированный сервис/биржа
+    activity = verdict.raw_labels.get("activity_tx") or 0
+    if isinstance(activity, int) and activity > 50_000:
+        verdict.entity = f"Возможно сервис/биржа (связан с {top}, нетегирован)"
+        verdict.risk_flags.append(
+            f"⚠️ Очень высокая активность ({activity:,} транзакций) — "
+            "возможно нетегированный сервис, а не личный кошелёк"
+        )
 
 
 def _amount(t: dict[str, Any]) -> float:
