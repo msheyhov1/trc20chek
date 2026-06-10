@@ -279,22 +279,33 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
         return
 
     # Депозитный адрес биржи? (sweep: пришла сумма — ровно столько ушло на биржу).
-    # Для НЕсанкционных бирж это легальная инфраструктура → помечаем как биржу.
-    # Если поток идёт на санкционную биржу — НЕ маскируем риск, отдаём в AML.
+    # Это адрес инфраструктуры биржи, а не личный кошелёк — помечаем как биржу.
+    # Для САНКЦИОННОЙ биржи риск не маскируем: deposit_pattern.sanctioned поднимет
+    # его в _compute_aml до SANCTIONED (адрес обслуживает санкционную биржу).
     deposit = _detect_exchange_deposit(transfers, addr)
-    if deposit and deposit[0] not in SANCTIONED_EXCHANGE_NAMES:
+    if deposit:
         exch, pairs, coverage = deposit
+        sanctioned_exch = exch in SANCTIONED_EXCHANGE_NAMES
         verdict.entity_type = EntityType.EXCHANGE
         verdict.entity = f"Депозитный кошелёк {exch}"
-        verdict.risk_level = RiskLevel.SAFE
+        verdict.risk_level = RiskLevel.SAFE  # для санкц. биржи поднимет _compute_aml
         verdict.raw_labels["flow"]["deposit_pattern"] = {
             "exchange": exch, "matched_pairs": pairs, "coverage": coverage,
+            "sanctioned": sanctioned_exch,
         }
-        verdict.risk_flags.append(
-            f"🏦 Депозитный адрес биржи {exch}: {pairs} совпадающих пар "
-            f"«приход → вывод на {exch}» одной суммой (sweep-паттерн), "
-            f"принадлежит инфраструктуре биржи, а не личному кошельку"
-        )
+        if sanctioned_exch:
+            verdict.risk_flags.append(
+                f"🚨 Депозитный адрес САНКЦИОННОЙ биржи {exch}: {pairs} совпадающих "
+                f"пар «приход → вывод на {exch}» одной суммой (sweep). Это не личный "
+                f"кошелёк — адрес обслуживает санкционную биржу, средства уходят в "
+                f"санкционную инфраструктуру"
+            )
+        else:
+            verdict.risk_flags.append(
+                f"🏦 Депозитный адрес биржи {exch}: {pairs} совпадающих пар "
+                f"«приход → вывод на {exch}» одной суммой (sweep-паттерн), "
+                f"принадлежит инфраструктуре биржи, а не личному кошельку"
+            )
         return
 
     # Иначе это ЛИЧНЫЙ кошелёк (у самого адреса нет биржевой метки — иначе он был
@@ -441,8 +452,11 @@ def _compute_aml(
     addr = verdict.address
     direct = addr in sanctioned
 
-    # Сам адрес — хот-кошелёк санкционной биржи? (по тегу TronScan)
-    self_sanctioned_exch = (
+    # Сам адрес обслуживает санкционную биржу: либо его тег = санкц. биржа
+    # (хот-кошелёк), либо sweep-паттерн опознал депозитник санкц. биржи.
+    deposit_pattern = (verdict.raw_labels.get("flow") or {}).get("deposit_pattern") or {}
+    sanctioned_deposit = bool(deposit_pattern.get("sanctioned"))
+    self_sanctioned_exch = sanctioned_deposit or (
         verdict.entity_type == EntityType.EXCHANGE
         and verdict.entity in SANCTIONED_EXCHANGE_NAMES
     )
@@ -524,7 +538,13 @@ def _compute_aml(
     elif self_sanctioned_exch:
         verdict.entity_type = EntityType.SANCTIONED
         verdict.entity = f"{verdict.entity} (санкционная биржа)"
-        verdict.risk_flags.insert(0, "🚨 Хот-кошелёк санкционной биржи (UK/OFAC)")
+        verdict.risk_flags.insert(
+            0,
+            "🚨 Депозитный адрес санкционной биржи (UK/OFAC) — средства уходят "
+            "в санкционную инфраструктуру, могут быть заморожены"
+            if sanctioned_deposit
+            else "🚨 Хот-кошелёк санкционной биржи (UK/OFAC)",
+        )
 
     # ---- GoPlus critical на самом адресе ----
     if goplus_critical and not direct and verdict.entity_type == EntityType.UNKNOWN:

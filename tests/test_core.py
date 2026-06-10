@@ -197,6 +197,30 @@ async def test_exchange_deposit_wallet_sweep():
 
 
 @pytest.mark.asyncio
+async def test_sanctioned_exchange_deposit_wallet():
+    """Депозитник САНКЦИОННОЙ биржи (sweep на HTX): приход = вывод на HTX.
+    Не «личный кошелёк», а SANCTIONED — адрес обслуживает санкционную биржу."""
+    addr = VALID_ADDR
+    transfers = [
+        _tr("Tx1", addr, 500_000_000),
+        _tr(addr, "THTX", 500_000_000, to_tag="HTX 1"),
+        _tr("Tx2", addr, 300_000_000),
+        _tr(addr, "THTX", 300_000_000, to_tag="HTX 1"),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert "HTX" in (v.entity or "")
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 100
+    assert v.raw_labels["flow"]["deposit_pattern"]["sanctioned"] is True
+    assert any("санкционной биржи" in f.lower() for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
 async def test_no_deposit_pattern_stays_personal_wallet():
     """Суммы прихода и вывода НЕ совпадают → не депозитник, остаётся кошельком."""
     addr = VALID_ADDR
