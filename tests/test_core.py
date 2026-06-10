@@ -193,7 +193,32 @@ async def test_exchange_deposit_wallet_sweep():
     assert v.risk_level == RiskLevel.SAFE
     dp = v.raw_labels["flow"]["deposit_pattern"]
     assert dp["exchange"] == "Bybit" and dp["matched_pairs"] == 3
-    assert any("Депозитный адрес биржи" in f for f in v.risk_flags)
+    assert any("Депозитный/транзитный адрес биржи" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_exchange_deposit_aggregation():
+    """Депозитник АГРЕГИРУЕТ несколько приходов в один вывод на биржу
+    (4129.33 + 10 + 20 → 4159.33 на Bybit). Суммы НЕ 1:1, но funnel ловится."""
+    addr = VALID_ADDR
+    transfers = [
+        _tr(addr, "TBybit", 4_159_330_000, to_tag="Bybit"),  # вывел всё на Bybit
+        _tr("Tsrc1", addr, 4_129_330_000),                   # приход извне
+        _tr("Tsrc2", addr, 10_000_000),
+        _tr("Tsrc2", addr, 20_000_000),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE
+    assert v.entity == "Депозитный кошелёк Bybit"
+    assert v.risk_level == RiskLevel.SAFE
+    dp = v.raw_labels["flow"]["deposit_pattern"]
+    assert dp["exchange"] == "Bybit"
+    assert dp["matched_pairs"] == 0          # 1:1 совпадений нет — поймали funnel
+    assert dp["concentration"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -221,13 +246,15 @@ async def test_sanctioned_exchange_deposit_wallet():
 
 
 @pytest.mark.asyncio
-async def test_no_deposit_pattern_stays_personal_wallet():
-    """Суммы прихода и вывода НЕ совпадают → не депозитник, остаётся кошельком."""
+async def test_two_way_exchange_not_deposit():
+    """Личный торговый кошелёк: и заводит на биржу, и ВЫВОДИТ с неё (двусторонний)
+    → не депозитник (депозитник от своей биржи ничего не получает)."""
     addr = VALID_ADDR
     transfers = [
-        _tr("Tx1", addr, 587_320_000),
-        _tr(addr, "TBybit", 123_000_000, to_tag="Bybit"),  # другая сумма
-        _tr(addr, "TBybit", 456_000_000, to_tag="Bybit"),  # другая сумма
+        _tr(addr, "TBybit", 500_000_000, to_tag="Bybit"),     # завёл на Bybit
+        _tr("TBybit2", addr, 300_000_000, from_tag="Bybit"),  # вывел С Bybit
+        _tr("Tfriend", addr, 200_000_000),                    # приход извне
+        _tr("Tfriend", addr, 100_000_000),
     ]
     with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
          patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
