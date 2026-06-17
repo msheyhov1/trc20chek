@@ -36,9 +36,13 @@ async def _run_bot():
         log.warning("BOT_TOKEN not set — Telegram bot disabled, API-only mode")
         return
     try:
-        from bot.main import dp
+        from bot.main import ALLOWED_TG_IDS, dp
         from aiogram import Bot
 
+        if ALLOWED_TG_IDS:
+            log.info("Bot access restricted to %d Telegram ID(s)", len(ALLOWED_TG_IDS))
+        else:
+            log.warning("ALLOWED_TG_IDS not set — bot is OPEN to everyone")
         bot = Bot(BOT_TOKEN)
         log.info("Starting Telegram bot polling...")
         await dp.start_polling(bot)

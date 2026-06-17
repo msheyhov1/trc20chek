@@ -5,10 +5,10 @@ import asyncio
 import logging
 import os
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject
 
 from core import check_address
 from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
@@ -17,6 +17,47 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
+
+def _parse_ids(raw: str) -> set[int]:
+    """Разбор списка TG-ID из env: '123, 456 789' → {123,456,789}."""
+    out: set[int] = set()
+    for chunk in raw.replace(",", " ").split():
+        try:
+            out.add(int(chunk))
+        except ValueError:
+            log.warning("ALLOWED_TG_IDS: пропускаю невалидный id %r", chunk)
+    return out
+
+
+# Белый список Telegram user_id. Пусто → доступ открыт (чтобы не залочиться
+# до настройки env); задан → бот отвечает только этим пользователям.
+ALLOWED_TG_IDS = _parse_ids(os.getenv("ALLOWED_TG_IDS", ""))
+
+
+def _is_allowed(user_id: int | None) -> bool:
+    if not ALLOWED_TG_IDS:
+        return True
+    return user_id in ALLOWED_TG_IDS
+
+
+class AccessMiddleware(BaseMiddleware):
+    """Гейт доступа по Telegram user_id. Незнакомцам — отказ, дальше не пускаем."""
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = data.get("event_from_user")
+        if not _is_allowed(user.id if user else None):
+            uid = user.id if user else "?"
+            log.warning("Доступ запрещён: user_id=%s", uid)
+            if isinstance(event, Message):
+                await event.answer(
+                    "⛔ Доступ к боту ограничен.\n"
+                    f"Ваш Telegram ID: <code>{uid}</code> — передайте его администратору "
+                    "для добавления в белый список.",
+                    parse_mode=ParseMode.HTML,
+                )
+            return  # обработчик не вызываем
+        return await handler(event, data)
 
 RISK_EMOJI = {
     RiskLevel.SAFE: "🟢",
@@ -102,6 +143,7 @@ def format_verdict(v: AddressVerdict) -> str:
 
 
 dp = Dispatcher()
+dp.message.middleware(AccessMiddleware())
 
 
 @dp.message(CommandStart())
@@ -149,6 +191,13 @@ async def main():
     from core.cluster import init_db as init_cluster_db
     await init_db()
     await init_cluster_db()
+    if ALLOWED_TG_IDS:
+        log.info("Доступ ограничен %d Telegram ID", len(ALLOWED_TG_IDS))
+    else:
+        log.warning(
+            "ALLOWED_TG_IDS не задан — бот ОТКРЫТ всем. "
+            "Задайте ALLOWED_TG_IDS, чтобы закрыть доступ по Telegram ID."
+        )
     bot = Bot(BOT_TOKEN)
     await dp.start_polling(bot)
 
