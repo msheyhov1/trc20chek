@@ -102,7 +102,7 @@ known_deposits_exchange}`. Разные депозитники ОДНОЙ бир
 # Установить зависимости
 pip install -r requirements.txt
 
-# Прогнать тесты (должны быть все зелёные: 31/31)
+# Прогнать тесты (должны быть все зелёные: 36/36)
 pytest -v
 
 # Локальный запуск (API + bot, если BOT_TOKEN задан; иначе только API)
@@ -124,6 +124,8 @@ curl http://localhost:8000/check/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 | `GOPLUS_API_KEY` | нет | Повышает лимиты GoPlus API |
 | `API_KEY` | нет | Если задано — REST API требует `?api_key=...` |
 | `ALLOWED_TG_IDS` | нет | Белый список Telegram user_id (через запятую/пробел). Пусто = бот открыт всем; задан = отвечает только этим ID |
+| `WEB_PASSWORD` | нет | Пароль на веб-сайт (HTTP Basic Auth на `/` и `/check`). Пусто = сайт открыт |
+| `WEB_USER` | нет | Логин для веб-пароля (по умолчанию `admin`) |
 | `CACHE_PATH` | нет | Путь к SQLite-кешу (по умолчанию `/data/cache.db`) |
 | `CLUSTER_PATH` | нет | Путь к SQLite кластеризации депозитников (по умолчанию `/data/cluster.db`) |
 | `CACHE_TTL_SECONDS` | нет | TTL кеша (по умолчанию 604800 = 7 дней) |
@@ -139,7 +141,8 @@ curl http://localhost:8000/check/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 - **Никаких сторонних эффектов при импорте**: `dp` в `bot/main.py` создаётся на модульном уровне, но polling стартует только из `if __name__ == "__main__"` или явно из `api/main.py` через lifespan
 - **Провайдер не падает на пользователя**: если внешний API недоступен, провайдер возвращает `{}` (см. `except httpx.HTTPError`). Агрегатор просто продолжит с тем, что есть
 - **Свежесть по умолчанию везде** (AML требует актуальных транзакций): бот вызывает `check_address(addr, use_cache=False)`; REST-эндпоинт `/check/{addr}` тоже свежий по умолчанию, кеш включается только явным `?cache=true`. Веб-форма ходит через API → тоже свежая. Кеш-инфраструктура (SQLite на `/data`) сохранена для опционального использования
-- **Доступ к боту по TG ID** (`bot/main.py`): `AccessMiddleware` на `dp.message` гейтит по `ALLOWED_TG_IDS` (env, через `_parse_ids`). Пусто = открыт всем (лог-warning при старте, чтобы не залочиться до настройки); задан = незнакомцам отказ с показом их собственного user_id для добавления в список. **Важно:** это закрывает только Telegram-бот. Веб-форма на `/` и REST `/check/{addr}` — отдельный публичный вектор (CORS `*`, только опц. `API_KEY`); TG-гейт на них не распространяется, т.к. там нет Telegram-контекста
+- **Доступ к боту по TG ID** (`bot/main.py`): `AccessMiddleware` на `dp.message` гейтит по `ALLOWED_TG_IDS` (env, через `_parse_ids`). Пусто = открыт всем (лог-warning при старте, чтобы не залочиться до настройки); задан = незнакомцам отказ с показом их собственного user_id для добавления в список
+- **Пароль на веб-сайт** (`api/main.py`): `require_web_auth` (HTTP Basic Auth, `secrets.compare_digest`) на `/` и `/check`. Включается `WEB_PASSWORD` (+`WEB_USER`, по умолч. `admin`); пусто = сайт открыт. `/health` НЕ закрыт (нужен Railway-healthcheck'у). Веб-форма ходит на `/check` относительным URL → браузер сам дошлёт Basic-креды того же origin. Бот не затронут — он зовёт `check_address()` напрямую, мимо HTTP
 
 ## Как добавить новый провайдер
 

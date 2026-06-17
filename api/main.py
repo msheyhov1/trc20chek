@@ -8,12 +8,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
 from core import check_address
@@ -27,6 +29,29 @@ log = logging.getLogger("app")
 API_KEY = os.getenv("API_KEY", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEB_DIR = Path(__file__).parent.parent / "web"
+
+# Пароль на веб-сайт (HTTP Basic Auth). Пусто = гейт выключен (сайт открыт).
+WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+WEB_USER = os.getenv("WEB_USER", "admin")
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_web_auth(
+    credentials: HTTPBasicCredentials | None = Depends(_basic),
+) -> None:
+    """Гейт сайта по логину/паролю. Если WEB_PASSWORD не задан — пропускаем всех.
+    Сравнение через secrets.compare_digest (защита от timing-атак)."""
+    if not WEB_PASSWORD:
+        return
+    ok = credentials is not None and secrets.compare_digest(
+        credentials.username, WEB_USER
+    ) and secrets.compare_digest(credentials.password, WEB_PASSWORD)
+    if not ok:
+        raise HTTPException(
+            status_code=401,
+            detail="Требуется авторизация",
+            headers={"WWW-Authenticate": 'Basic realm="TRC20 Checker"'},
+        )
 
 
 async def _run_bot():
@@ -57,6 +82,10 @@ async def _run_bot():
 async def lifespan(app: FastAPI):
     await init_db()
     await init_cluster_db()
+    if WEB_PASSWORD:
+        log.info("Web auth ENABLED (user=%s)", WEB_USER)
+    else:
+        log.warning("WEB_PASSWORD not set — website is PUBLIC")
     bot_task = asyncio.create_task(_run_bot())
     try:
         yield
@@ -93,6 +122,7 @@ async def check(
     address: str,
     cache: bool = Query(False, description="Использовать кеш (по умолчанию выкл — всегда свежие данные для AML)"),
     api_key: str | None = Query(None, description="API key (если включена защита)"),
+    _auth: None = Depends(require_web_auth),
 ):
     if API_KEY and api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -110,5 +140,5 @@ if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 
     @app.get("/")
-    async def index():
+    async def index(_auth: None = Depends(require_web_auth)):
         return FileResponse(WEB_DIR / "index.html")
