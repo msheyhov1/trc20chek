@@ -24,10 +24,17 @@ _AML_SKIP_TYPES = frozenset(
 AML_EXCHANGE_ENTITY_THRESHOLD = float(os.getenv("AML_EXCHANGE_ENTITY_THRESHOLD", "0.9"))
 
 
-def _relabel_from_swapster(verdict: AddressVerdict) -> None:
-    """Если у неопознанного адреса Swapster показал доминирующую биржевую
-    сущность (EXCHANGE*) с долей ≥ порога — помечаем как биржу/сервис."""
+def _relabel_from_swapster(verdict: AddressVerdict, is_transit: bool) -> None:
+    """Помечаем неопознанный адрес как биржу/сервис ТОЛЬКО если выполнено И то, И другое:
+      1) Swapster показал доминирующую биржевую сущность (EXCHANGE*) ≥ порога;
+      2) адрес ведёт себя как ТРАНЗИТ (форвардит ~всё полученное, не копит баланс).
+
+    Второе условие отсекает обычного юзера, который «всегда заводит с биржи» и
+    держит/тратит средства: у него высокая биржевая экспозиция, но он НЕ транзит.
+    Инфраструктура биржи (депозитник/хаб) — именно транзит."""
     if verdict.entity_type not in (EntityType.WALLET, EntityType.UNKNOWN, EntityType.LABELED):
+        return
+    if not is_transit:
         return
     ext = verdict.external_aml or {}
     if not ext.get("available") or ext.get("pending"):
@@ -47,6 +54,26 @@ def _relabel_from_swapster(verdict: AddressVerdict) -> None:
             pass
         if "Swapster" not in verdict.sources:
             verdict.sources.append("Swapster")
+
+
+# Транзит: адрес форвардит ≥ этой доли полученного и не копит существенный баланс.
+TRANSIT_FORWARD_RATIO = 0.8
+
+
+def _is_transit(transfers: list[dict[str, Any]], addr: str, balance_usdt: float) -> bool:
+    """Пересылает почти всё полученное и держит ~0 (инфраструктура, не личный кошелёк)."""
+    tin = tout = 0.0
+    for t in transfers:
+        amt = _amount(t)
+        if amt <= 0:
+            continue
+        if t.get("from_address") == addr:
+            tout += amt
+        elif t.get("to_address") == addr:
+            tin += amt
+    if tin <= 0:
+        return False
+    return tout >= TRANSIT_FORWARD_RATIO * tin and balance_usdt < 0.1 * tin
 
 # Нормализация биржевых меток
 EXCHANGE_KEYWORDS: dict[str, str] = {
@@ -809,8 +836,10 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         verdict.external_aml = {"skipped": True, "reason": "биржа/сервис — AML не требуется"}
     else:
         verdict.external_aml = await aml_external.check(address)
-        # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто.
-        _relabel_from_swapster(verdict)
+        # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто,
+        # но только если адрес ещё и ведёт себя как транзит (не личный юзер).
+        transit = _is_transit(flow_data, address, verdict.balance_usdt)
+        _relabel_from_swapster(verdict, transit)
 
     # Кеш
     if use_cache:

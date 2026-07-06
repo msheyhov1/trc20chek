@@ -350,6 +350,30 @@ async def test_swapster_relabels_unlabeled_as_exchange():
 
 
 @pytest.mark.asyncio
+async def test_swapster_does_not_relabel_personal_holder():
+    """Юзер всегда заводит с Bybit и ДЕРЖИТ (не форвардит) → у Swapster высокая
+    биржевая экспозиция, но адрес НЕ транзит → остаётся кошельком, НЕ биржей."""
+    addr = VALID_ADDR
+    transfers = [
+        _tr("TBybit", addr, 50_000_000_000, from_tag="Bybit"),
+        _tr("TBybit", addr, 30_000_000_000, from_tag="Bybit"),
+    ]  # только приход, ничего не пересылает дальше
+    aml = {
+        "available": True, "provider": "Swapster", "pending": False,
+        "risk_score": 8.0, "risk_level": "safe",
+        "entities": [{"entity": "EXCHANGE LICENSED", "level": "LOW_RISK", "risk_score": 99.6}],
+    }
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())), \
+         patch("core.aggregator.aml_external.check", new=AsyncMock(return_value=aml)):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.WALLET
+    assert "Биржа" not in (v.entity or "")
+
+
+@pytest.mark.asyncio
 async def test_flow_does_not_override_contract():
     """Если TronScan уже опознал контракт — flow его не понижает до кошелька."""
     ts_resp = {"address": VALID_ADDR, "accountType": 2,
