@@ -91,33 +91,27 @@ RISK_RU = {
 }
 
 
+def _fmt_amount(x: float) -> str:
+    """Компактно: 1 234.56 (без лишних нулей для целых)."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "0"
+    s = f"{x:,.2f}".replace(",", " ")
+    return s[:-3] if s.endswith(".00") else s
+
+
 def format_verdict(v: AddressVerdict) -> str:
     emoji = RISK_EMOJI[v.risk_level]
     lines = [
         f"{emoji} <b>{v.entity or '—'}</b>",
         f"<i>Тип:</i> {TYPE_RU[v.entity_type]}",
-        f"<i>Риск:</i> {RISK_RU[v.risk_level]} · скор {v.risk_score}/100",
-        f"<code>{_score_bar(v.risk_score)}</code>",
         "",
         f"<code>{v.address}</code>",
+        f"<i>Баланс:</i> {_fmt_amount(v.balance_usdt)} USDT · {_fmt_amount(v.balance_trx)} TRX",
     ]
-    aml = v.aml or {}
-    if aml.get("transfers_analyzed"):
-        s = aml.get("sanctions_exposure_pct", 0)
-        se = aml.get("sanctioned_exchange_exposure_pct", 0)
-        ex = aml.get("exchange_exposure_pct", 0)
-        ot = aml.get("other_exposure_pct", 0)
-        lines.append("")
-        lines.append(f"<b>AML-экспозиция</b> (по {aml['transfers_analyzed']} переводам):")
-        ind = aml.get("indirect_sanctions_pct", 0)
-        lines.append(f"  🚨 санкц. адреса: {s}%")
-        if se:
-            lines.append(f"  🚫 санкц. биржи: {se}%")
-        if ind:
-            n = aml.get("hop2_intermediaries_checked", 0)
-            lines.append(f"  🔗 косвенно (2-й хоп): ~{ind}%")
-        lines.append(f"  🏦 биржи: {ex}%")
-        lines.append(f"  ❔ прочее: {ot}%")
+
+    # Связи с биржами (оставляем)
     if v.exchange_links:
         lines.append("")
         lines.append("<b>Связи с биржами:</b>")
@@ -129,15 +123,27 @@ def format_verdict(v: AddressVerdict) -> str:
                 parts.append(f"выводы ×{e['withdrawals']}")
             mark = " 🚫<b>САНКЦ.</b>" if e.get("sanctioned") else ""
             lines.append(f"  • {e['name']}{mark}: {', '.join(parts)}")
-    if v.risk_flags:
+
+    # Туннель: AML показываем только для НЕ-биржевых кошельков
+    ext = v.external_aml or {}
+    if ext.get("skipped"):
+        pass  # биржа/сервис — AML не нужен
+    elif ext.get("available"):
         lines.append("")
-        lines.append("<b>Флаги:</b>")
-        for f in v.risk_flags[:10]:
-            lines.append(f"  • {f}")
-    if v.sources:
+        prov = ext.get("provider", "AML")
+        rl, rs = ext.get("risk_level"), ext.get("risk_score")
+        try:
+            rl_ru = RISK_RU.get(RiskLevel(rl)) if rl else None
+        except ValueError:
+            rl_ru = str(rl)
+        tail = " · ".join(p for p in [rl_ru, f"скор {rs}/100" if rs is not None else None] if p)
+        lines.append(f"<b>AML ({prov}):</b> {tail}".rstrip())
+    elif ext:
         lines.append("")
-        lines.append(f"<i>Источники:</i> {', '.join(v.sources)}")
+        lines.append(f"<i>AML:</i> {ext.get('reason', 'внешний API не настроен')}")
+
     if v.cached:
+        lines.append("")
         lines.append("<i>(из кеша)</i>")
     return "\n".join(lines)
 

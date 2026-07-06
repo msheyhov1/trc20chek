@@ -8,9 +8,15 @@ from typing import Any
 
 import httpx
 
-from . import cache, cluster
+from . import aml_external, balance, cache, cluster
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 from .providers import flow, goplus, local, ofac, tronscan
+
+# Туннель: для этих типов внешний AML-API НЕ запрашивается
+# (биржа/депозитник биржи/контракт — инфраструктура; скам/санкции уже помечены).
+_AML_SKIP_TYPES = frozenset(
+    {EntityType.EXCHANGE, EntityType.CONTRACT, EntityType.SCAM, EntityType.SANCTIONED}
+)
 
 # Нормализация биржевых меток
 EXCHANGE_KEYWORDS: dict[str, str] = {
@@ -713,6 +719,9 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
                 exchange_links=cached.get("exchange_links", []),
                 risk_score=cached.get("risk_score", 0),
                 aml=cached.get("aml", {}),
+                balance_trx=cached.get("balance_trx", 0.0),
+                balance_usdt=cached.get("balance_usdt", 0.0),
+                external_aml=cached.get("external_aml", {}),
                 cached=True,
             )
             return v
@@ -756,6 +765,17 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     # _compute_aml (у адреса может быть реальный риск от экспозиции/2-хопа).
     if verdict.entity_type == EntityType.UNKNOWN and not verdict.entity:
         verdict.entity = "No public labels"
+
+    # Баланс кошелька (из уже полученного ответа TronScan)
+    verdict.balance_trx, verdict.balance_usdt = balance.extract_balances(ts_data)
+
+    # Туннель: биржа/контракт/скам/санкции → внешний AML не зовём.
+    # Обычный кошелёк (WALLET/UNKNOWN/LABELED) → запрашиваем AML через внешний API.
+    if verdict.entity_type in _AML_SKIP_TYPES:
+        verdict.external_aml = {"skipped": True, "reason": "биржа/сервис — AML не требуется"}
+    else:
+        async with httpx.AsyncClient() as aml_client:
+            verdict.external_aml = await aml_external.check(address, aml_client)
 
     # Кеш
     if use_cache:

@@ -30,9 +30,13 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
+function fmtAmount(x) {
+  const n = Number(x) || 0;
+  const s = n.toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  return s;
+}
+
 function render(verdict) {
-  const flags = (verdict.risk_flags || []).map(f => `<div class="flag">${escapeHtml(f)}</div>`).join("");
-  const sources = (verdict.sources || []).join(", ") || "—";
   const links = (verdict.exchange_links || []).map(e => {
     const parts = [];
     if (e.deposits) parts.push(`депозиты ×${e.deposits}`);
@@ -40,31 +44,34 @@ function render(verdict) {
     const mark = e.sanctioned ? " 🚫 САНКЦ." : "";
     return `<div class="flag">${escapeHtml(e.name)}${mark}: ${escapeHtml(parts.join(", "))}</div>`;
   }).join("");
-  const aml = verdict.aml || {};
-  const score = verdict.risk_score || 0;
+
+  // Туннель: AML показываем только для НЕ-биржевых кошельков
+  const ext = verdict.external_aml || {};
   let amlBlock = "";
-  if (aml.transfers_analyzed) {
-    const se = aml.sanctioned_exchange_exposure_pct || 0;
-    const ind = aml.indirect_sanctions_pct || 0;
-    amlBlock = `<div class="flags"><h3>AML-экспозиция (по ${aml.transfers_analyzed} переводам)</h3>`
-      + `<div class="flag">🚨 санкц. адреса: ${aml.sanctions_exposure_pct || 0}%</div>`
-      + (se ? `<div class="flag">🚫 санкц. биржи: ${se}%</div>` : "")
-      + (ind ? `<div class="flag">🔗 косвенно (2-й хоп): ~${ind}%</div>` : "")
-      + `<div class="flag">🏦 биржи: ${aml.exchange_exposure_pct || 0}%</div>`
-      + `<div class="flag">❔ прочее: ${aml.other_exposure_pct || 0}%</div></div>`;
+  if (ext.skipped) {
+    amlBlock = "";
+  } else if (ext.available) {
+    const tail = [
+      ext.risk_level ? (RISK_RU[ext.risk_level] || ext.risk_level) : null,
+      (ext.risk_score !== undefined && ext.risk_score !== null) ? `скор ${ext.risk_score}/100` : null,
+    ].filter(Boolean).join(" · ");
+    amlBlock = `<div class="flags"><h3>AML (${escapeHtml(ext.provider || "AML")})</h3>`
+      + `<div class="flag">${escapeHtml(tail || "—")}</div></div>`;
+  } else if (Object.keys(ext).length) {
+    amlBlock = `<div class="meta">AML: ${escapeHtml(ext.reason || "внешний API не настроен")}</div>`;
   }
+
   result.innerHTML = `
     <div class="verdict-header">
       <span class="dot ${escapeHtml(verdict.risk_level)}"></span>
       <span class="entity">${escapeHtml(verdict.entity || "—")}</span>
     </div>
     <div class="meta">Тип: ${TYPE_RU[verdict.entity_type] || verdict.entity_type}</div>
-    <div class="meta">Риск: ${RISK_RU[verdict.risk_level] || verdict.risk_level} · скор ${score}/100</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
-    ${amlBlock}
+    <div class="meta">Баланс: ${fmtAmount(verdict.balance_usdt)} USDT · ${fmtAmount(verdict.balance_trx)} TRX</div>
     ${links ? `<div class="flags"><h3>Связи с биржами</h3>${links}</div>` : ""}
-    ${flags ? `<div class="flags"><h3>Флаги</h3>${flags}</div>` : ""}
-    <div class="sources">Источники: ${escapeHtml(sources)}${verdict.cached ? " · из кеша" : ""}</div>
+    ${amlBlock}
+    ${verdict.cached ? `<div class="sources">из кеша</div>` : ""}
   `;
   result.classList.remove("hidden");
 }

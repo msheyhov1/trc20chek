@@ -35,9 +35,14 @@ class AddressVerdict:
     raw_labels: dict[str, Any] = field(default_factory=dict)
     # Связи с биржами по анализу переводов (flow): [{name, deposits, withdrawals, total}]
     exchange_links: list[dict[str, Any]] = field(default_factory=list)
-    # AML: числовой скор 0-100 + разбивка экспозиции по контрагентам
+    # AML: числовой скор 0-100 + разбивка экспозиции по контрагентам (внутренняя, on-chain)
     risk_score: int = 0
     aml: dict[str, Any] = field(default_factory=dict)
+    # Баланс кошелька (из TronScan /api/account)
+    balance_trx: float = 0.0
+    balance_usdt: float = 0.0
+    # Результат внешнего AML-API (туннель: заполняется только для НЕ-биржевых кошельков)
+    external_aml: dict[str, Any] = field(default_factory=dict)
     cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -48,6 +53,9 @@ class AddressVerdict:
             "risk_level": self.risk_level.value,
             "risk_score": self.risk_score,
             "aml": self.aml,
+            "balance_trx": self.balance_trx,
+            "balance_usdt": self.balance_usdt,
+            "external_aml": self.external_aml,
             "risk_flags": self.risk_flags,
             "sources": self.sources,
             "raw_labels": self.raw_labels,
