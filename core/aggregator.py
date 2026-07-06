@@ -339,7 +339,7 @@ def _detect_exchange_deposit(
     return {
         "exchange": exch,
         "concentration": round(concentration, 2),
-        "forwarded_pct": round(min(out_e / in_other, 9.99) * 100, 1),
+        "forwarded_pct": round(min(out_e / total_in, 9.99) * 100, 1) if total_in else 0.0,
         "in_sources": len(in_sources),
         "matched_pairs": pairs,
         "hot_wallet": hot_wallet,
