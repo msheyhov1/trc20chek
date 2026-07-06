@@ -76,7 +76,11 @@ def _is_transit(transfers: list[dict[str, Any]], addr: str, balance_usdt: float)
     return tout >= TRANSIT_FORWARD_RATIO * tin and balance_usdt < 0.1 * tin
 
 # Нормализация биржевых меток
+# Ключ — подстрока тега TronScan (lowercase), значение — каноничное имя.
+# Матчинг по вхождению (см. _normalize_exchange), поэтому ключи должны быть
+# различимыми (без коротких/общих слов, чтобы не ловить ложные совпадения).
 EXCHANGE_KEYWORDS: dict[str, str] = {
+    # топ по обороту / USDT-TRC20
     "binance": "Binance",
     "okx": "OKX",
     "okex": "OKX",
@@ -86,13 +90,66 @@ EXCHANGE_KEYWORDS: dict[str, str] = {
     "gateio": "Gate.io",
     "bitget": "Bitget",
     "mexc": "MEXC",
-    "mxc": "MEXC",  # TronScan метит хот-кошельки MEXC как «MXC» (старое имя)
+    "mxc": "MEXC",          # TronScan метит хот-кошельки MEXC как «MXC» (старое имя)
     "kraken": "Kraken",
     "coinbase": "Coinbase",
     "bitfinex": "Bitfinex",
     "poloniex": "Poloniex",
     "crypto.com": "Crypto.com",
     "bitstamp": "Bitstamp",
+    # средний эшелон / активны с TRC20
+    "bitmart": "BitMart",
+    "bitrue": "Bitrue",
+    "coinex": "CoinEx",
+    "lbank": "LBank",
+    "whitebit": "WhiteBIT",
+    "phemex": "Phemex",
+    "bingx": "BingX",
+    "bitmex": "BitMEX",
+    "deribit": "Deribit",
+    "ascendex": "AscendEX",
+    "digifinex": "DigiFinex",
+    "pionex": "Pionex",
+    "btse": "BTSE",
+    "toobit": "Toobit",
+    "weex": "WEEX",
+    "coinw": "CoinW",
+    "bitunix": "Bitunix",
+    "deepcoin": "Deepcoin",
+    "probit": "ProBit",
+    "hitbtc": "HitBTC",
+    "latoken": "LATOKEN",
+    "bigone": "BigONE",
+    "coincheck": "Coincheck",
+    "bitflyer": "bitFlyer",
+    "gemini": "Gemini",
+    "bittrex": "Bittrex",
+    "xt.com": "XT.com",
+    "cointr": "CoinTR",
+    "fameex": "FameEX",
+    "biconomy": "Biconomy",
+    "hotcoin": "Hotcoin",
+    "azbit": "Azbit",
+    "nominex": "Nominex",
+    # региональные
+    "bithumb": "Bithumb",
+    "upbit": "Upbit",
+    "coinone": "Coinone",
+    "korbit": "Korbit",
+    "bitkub": "Bitkub",
+    "indodax": "Indodax",
+    "tokocrypto": "Tokocrypto",
+    "wazirx": "WazirX",
+    "coindcx": "CoinDCX",
+    "bitso": "Bitso",
+    "bitpanda": "Bitpanda",
+    "bitvavo": "Bitvavo",
+    "luno": "Luno",
+    "nobitex": "Nobitex",
+    "wallex": "Wallex",
+    # кастодиальные/лендинг (держат USDT, часто метятся как биржи)
+    "nexo": "Nexo",
+    "cex.io": "CEX.IO",
 }
 
 # Биржи под санкциями. Деньги с них блокируются комплаенсом ("заморозка").

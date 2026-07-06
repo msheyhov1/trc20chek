@@ -349,6 +349,20 @@ async def test_swapster_relabels_unlabeled_as_exchange():
     assert "Swapster" in (v.entity or "")
 
 
+def test_normalize_exchange_tags():
+    """Теги TronScan (с суффиксами/регистром) → каноничное имя; обычные слова → None."""
+    from core.aggregator import _normalize_exchange
+    assert _normalize_exchange("MXC 2") == "MEXC"
+    assert _normalize_exchange("Bybit Deposit") == "Bybit"
+    assert _normalize_exchange("BitMart 1") == "BitMart"
+    assert _normalize_exchange("WhiteBIT") == "WhiteBIT"
+    assert _normalize_exchange("Coinbase Prime") == "Coinbase"
+    assert _normalize_exchange("XT.COM") == "XT.com"
+    # анти-ложные срабатывания
+    for w in ("Justin Sun", "SunSwap", "Tether Treasury", "Bitcoin", "Contract", ""):
+        assert _normalize_exchange(w) is None
+
+
 @pytest.mark.asyncio
 async def test_deposit_to_mexc_funded_from_other_exchanges():
     """Депозитник MEXC, куда средства заводят выводами с Bybit/Binance и форвардят
