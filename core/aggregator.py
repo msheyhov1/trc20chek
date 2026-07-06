@@ -774,8 +774,7 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     if verdict.entity_type in _AML_SKIP_TYPES:
         verdict.external_aml = {"skipped": True, "reason": "биржа/сервис — AML не требуется"}
     else:
-        async with httpx.AsyncClient() as aml_client:
-            verdict.external_aml = await aml_external.check(address, aml_client)
+        verdict.external_aml = await aml_external.check(address)
 
     # Кеш
     if use_cache:

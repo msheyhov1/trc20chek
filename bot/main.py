@@ -91,6 +91,9 @@ RISK_RU = {
 }
 
 
+_AML_LEVEL_EMOJI = {"LOW_RISK": "✅", "MEDIUM_RISK": "⚠️", "HIGH_RISK": "⛔️"}
+
+
 def _fmt_amount(x: float) -> str:
     """Компактно: 1 234.56 (без лишних нулей для целых)."""
     try:
@@ -131,13 +134,20 @@ def format_verdict(v: AddressVerdict) -> str:
     elif ext.get("available"):
         lines.append("")
         prov = ext.get("provider", "AML")
-        rl, rs = ext.get("risk_level"), ext.get("risk_score")
-        try:
-            rl_ru = RISK_RU.get(RiskLevel(rl)) if rl else None
-        except ValueError:
-            rl_ru = str(rl)
-        tail = " · ".join(p for p in [rl_ru, f"скор {rs}/100" if rs is not None else None] if p)
-        lines.append(f"<b>AML ({prov}):</b> {tail}".rstrip())
+        if ext.get("pending"):
+            lines.append(f"<b>AML ({prov}):</b> ⏳ результат готовится, повторите через минуту")
+        else:
+            rl, rs = ext.get("risk_level"), ext.get("risk_score")
+            try:
+                rl_ru = RISK_RU.get(RiskLevel(rl)) if rl else None
+            except ValueError:
+                rl_ru = str(rl)
+            tail = " · ".join(p for p in [rl_ru, f"{rs}%" if rs is not None else None] if p)
+            lines.append(f"<b>AML ({prov}):</b> {tail}".rstrip() or f"<b>AML ({prov})</b>")
+            for e in ext.get("entities", [])[:6]:
+                mark = _AML_LEVEL_EMOJI.get(e.get("level"), "•")
+                es = e.get("risk_score")
+                lines.append(f"  {mark} {e.get('entity', '—')}" + (f" — {es}%" if es is not None else ""))
     elif ext:
         lines.append("")
         lines.append(f"<i>AML:</i> {ext.get('reason', 'внешний API не настроен')}")
