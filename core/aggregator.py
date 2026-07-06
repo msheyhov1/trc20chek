@@ -18,6 +18,36 @@ _AML_SKIP_TYPES = frozenset(
     {EntityType.EXCHANGE, EntityType.CONTRACT, EntityType.SCAM, EntityType.SANCTIONED}
 )
 
+# Доля доминирующей биржевой сущности в AML, при которой НЕразмеченный адрес
+# считаем биржей/сервисом. Swapster видит off-chain принадлежность, которой нет
+# у TronScan/on-chain (напр. транзитный хаб биржи без публичной метки). Тюнится env.
+AML_EXCHANGE_ENTITY_THRESHOLD = float(os.getenv("AML_EXCHANGE_ENTITY_THRESHOLD", "0.9"))
+
+
+def _relabel_from_swapster(verdict: AddressVerdict) -> None:
+    """Если у неопознанного адреса Swapster показал доминирующую биржевую
+    сущность (EXCHANGE*) с долей ≥ порога — помечаем как биржу/сервис."""
+    if verdict.entity_type not in (EntityType.WALLET, EntityType.UNKNOWN, EntityType.LABELED):
+        return
+    ext = verdict.external_aml or {}
+    if not ext.get("available") or ext.get("pending"):
+        return
+    entities = ext.get("entities") or []
+    if not entities:
+        return
+    top = max(entities, key=lambda e: e.get("risk_score") or 0)
+    share = (top.get("risk_score") or 0) / 100.0
+    name = top.get("entity") or ""
+    if "EXCHANGE" in name.upper() and share >= AML_EXCHANGE_ENTITY_THRESHOLD:
+        verdict.entity_type = EntityType.EXCHANGE
+        verdict.entity = f"Биржа/сервис (Swapster: {name} {top.get('risk_score')}%)"
+        try:
+            verdict.risk_level = RiskLevel(ext.get("risk_level"))
+        except ValueError:
+            pass
+        if "Swapster" not in verdict.sources:
+            verdict.sources.append("Swapster")
+
 # Нормализация биржевых меток
 EXCHANGE_KEYWORDS: dict[str, str] = {
     "binance": "Binance",
@@ -779,6 +809,8 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         verdict.external_aml = {"skipped": True, "reason": "биржа/сервис — AML не требуется"}
     else:
         verdict.external_aml = await aml_external.check(address)
+        # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто.
+        _relabel_from_swapster(verdict)
 
     # Кеш
     if use_cache:
