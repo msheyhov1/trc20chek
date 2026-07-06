@@ -350,6 +350,26 @@ async def test_swapster_relabels_unlabeled_as_exchange():
 
 
 @pytest.mark.asyncio
+async def test_deposit_to_mexc_funded_from_other_exchanges():
+    """Депозитник MEXC, куда средства заводят выводами с Bybit/Binance и форвардят
+    на хот-кошелёк MEXC (в TronScan помечен «MXC»). Имя биржи берётся on-chain."""
+    addr = VALID_ADDR
+    transfers = [
+        _tr("TBybit", addr, 57_000_000_000, from_tag="Bybit"),
+        _tr("TBinance", addr, 12_000_000_000, from_tag="Binance"),
+        _tr(addr, "TMXChot", 40_000_000_000, to_tag="MXC"),
+        _tr(addr, "TMXChot2", 29_000_000_000, to_tag="MXC 2"),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE
+    assert "MEXC" in (v.entity or "")
+
+
+@pytest.mark.asyncio
 async def test_swapster_does_not_relabel_personal_holder():
     """Юзер всегда заводит с Bybit и ДЕРЖИТ (не форвардит) → у Swapster высокая
     биржевая экспозиция, но адрес НЕ транзит → остаётся кошельком, НЕ биржей."""

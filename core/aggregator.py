@@ -86,6 +86,7 @@ EXCHANGE_KEYWORDS: dict[str, str] = {
     "gateio": "Gate.io",
     "bitget": "Bitget",
     "mexc": "MEXC",
+    "mxc": "MEXC",  # TronScan метит хот-кошельки MEXC как «MXC» (старое имя)
     "kraken": "Kraken",
     "coinbase": "Coinbase",
     "bitfinex": "Bitfinex",
@@ -265,6 +266,7 @@ def _detect_exchange_deposit(
     out_other = 0.0                   # отток на не-биржи
     in_exch: dict[str, float] = {}    # приток С бирж (выводы), по биржам
     in_other = 0.0                    # приток от не-бирж («депозиты» пользователей)
+    in_tx = 0                         # всего входящих переводов (с бирж И извне)
     in_sources: set[str] = set()
     in_amounts: list[float] = []
     out_pairs: list[tuple[float, str]] = []
@@ -287,6 +289,7 @@ def _detect_exchange_deposit(
             else:
                 out_other += amt
         elif addr == t.get("to_address"):
+            in_tx += 1
             exch = _normalize_exchange((t.get("from_address_tag") or {}).get("from_address_tag"))
             if exch:
                 in_exch[exch] = in_exch.get(exch, 0.0) + amt
@@ -303,16 +306,19 @@ def _detect_exchange_deposit(
     out_e = out_exch[exch]
     concentration = out_e / total_out if total_out > 0 else 0.0
 
-    # funnel-критерии депозитника
+    # funnel-критерии депозитника. Приход может идти и от «внешних юзеров», и с
+    # ДРУГИХ бирж (напр. вывел с Bybit/Binance → форварднул на MEXC) — в обоих
+    # случаях адрес funnel'ит на одну биржу.
+    total_in = in_other + sum(in_exch.values())
     is_deposit = (
         concentration >= DEPOSIT_CONCENTRATION   # почти весь отток — на одну биржу
-        # от этой биржи приходит мало относительно оттока на неё: газ-пополнения
-        # для sweep — норма, а вот сопоставимый обратный поток = личный торговый
+        # от ЭТОЙ биржи приходит мало относительно оттока на неё: газ-пополнения
+        # для sweep — норма, а сопоставимый обратный поток = личный торговый
         # кошелёк (и заводит, и выводит), это НЕ депозитник.
         and in_exch.get(exch, 0.0) <= DEPOSIT_BACKFLOW_RATIO * out_e
-        and in_other > 0                          # есть внешние «депозиты»
-        and len(in_amounts) >= 2                  # не одиночный перевод
-        and out_e >= DEPOSIT_FORWARD_RATIO * in_other  # пересылает бóльшую часть
+        and in_tx >= 2                            # активный получатель, не одиночный перевод
+        and total_in > 0
+        and out_e >= DEPOSIT_FORWARD_RATIO * total_in  # форвардит бóльшую часть полученного
     )
     if not is_deposit:
         return None
