@@ -303,6 +303,28 @@ async def test_two_way_exchange_not_deposit():
 
 
 @pytest.mark.asyncio
+async def test_deposit_wallet_with_gas_backflow():
+    """Депозитник получает от биржи МЕЛОЧЬ на газ (sweep), но весь отток — на неё.
+    Малый обратный поток (≤15% оттока) не должен ломать распознавание депозитника."""
+    addr = VALID_ADDR
+    transfers = [
+        _tr(addr, "TBybitHot", 60_000_000_000, to_tag="Bybit"),   # отток на Bybit
+        _tr(addr, "TBybitHot", 42_000_000_000, to_tag="Bybit"),
+        _tr("TBybitGas", addr, 2_000_000_000, from_tag="Bybit"),  # газ с Bybit (~2% оттока)
+        _tr("Tuser1", addr, 50_000_000_000),                      # внешние депозиты
+        _tr("Tuser2", addr, 46_000_000_000),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE
+    assert "Депозитный" in (v.entity or "")
+    assert "deposit_pattern" in v.raw_labels.get("flow", {})
+
+
+@pytest.mark.asyncio
 async def test_flow_does_not_override_contract():
     """Если TronScan уже опознал контракт — flow его не понижает до кошелька."""
     ts_resp = {"address": VALID_ADDR, "accountType": 2,

@@ -36,6 +36,15 @@ function fmtAmount(x) {
   return s;
 }
 
+function fmtPct(value) {
+  if (value === null || value === undefined) return "—";
+  const v = Number(value);
+  if (Number.isNaN(v)) return "—";
+  if (Math.abs(v - Math.round(v)) < 0.05) return `${Math.round(v)}%`;
+  if (Math.abs(v) < 1) return `${parseFloat(v.toFixed(2))}%`;
+  return `${parseFloat(v.toFixed(1))}%`;
+}
+
 function render(verdict) {
   const links = (verdict.exchange_links || []).map(e => {
     const parts = [];
@@ -48,25 +57,32 @@ function render(verdict) {
   // Туннель: AML показываем только для НЕ-биржевых кошельков
   const ext = verdict.external_aml || {};
   let amlBlock = "";
-  const AML_EMOJI = { LOW_RISK: "✅", MEDIUM_RISK: "⚠️", HIGH_RISK: "⛔️" };
+  const AML_GROUPS = [
+    ["LOW_RISK", "✅ Минимальный риск"],
+    ["MEDIUM_RISK", "⚠️ Средний риск"],
+    ["HIGH_RISK", "⛔️ Высокий риск"],
+  ];
   if (ext.skipped) {
     amlBlock = "";
   } else if (ext.available) {
     const prov = escapeHtml(ext.provider || "AML");
     if (ext.pending) {
-      amlBlock = `<div class="flags"><h3>AML (${prov})</h3><div class="flag">⏳ результат готовится, повторите через минуту</div></div>`;
+      amlBlock = `<div class="flags"><h3>🔍 AML-проверка (${prov} · USDT · TRC20)</h3>`
+        + `<div class="flag">⏳ Результат ещё готовится, повторите через минуту</div></div>`;
     } else {
-      const tail = [
-        ext.risk_level ? (RISK_RU[ext.risk_level] || ext.risk_level) : null,
-        (ext.risk_score !== undefined && ext.risk_score !== null) ? `${ext.risk_score}%` : null,
-      ].filter(Boolean).join(" · ");
-      const ents = (ext.entities || []).slice(0, 6).map(e => {
-        const m = AML_EMOJI[e.level] || "•";
-        const s = (e.risk_score !== undefined && e.risk_score !== null) ? ` — ${e.risk_score}%` : "";
-        return `<div class="flag">${m} ${escapeHtml(e.entity || "—")}${escapeHtml(s)}</div>`;
-      }).join("");
-      amlBlock = `<div class="flags"><h3>AML (${prov})</h3>`
-        + `<div class="flag">${escapeHtml(tail || "—")}</div>${ents}</div>`;
+      const rs = ext.risk_score;
+      const emoji = (rs === null || rs === undefined) ? "❔" : (rs < 25 ? "✅" : (rs < 75 ? "⚠️" : "⛔️"));
+      let inner = `<div class="flag">${emoji} Риск: <b>${escapeHtml(fmtPct(rs))}</b></div>`;
+      for (const [level, title] of AML_GROUPS) {
+        const items = (ext.entities || []).filter(e => e.level === level)
+          .sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0));
+        if (!items.length) continue;
+        inner += `<div class="aml-group"><b>${title}:</b></div>`;
+        for (const it of items) {
+          inner += `<div class="flag">• ${escapeHtml(it.entity || "—")} — ${escapeHtml(fmtPct(it.risk_score))}</div>`;
+        }
+      }
+      amlBlock = `<div class="flags"><h3>🔍 AML-проверка (${prov} · USDT · TRC20)</h3>${inner}</div>`;
     }
   } else if (Object.keys(ext).length) {
     amlBlock = `<div class="meta">AML: ${escapeHtml(ext.reason || "внешний API не настроен")}</div>`;

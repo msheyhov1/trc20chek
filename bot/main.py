@@ -92,6 +92,36 @@ RISK_RU = {
 
 
 _AML_LEVEL_EMOJI = {"LOW_RISK": "✅", "MEDIUM_RISK": "⚠️", "HIGH_RISK": "⛔️"}
+_AML_GROUPS = [
+    ("LOW_RISK", "✅ Минимальный риск"),
+    ("MEDIUM_RISK", "⚠️ Средний риск"),
+    ("HIGH_RISK", "⛔️ Высокий риск"),
+]
+
+
+def _fmt_pct(value) -> str:
+    """48 -> '48%', 69.3 -> '69.3%', 0.9 -> '0.9%', None -> '—'."""
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(v - round(v)) < 0.05:
+        return f"{v:.0f}%"
+    if abs(v) < 1:
+        return f"{v:.2f}".rstrip("0").rstrip(".") + "%"
+    return f"{v:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _aml_risk_emoji(pct) -> str:
+    if pct is None:
+        return "❔"
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        return "❔"
+    return "✅" if pct < 25 else ("⚠️" if pct < 75 else "⛔️")
 
 
 def _fmt_amount(x: float) -> str:
@@ -134,20 +164,22 @@ def format_verdict(v: AddressVerdict) -> str:
     elif ext.get("available"):
         lines.append("")
         prov = ext.get("provider", "AML")
+        lines.append(f"🔍 <b>AML-проверка</b> ({prov} · USDT · TRC20)")
         if ext.get("pending"):
-            lines.append(f"<b>AML ({prov}):</b> ⏳ результат готовится, повторите через минуту")
+            lines.append("⏳ Результат ещё готовится. Повторите проверку через минуту.")
         else:
-            rl, rs = ext.get("risk_level"), ext.get("risk_score")
-            try:
-                rl_ru = RISK_RU.get(RiskLevel(rl)) if rl else None
-            except ValueError:
-                rl_ru = str(rl)
-            tail = " · ".join(p for p in [rl_ru, f"{rs}%" if rs is not None else None] if p)
-            lines.append(f"<b>AML ({prov}):</b> {tail}".rstrip() or f"<b>AML ({prov})</b>")
-            for e in ext.get("entities", [])[:6]:
-                mark = _AML_LEVEL_EMOJI.get(e.get("level"), "•")
-                es = e.get("risk_score")
-                lines.append(f"  {mark} {e.get('entity', '—')}" + (f" — {es}%" if es is not None else ""))
+            rs = ext.get("risk_score")
+            lines.append(f"{_aml_risk_emoji(rs)} Риск: <b>{_fmt_pct(rs)}</b>")
+            entities = ext.get("entities", [])
+            for level, title in _AML_GROUPS:
+                items = [e for e in entities if e.get("level") == level]
+                if not items:
+                    continue
+                items.sort(key=lambda e: e.get("risk_score") or 0, reverse=True)
+                lines.append("")
+                lines.append(f"<b>{title}:</b>")
+                for it in items:
+                    lines.append(f"• {it.get('entity', '—')} — {_fmt_pct(it.get('risk_score'))}")
     elif ext:
         lines.append("")
         lines.append(f"<i>AML:</i> {ext.get('reason', 'внешний API не настроен')}")

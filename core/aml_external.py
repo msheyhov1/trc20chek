@@ -151,7 +151,7 @@ async def check(address: str) -> dict[str, Any]:
         "available": True,
         "provider": PROVIDER,
         "pending": pending,
-        "risk_score": None if pct is None else int(round(pct)),
+        "risk_score": pct,  # проценты с десятыми (0..100) или None
         "risk_level": _level_from_pct(pct),
         "entities": entities,
         "details": data,

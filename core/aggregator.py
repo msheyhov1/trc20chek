@@ -68,6 +68,7 @@ HOP2_CONCURRENCY = int(os.getenv("AML_HOP2_CONCURRENCY", "4"))
 # Концентрация оттока на одну биржу и доля пересылаемого — пороги распознавания.
 DEPOSIT_CONCENTRATION = 0.9   # ≥90% оттока на одну биржу
 DEPOSIT_FORWARD_RATIO = 0.5   # пересылает ≥50% полученного извне
+DEPOSIT_BACKFLOW_RATIO = 0.15  # приход С этой биржи ≤15% оттока на неё (газ, не торговля)
 
 # Серьёзные риск-флаги GoPlus → dangerous
 CRITICAL_GOPLUS_FLAGS = {
@@ -248,7 +249,10 @@ def _detect_exchange_deposit(
     # funnel-критерии депозитника
     is_deposit = (
         concentration >= DEPOSIT_CONCENTRATION   # почти весь отток — на одну биржу
-        and in_exch.get(exch, 0.0) == 0.0        # от этой биржи ничего не приходило
+        # от этой биржи приходит мало относительно оттока на неё: газ-пополнения
+        # для sweep — норма, а вот сопоставимый обратный поток = личный торговый
+        # кошелёк (и заводит, и выводит), это НЕ депозитник.
+        and in_exch.get(exch, 0.0) <= DEPOSIT_BACKFLOW_RATIO * out_e
         and in_other > 0                          # есть внешние «депозиты»
         and len(in_amounts) >= 2                  # не одиночный перевод
         and out_e >= DEPOSIT_FORWARD_RATIO * in_other  # пересылает бóльшую часть
