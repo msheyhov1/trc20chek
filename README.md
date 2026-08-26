@@ -42,7 +42,13 @@ git push -u origin main
 | `TRONSCAN_API_KEY` | (опционально) |
 | `GOPLUS_API_KEY` | (опционально) |
 | `API_KEY` | (опционально, защита API) |
+| `SWAPSTER_API_TOKEN` | Токен AML-сервиса Swapster (опционально) |
+| `BITOK_API_KEY_ID` | API Key ID сервиса Bitok KYT (опционально) |
+| `BITOK_API_SECRET` | API Secret сервиса Bitok KYT (опционально) |
 | `CACHE_TTL_SECONDS` | `604800` |
+
+Полный список переменных — в `.env.example`. Без AML-ключей сервис работает,
+но в выводе будет «Swapster/Bitok не настроен».
 
 ### 4. Добавить персистентный диск
 

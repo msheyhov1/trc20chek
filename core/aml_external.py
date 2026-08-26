@@ -94,7 +94,8 @@ async def check(address: str) -> dict[str, Any]:
     """AML-проверка адреса через Swapster. Всегда возвращает dict, не бросает."""
     cfg = _cfg()
     if not cfg["token"]:
-        return {"available": False, "reason": "Swapster не настроен (SWAPSTER_API_TOKEN пуст)"}
+        return {"available": False, "provider": PROVIDER,
+                "reason": "Swapster не настроен (SWAPSTER_API_TOKEN пуст)"}
 
     headers = {
         "Authorization": f"Bearer {cfg['token']}",
@@ -112,7 +113,8 @@ async def check(address: str) -> dict[str, Any]:
             )
             req_id = prepared.get("reqId")
             if not req_id:
-                return {"available": False, "reason": "Swapster: API не вернул reqId"}
+                return {"available": False, "provider": PROVIDER,
+                        "reason": "Swapster: API не вернул reqId"}
 
             data = await _request(
                 client, "POST", "/aml", cfg,
@@ -132,9 +134,10 @@ async def check(address: str) -> dict[str, Any]:
             429: "превышен лимит запросов",
             503: "сервис временно недоступен",
         }.get(code, f"HTTP {code}")
-        return {"available": False, "reason": f"Swapster: {reason}"}
+        return {"available": False, "provider": PROVIDER, "reason": f"Swapster: {reason}"}
     except (httpx.HTTPError, ValueError) as e:
-        return {"available": False, "reason": f"Swapster: ошибка соединения ({e})"}
+        return {"available": False, "provider": PROVIDER,
+                "reason": f"Swapster: ошибка соединения ({e})"}
 
     pending = bool(data.get("pending"))
     pct = None if pending else _score_to_percent(data.get("riskScore"))

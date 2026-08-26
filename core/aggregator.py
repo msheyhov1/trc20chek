@@ -8,15 +8,15 @@ from typing import Any
 
 import httpx
 
-from . import aml_external, balance, cache, cluster
+from . import aml_bitok, aml_external, balance, cache, cluster
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 from .providers import flow, goplus, local, ofac, tronscan
 
-# Туннель: для этих типов внешний AML-API НЕ запрашивается
-# (биржа/депозитник биржи/контракт — инфраструктура; скам/санкции уже помечены).
-_AML_SKIP_TYPES = frozenset(
-    {EntityType.EXCHANGE, EntityType.CONTRACT, EntityType.SCAM, EntityType.SANCTIONED}
-)
+# Туннель: для этих типов внешний AML-API НЕ запрашивается — биржа/депозитник
+# биржи/контракт — это инфраструктура, её AML-скор ничего не говорит о владельце,
+# а запросов к платным KYT в потоке проверок бирж больше всего.
+# Скам/санкции туннель НЕ отсекает: там как раз ценно второе мнение сервисов.
+_AML_SKIP_TYPES = frozenset({EntityType.EXCHANGE, EntityType.CONTRACT})
 
 # Доля доминирующей биржевой сущности в AML, при которой НЕразмеченный адрес
 # считаем биржей/сервисом. Swapster видит off-chain принадлежность, которой нет
@@ -54,6 +54,109 @@ def _relabel_from_swapster(verdict: AddressVerdict, is_transit: bool) -> None:
             pass
         if "Swapster" not in verdict.sources:
             verdict.sources.append("Swapster")
+
+
+# Категория сущности Bitok → тип адреса в наших терминах.
+_BITOK_CATEGORY_TYPE = {
+    "exchange": EntityType.EXCHANGE,
+    "high_risk_exchange": EntityType.EXCHANGE,
+    "p2p_exchange": EntityType.EXCHANGE,
+    "psp": EntityType.EXCHANGE,
+    "atm": EntityType.EXCHANGE,
+    "marketplace": EntityType.PROJECT,
+    "nft_marketplace": EntityType.PROJECT,
+    "mining_pool": EntityType.PROJECT,
+    "token_contract": EntityType.CONTRACT,
+    "smart_contract": EntityType.CONTRACT,
+    "dex": EntityType.CONTRACT,
+    "lending": EntityType.CONTRACT,
+    "bridge": EntityType.CONTRACT,
+    "sanctions": EntityType.SANCTIONED,
+    "terrorist_financing": EntityType.SANCTIONED,
+    "high_risk_jurisdiction": EntityType.SANCTIONED,
+    "scam": EntityType.SCAM,
+    "fraud_shop": EntityType.SCAM,
+    "darknet_market": EntityType.SCAM,
+    "ransomware": EntityType.SCAM,
+    "stolen_funds": EntityType.SCAM,
+    "illegal_service": EntityType.SCAM,
+    "cam": EntityType.SCAM,
+    "personal_wallet": EntityType.WALLET,
+    "custodial_wallet": EntityType.WALLET,
+    "unnamed_wallet": EntityType.WALLET,
+}
+
+# Метки, которые считаем «пустыми» — их разрешено перезаписать данными Bitok.
+_EMPTY_ENTITY_LABELS = {"", "No public labels"}
+
+
+def _label_from_bitok(verdict: AddressVerdict) -> None:
+    """Bitok видит off-chain имя сущности («Tether blacklist», «Binance») там,
+    где у TronScan публичной метки нет. Ставим её ТОЛЬКО если своей метки нет —
+    on-chain данные и локальная БД приоритетнее."""
+    ext = verdict.bitok_aml or {}
+    if not ext.get("available") or ext.get("pending"):
+        return
+    name = (ext.get("entity") or "").strip()
+    if not name:
+        return
+    if verdict.entity_type != EntityType.UNKNOWN:
+        return
+    if (verdict.entity or "").strip() not in _EMPTY_ENTITY_LABELS:
+        return
+    category = (ext.get("entity_category") or "").strip().lower()
+    category_ru = aml_bitok.category_ru(category)
+    verdict.entity = f"{name} · {category_ru}" if category_ru else name
+    verdict.entity_type = _BITOK_CATEGORY_TYPE.get(category, EntityType.LABELED)
+    if aml_bitok.PROVIDER not in verdict.sources:
+        verdict.sources.append(aml_bitok.PROVIDER)
+
+
+# Порядок «строгости» уровней: внешний AML может только поднять риск.
+_RISK_ORDER = {
+    RiskLevel.UNKNOWN: 0,
+    RiskLevel.SAFE: 1,
+    RiskLevel.CAUTION: 2,
+    RiskLevel.DANGEROUS: 3,
+}
+
+# Внешний AML влияет на итоговый risk_level/risk_score. EXTERNAL_AML_AFFECTS_RISK=0
+# → сервисы показываются в выводе, но итоговый вердикт не меняют.
+EXTERNAL_AML_AFFECTS_RISK = os.getenv("EXTERNAL_AML_AFFECTS_RISK", "1") != "0"
+
+
+def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
+    """Swapster/Bitok сказали «caution/dangerous» → поднимаем итоговый вердикт
+    до их уровня и добавляем поясняющий флаг. Понижать вердикт внешним сервисам
+    НЕ даём: чистый ответ KYT не отменяет наши on-chain находки, а UNKNOWN
+    («меток нет») не превращается в «безопасно» из-за отсутствия у них данных."""
+    if not EXTERNAL_AML_AFFECTS_RISK:
+        return
+    for ext in (verdict.external_aml or {}, verdict.bitok_aml or {}):
+        if not ext.get("available") or ext.get("pending"):
+            continue
+        try:
+            level = RiskLevel(ext.get("risk_level"))
+        except ValueError:
+            continue
+        if level not in (RiskLevel.CAUTION, RiskLevel.DANGEROUS):
+            continue
+        provider = ext.get("provider") or "AML"
+        pct = ext.get("risk_score")
+        if isinstance(pct, (int, float)):
+            verdict.risk_score = max(verdict.risk_score, int(round(pct)))
+        detail = f" — {pct:g}%" if isinstance(pct, (int, float)) else ""
+        top = (ext.get("entities") or [{}])[0].get("entity") or ext.get("entity_category_ru")
+        reason = f" ({top})" if top else ""
+        verdict.risk_flags.append(
+            f"{'⛔️' if level is RiskLevel.DANGEROUS else '⚠️'} {provider}: "
+            f"{'высокий' if level is RiskLevel.DANGEROUS else 'средний'} риск"
+            f"{detail}{reason}"
+        )
+        if _RISK_ORDER[level] > _RISK_ORDER[verdict.risk_level]:
+            verdict.risk_level = level
+        if provider not in verdict.sources:
+            verdict.sources.append(provider)
 
 
 # Транзит: адрес форвардит ≥ этой доли полученного и не копит существенный баланс.
@@ -893,16 +996,25 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     # Баланс кошелька (из уже полученного ответа TronScan)
     verdict.balance_trx, verdict.balance_usdt = balance.extract_balances(ts_data)
 
-    # Туннель: биржа/контракт/скам/санкции → внешний AML не зовём.
-    # Обычный кошелёк (WALLET/UNKNOWN/LABELED) → запрашиваем AML через внешний API.
+    # Туннель: биржа/контракт/скам/санкции → внешние AML не зовём.
+    # Обычный кошелёк (WALLET/UNKNOWN/LABELED) → спрашиваем ОБА внешних AML
+    # (Swapster + Bitok) параллельно: они независимы, ждём максимум одного.
     if verdict.entity_type in _AML_SKIP_TYPES:
-        verdict.external_aml = {"skipped": True, "reason": "биржа/сервис — AML не требуется"}
+        reason = "биржа/сервис — внешний AML не требуется"
+        verdict.external_aml = {"skipped": True, "reason": reason}
+        verdict.bitok_aml = {"skipped": True, "reason": reason}
     else:
-        verdict.external_aml = await aml_external.check(address)
+        verdict.external_aml, verdict.bitok_aml = await asyncio.gather(
+            aml_external.check(address), aml_bitok.check(address)
+        )
         # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто,
         # но только если адрес ещё и ведёт себя как транзит (не личный юзер).
         transit = _is_transit(flow_data, address, verdict.balance_usdt)
         _relabel_from_swapster(verdict, transit)
+        # Bitok знает имя сущности off-chain — используем, если меток нет вообще.
+        _label_from_bitok(verdict)
+        # Оба сервиса могут ПОВЫСИТЬ итоговый риск (понизить — никогда).
+        _apply_external_aml_risk(verdict)
 
     # Кеш
     if use_cache:

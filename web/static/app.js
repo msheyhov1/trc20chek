@@ -15,11 +15,48 @@ const TYPE_RU = {
 };
 
 const RISK_RU = {
-  safe: "безопасно",
-  caution: "осторожно",
+  safe: "БЕЗОПАСНО",
+  caution: "ОСТОРОЖНО",
   dangerous: "ОПАСНО",
-  unknown: "нет данных",
+  unknown: "НЕТ ДАННЫХ",
 };
+
+// Родной уровень Bitok → подпись рядом с процентом
+const LEVEL_RU = {
+  none: "чисто",
+  low: "низкий",
+  medium: "средний",
+  high: "высокий",
+  severe: "критический",
+  undefined: "не определён",
+};
+
+// Группы рисков внутри блока провайдера (порядок = сверху вниз)
+const AML_GROUPS = [
+  ["HIGH_RISK", "⛔️ Высокий риск"],
+  ["MEDIUM_RISK", "⚠️ Средний риск"],
+  ["LOW_RISK", "✅ Минимальный риск"],
+];
+
+// Технические флаги провайдеров → человеческий русский
+const FLAG_PREFIX_RU = [
+  ["TronScan red tag:", "🚩 Красная метка TronScan:"],
+  ["TronScan grey tag:", "⚠️ Серая метка TronScan:"],
+  ["Local note:", "📝 Локальная заметка:"],
+  ["GoPlus:", "🛡 GoPlus:"],
+];
+const FLAG_EXACT_RU = {
+  "Exchange hot wallet": "🔥 Горячий кошелёк биржи",
+  "Exchange cold wallet": "❄️ Холодный кошелёк биржи",
+};
+
+function flagRu(flag) {
+  if (FLAG_EXACT_RU[flag]) return FLAG_EXACT_RU[flag];
+  for (const [prefix, ru] of FLAG_PREFIX_RU) {
+    if (flag.startsWith(prefix)) return ru + flag.slice(prefix.length);
+  }
+  return flag;
+}
 
 function escapeHtml(s) {
   if (s == null) return "";
@@ -32,8 +69,7 @@ function escapeHtml(s) {
 
 function fmtAmount(x) {
   const n = Number(x) || 0;
-  const s = n.toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-  return s;
+  return n.toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 function fmtPct(value) {
@@ -45,8 +81,85 @@ function fmtPct(value) {
   return `${parseFloat(v.toFixed(1))}%`;
 }
 
+function riskEmoji(pct) {
+  if (pct === null || pct === undefined) return "❔";
+  return pct < 25 ? "✅" : (pct < 75 ? "⚠️" : "⛔️");
+}
+
+function section(title, inner) {
+  return inner ? `<div class="flags"><h3>${title}</h3>${inner}</div>` : "";
+}
+
+/** Блок одного внешнего AML-сервиса (Swapster / Bitok) — формат общий. */
+function amlProvider(ext) {
+  const name = escapeHtml(ext.provider || "AML");
+  if (!ext.available) {
+    return `<div class="provider"><div class="provider-head">${name}</div>`
+      + `<div class="flag muted">${escapeHtml(ext.reason || "не настроен")}</div></div>`;
+  }
+  if (ext.pending) {
+    return `<div class="provider"><div class="provider-head">${name}</div>`
+      + `<div class="flag">⏳ Результат ещё готовится, повторите через минуту</div></div>`;
+  }
+
+  const pct = ext.risk_score;
+  const levelRu = LEVEL_RU[ext.level_raw] || "";
+  let inner = `<div class="provider-head">${name}`
+    + `<span class="badge ${escapeHtml(ext.risk_level || "unknown")}">`
+    + `${riskEmoji(pct)} ${escapeHtml(fmtPct(pct))}${levelRu ? ` · ${escapeHtml(levelRu)}` : ""}`
+    + `</span></div>`;
+
+  if (ext.entity) {
+    const cat = ext.entity_category_ru || ext.entity_category;
+    inner += `<div class="flag">🏷 ${escapeHtml(ext.entity)}`
+      + `${cat ? ` · ${escapeHtml(cat)}` : ""}</div>`;
+  }
+
+  const entities = (ext.entities || []).filter(e => e && typeof e === "object");
+  for (const [level, title] of AML_GROUPS) {
+    const items = entities.filter(e => e.level === level)
+      .sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0)).slice(0, 6);
+    if (!items.length) continue;
+    inner += `<div class="aml-group">${title}:</div>`;
+    for (const it of items) {
+      const prox = it.proximity === "direct" ? " (прямая)"
+        : (it.proximity === "indirect" ? " (косвенная)" : "");
+      inner += `<div class="flag">• ${escapeHtml(it.entity || "—")} — `
+        + `${escapeHtml(fmtPct(it.risk_score))}${escapeHtml(prox)}</div>`;
+    }
+  }
+  return `<div class="provider">${inner}</div>`;
+}
+
+/** Разбивка объёма переводов по типам контрагентов (наш on-chain анализ). */
+function exposureBlock(aml) {
+  if (!aml || !aml.transfers_analyzed) return "";
+  const parts = [];
+  for (const [key, title] of [
+    ["sanctions_exposure_pct", "санкции"],
+    ["sanctioned_exchange_exposure_pct", "санкц. биржи"],
+    ["exchange_exposure_pct", "биржи"],
+    ["other_exposure_pct", "прочее"],
+  ]) {
+    if (aml[key]) parts.push(`${title} ${fmtPct(aml[key])}`);
+  }
+  if (!parts.length) return "";
+  let inner = `<div class="flag">${escapeHtml(parts.join(" · "))}</div>`;
+  if (aml.indirect_sanctions_pct) {
+    inner += `<div class="flag">2-й хоп: ~${escapeHtml(fmtPct(aml.indirect_sanctions_pct))} `
+      + `через ${(aml.hop2_flagged || []).length} посредник(ов)</div>`;
+  }
+  return section(`Экспозиция (по ${aml.transfers_analyzed} переводам)`, inner);
+}
+
 function render(verdict) {
-  const links = (verdict.exchange_links || []).map(e => {
+  const score = Number(verdict.risk_score) || 0;
+  const level = verdict.risk_level || "unknown";
+
+  const flags = (verdict.risk_flags || [])
+    .map(f => `<div class="flag">${escapeHtml(flagRu(String(f)))}</div>`).join("");
+
+  const links = (verdict.exchange_links || []).slice(0, 5).map(e => {
     const parts = [];
     if (e.deposits) parts.push(`депозиты ×${e.deposits}`);
     if (e.withdrawals) parts.push(`выводы ×${e.withdrawals}`);
@@ -54,50 +167,43 @@ function render(verdict) {
     return `<div class="flag">${escapeHtml(e.name)}${mark}: ${escapeHtml(parts.join(", "))}</div>`;
   }).join("");
 
-  // Туннель: AML показываем только для НЕ-биржевых кошельков
-  const ext = verdict.external_aml || {};
+  const cluster = (verdict.raw_labels || {}).cluster || {};
+  const clusterBlock = (cluster.siblings_on_anchor || cluster.known_deposits_exchange)
+    ? section(`Кластер ${escapeHtml(cluster.exchange || "")}`,
+      `<div class="flag">Родственных депозитников: ${cluster.siblings_on_anchor || 0} `
+      + `на том же хот-кошельке, ${cluster.known_deposits_exchange || 0} по бирже</div>`)
+    : "";
+
+  // Туннель: для бирж/контрактов внешние AML не запрашиваются
+  const providers = [verdict.external_aml, verdict.bitok_aml].filter(p => p && Object.keys(p).length);
+  const shown = providers.filter(p => !p.skipped);
   let amlBlock = "";
-  const AML_GROUPS = [
-    ["LOW_RISK", "✅ Минимальный риск"],
-    ["MEDIUM_RISK", "⚠️ Средний риск"],
-    ["HIGH_RISK", "⛔️ Высокий риск"],
-  ];
-  if (ext.skipped) {
-    amlBlock = "";
-  } else if (ext.available) {
-    const prov = escapeHtml(ext.provider || "AML");
-    if (ext.pending) {
-      amlBlock = `<div class="flags"><h3>🔍 AML-проверка (${prov} · USDT · TRC20)</h3>`
-        + `<div class="flag">⏳ Результат ещё готовится, повторите через минуту</div></div>`;
-    } else {
-      const rs = ext.risk_score;
-      const emoji = (rs === null || rs === undefined) ? "❔" : (rs < 25 ? "✅" : (rs < 75 ? "⚠️" : "⛔️"));
-      let inner = `<div class="flag">${emoji} Риск: <b>${escapeHtml(fmtPct(rs))}</b></div>`;
-      for (const [level, title] of AML_GROUPS) {
-        const items = (ext.entities || []).filter(e => e.level === level)
-          .sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0));
-        if (!items.length) continue;
-        inner += `<div class="aml-group"><b>${title}:</b></div>`;
-        for (const it of items) {
-          inner += `<div class="flag">• ${escapeHtml(it.entity || "—")} — ${escapeHtml(fmtPct(it.risk_score))}</div>`;
-        }
-      }
-      amlBlock = `<div class="flags"><h3>🔍 AML-проверка (${prov} · USDT · TRC20)</h3>${inner}</div>`;
-    }
-  } else if (Object.keys(ext).length) {
-    amlBlock = `<div class="meta">AML: ${escapeHtml(ext.reason || "внешний API не настроен")}</div>`;
+  if (shown.length) {
+    amlBlock = section("AML-сервисы (USDT · TRC20)", shown.map(amlProvider).join(""));
+  } else if (providers.length) {
+    amlBlock = `<div class="meta">AML-сервисы: ${escapeHtml(providers[0].reason || "не запрашивались")}</div>`;
   }
+
+  const sources = [...new Set(verdict.sources || [])].join(" · ");
 
   result.innerHTML = `
     <div class="verdict-header">
-      <span class="dot ${escapeHtml(verdict.risk_level)}"></span>
+      <span class="dot ${escapeHtml(level)}"></span>
       <span class="entity">${escapeHtml(verdict.entity || "—")}</span>
+    </div>
+    <div class="score">
+      <div class="score-bar"><div class="score-fill ${escapeHtml(level)}" style="width:${Math.min(100, score)}%"></div></div>
+      <div class="score-label">Риск ${score}/100 · ${RISK_RU[level] || level}</div>
     </div>
     <div class="meta">Тип: ${TYPE_RU[verdict.entity_type] || verdict.entity_type}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
     <div class="meta">Баланс: ${fmtAmount(verdict.balance_usdt)} USDT · ${fmtAmount(verdict.balance_trx)} TRX</div>
-    ${links ? `<div class="flags"><h3>Связи с биржами</h3>${links}</div>` : ""}
+    ${section("Что нашли", flags)}
+    ${section("Связи с биржами", links)}
+    ${exposureBlock(verdict.aml)}
+    ${clusterBlock}
     ${amlBlock}
+    ${sources ? `<div class="sources">Источники: ${escapeHtml(sources)}</div>` : ""}
     ${verdict.cached ? `<div class="sources">из кеша</div>` : ""}
   `;
   result.classList.remove("hidden");
@@ -114,6 +220,9 @@ form.addEventListener("submit", async (e) => {
   if (!addr) return;
   btn.disabled = true;
   btn.textContent = "Проверка...";
+  // Проверка идёт десятки секунд (два внешних AML) — показываем, что процесс идёт.
+  result.innerHTML = `<div class="meta">⏳ Проверяю адрес… TronScan · GoPlus · OFAC · Swapster · Bitok</div>`;
+  result.classList.remove("hidden");
   try {
     const r = await fetch(`/check/${encodeURIComponent(addr)}`);
     if (!r.ok) {

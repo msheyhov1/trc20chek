@@ -41,8 +41,10 @@ class AddressVerdict:
     # Баланс кошелька (из TronScan /api/account)
     balance_trx: float = 0.0
     balance_usdt: float = 0.0
-    # Результат внешнего AML-API (туннель: заполняется только для НЕ-биржевых кошельков)
+    # Результаты внешних AML-API (туннель: заполняются только для НЕ-биржевых кошельков).
+    # external_aml — Swapster, bitok_aml — Bitok KYT. Формат у обоих одинаковый.
     external_aml: dict[str, Any] = field(default_factory=dict)
+    bitok_aml: dict[str, Any] = field(default_factory=dict)
     cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,6 +58,7 @@ class AddressVerdict:
             "balance_trx": self.balance_trx,
             "balance_usdt": self.balance_usdt,
             "external_aml": self.external_aml,
+            "bitok_aml": self.bitok_aml,
             "risk_flags": self.risk_flags,
             "sources": self.sources,
             "raw_labels": self.raw_labels,

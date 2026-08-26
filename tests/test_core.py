@@ -46,12 +46,17 @@ EMPTY_GP = {"code": 1, "result": {
 }}
 
 
+NO_AML = {"available": False, "reason": "не настроен"}
+
+
 @pytest.fixture(autouse=True)
 def _no_network_by_default():
-    """flow и OFAC по умолчанию пустые — тесты не ходят в сеть.
+    """flow, OFAC и внешние AML по умолчанию пустые — тесты не ходят в сеть.
     Конкретный тест переопределяет нужный патч своим внутри `with`."""
     with patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])), \
-         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())), \
+         patch("core.aggregator.aml_external.check", new=AsyncMock(return_value=dict(NO_AML))), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=dict(NO_AML))):
         yield
 
 
@@ -568,3 +573,88 @@ async def test_untagged_high_activity_flagged_as_service():
         v = await check_address(VALID_ADDR, use_cache=False)
     assert "сервис" in (v.entity or "").lower()
     assert any("нетегир" in f for f in v.risk_flags)
+
+
+# ---------- Внешние AML-сервисы (Swapster + Bitok) ----------
+
+def _bitok(risk_level="none", score=0.0, entity=None, category=None, entities=None):
+    """Ответ Bitok в нормализованном виде (как его отдаёт core/aml_bitok.check)."""
+    from core.aml_bitok import _LEVEL_MAP, category_ru
+    return {
+        "available": True, "provider": "Bitok", "pending": False,
+        "risk_score": score, "risk_level": _LEVEL_MAP.get(risk_level),
+        "level_raw": risk_level, "entity": entity, "entity_category": category,
+        "entity_category_ru": category_ru(category), "entities": entities or [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_bitok_labels_unlabeled_address():
+    """У TronScan меток нет, но Bitok знает сущность → берём её имя и тип."""
+    ext = _bitok("severe", 100.0, "Tether blacklist - TQ8a74", "enforcement_action")
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.LABELED
+    assert "Tether blacklist" in (v.entity or "")
+    assert "правоохранительная блокировка" in (v.entity or "")
+    assert "Bitok" in v.sources
+
+
+@pytest.mark.asyncio
+async def test_bitok_exchange_category_sets_exchange_type():
+    ext = _bitok("none", 0.0, "Binance", "exchange")
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE
+    assert "Binance" in (v.entity or "")
+
+
+@pytest.mark.asyncio
+async def test_bitok_high_risk_escalates_verdict():
+    """Чистый по on-chain адрес, но Bitok даёт severe → вердикт поднимается."""
+    ext = _bitok("severe", 96.0, entities=[
+        {"entity": "даркнет-маркет", "level": "HIGH_RISK", "risk_score": 96.0,
+         "proximity": "indirect"}])
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 96
+    assert any("Bitok" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_external_aml_never_downgrades_verdict():
+    """Адрес в OFAC SDN: «чистый» ответ внешнего сервиса не снимает опасность."""
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set",
+               new=AsyncMock(return_value={VALID_ADDR})), \
+         patch("core.aggregator.aml_bitok.check",
+               new=AsyncMock(return_value=_bitok("none", 0.0))):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 100
+
+
+@pytest.mark.asyncio
+async def test_aml_tunnel_skips_exchange_for_both_providers():
+    """Биржевой хот-кошелёк — платные KYT не дёргаем ни один."""
+    ts_resp = {"address": VALID_ADDR, "accountType": 0, "publicTag": "Binance-Hot 4"}
+    swapster = AsyncMock(return_value=dict(NO_AML))
+    bitok = AsyncMock(return_value=dict(NO_AML))
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_external.check", new=swapster), \
+         patch("core.aggregator.aml_bitok.check", new=bitok):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.external_aml.get("skipped") is True
+    assert v.bitok_aml.get("skipped") is True
+    swapster.assert_not_awaited()
+    bitok.assert_not_awaited()

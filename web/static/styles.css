@@ -141,3 +141,72 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 .error {
   color: #e74c3c;
 }
+
+/* Шкала риск-скора 0-100 */
+.score {
+  margin: 4px 0 14px;
+}
+
+.score-bar {
+  height: 8px;
+  background: #0f1115;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.score-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.score-fill.safe { background: #2ecc71; }
+.score-fill.caution { background: #f39c12; }
+.score-fill.dangerous { background: #e74c3c; }
+.score-fill.unknown { background: #7f8c8d; }
+
+.score-label {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8a91a0;
+}
+
+/* Карточка одного внешнего AML-сервиса */
+.provider {
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.provider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+
+.badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #0f1115;
+  border: 1px solid #2a2f3a;
+}
+
+.badge.safe { color: #2ecc71; }
+.badge.caution { color: #f39c12; }
+.badge.dangerous { color: #e74c3c; }
+.badge.unknown { color: #8a91a0; }
+
+.aml-group {
+  font-size: 12px;
+  color: #8a91a0;
+  margin: 8px 0 4px;
+}
+
+.flag.muted { color: #8a91a0; }

@@ -2,13 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
-from aiogram.types import Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    TelegramObject,
+)
 
 from core import check_address
 from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
@@ -56,6 +64,8 @@ class AccessMiddleware(BaseMiddleware):
                     "для добавления в белый список.",
                     parse_mode=ParseMode.HTML,
                 )
+            elif isinstance(event, CallbackQuery):
+                await event.answer("⛔ Доступ ограничен", show_alert=True)
             return  # обработчик не вызываем
         return await handler(event, data)
 
@@ -77,26 +87,57 @@ TYPE_RU = {
     EntityType.UNKNOWN: "Неизвестно",
 }
 
-
-def _score_bar(score: int) -> str:
-    """Визуальная шкала риск-скора 0-100."""
-    filled = round(score / 10)
-    return "█" * filled + "░" * (10 - filled)
-
 RISK_RU = {
-    RiskLevel.SAFE: "безопасно",
-    RiskLevel.CAUTION: "осторожно",
+    RiskLevel.SAFE: "БЕЗОПАСНО",
+    RiskLevel.CAUTION: "ОСТОРОЖНО",
     RiskLevel.DANGEROUS: "ОПАСНО",
-    RiskLevel.UNKNOWN: "нет данных",
+    RiskLevel.UNKNOWN: "НЕТ ДАННЫХ",
 }
 
 
-_AML_LEVEL_EMOJI = {"LOW_RISK": "✅", "MEDIUM_RISK": "⚠️", "HIGH_RISK": "⛔️"}
+def _score_bar(score: int) -> str:
+    """Визуальная шкала риск-скора 0-100 (10 делений)."""
+    filled = max(0, min(10, round(score / 10)))
+    return "▰" * filled + "▱" * (10 - filled)
+
+
+# Технические флаги провайдеров → человеческий русский.
+_FLAG_PREFIX_RU = (
+    ("TronScan red tag:", "🚩 Красная метка TronScan:"),
+    ("TronScan grey tag:", "⚠️ Серая метка TronScan:"),
+    ("Local note:", "📝 Локальная заметка:"),
+    ("GoPlus:", "🛡 GoPlus:"),
+)
+_FLAG_EXACT_RU = {
+    "Exchange hot wallet": "🔥 Горячий кошелёк биржи",
+    "Exchange cold wallet": "❄️ Холодный кошелёк биржи",
+}
+
+
+def _flag_ru(flag: str) -> str:
+    if flag in _FLAG_EXACT_RU:
+        return _FLAG_EXACT_RU[flag]
+    for prefix, ru in _FLAG_PREFIX_RU:
+        if flag.startswith(prefix):
+            return ru + flag[len(prefix):]
+    return flag
+
+
 _AML_GROUPS = [
-    ("LOW_RISK", "✅ Минимальный риск"),
-    ("MEDIUM_RISK", "⚠️ Средний риск"),
     ("HIGH_RISK", "⛔️ Высокий риск"),
+    ("MEDIUM_RISK", "⚠️ Средний риск"),
+    ("LOW_RISK", "✅ Минимальный риск"),
 ]
+
+# Родной уровень Bitok → подпись рядом с процентом.
+_BITOK_LEVEL_RU = {
+    "none": "чисто",
+    "low": "низкий",
+    "medium": "средний",
+    "high": "высокий",
+    "severe": "критический",
+    "undefined": "не определён",
+}
 
 
 def _fmt_pct(value) -> str:
@@ -134,20 +175,105 @@ def _fmt_amount(x: float) -> str:
     return s[:-3] if s.endswith(".00") else s
 
 
+def _esc(x) -> str:
+    return html.escape(str(x if x is not None else "—"), quote=False)
+
+
+def _aml_provider_lines(ext: dict, number: int) -> list[str]:
+    """Блок одного внешнего AML-сервиса (Swapster/Bitok) — формат общий."""
+    provider = _esc(ext.get("provider") or "AML")
+    head = f"<b>{number}) {provider}</b>"
+
+    if not ext.get("available"):
+        return [f"{head} — <i>{_esc(ext.get('reason') or 'не настроен')}</i>"]
+    if ext.get("pending"):
+        return [f"{head} — ⏳ считается, повторите через минуту"]
+
+    pct = ext.get("risk_score")
+    level_ru = _BITOK_LEVEL_RU.get(ext.get("level_raw") or "")
+    suffix = f" · {level_ru}" if level_ru else ""
+    lines = [f"{head} — {_aml_risk_emoji(pct)} <b>{_fmt_pct(pct)}</b>{suffix}"]
+
+    # Опознанная сущность (Bitok отдаёт имя + категорию)
+    if ext.get("entity"):
+        category = ext.get("entity_category_ru") or ext.get("entity_category")
+        tail = f" · {_esc(category)}" if category else ""
+        lines.append(f"    🏷 {_esc(ext['entity'])}{tail}")
+
+    entities = [e for e in (ext.get("entities") or []) if isinstance(e, dict)]
+    for level, title in _AML_GROUPS:
+        items = sorted(
+            (e for e in entities if e.get("level") == level),
+            key=lambda e: e.get("risk_score") or 0,
+            reverse=True,
+        )
+        if not items:
+            continue
+        lines.append(f"    <i>{title}:</i>")
+        for it in items[:6]:
+            prox = " (прямая)" if it.get("proximity") == "direct" else (
+                " (косвенная)" if it.get("proximity") == "indirect" else ""
+            )
+            lines.append(
+                f"    • {_esc(it.get('entity'))} — {_fmt_pct(it.get('risk_score'))}{prox}"
+            )
+    return lines
+
+
+def _exposure_line(aml: dict) -> list[str]:
+    """Разбивка объёма переводов по типам контрагентов (наш on-chain анализ)."""
+    if not aml or not aml.get("transfers_analyzed"):
+        return []
+    parts = []
+    for key, title in (
+        ("sanctions_exposure_pct", "санкции"),
+        ("sanctioned_exchange_exposure_pct", "санкц. биржи"),
+        ("exchange_exposure_pct", "биржи"),
+        ("other_exposure_pct", "прочее"),
+    ):
+        value = aml.get(key) or 0
+        if value:
+            parts.append(f"{title} {_fmt_pct(value)}")
+    if not parts:
+        return []
+    lines = [
+        "",
+        f"<b>🧭 Экспозиция</b> <i>(по {aml['transfers_analyzed']} переводам)</i>",
+        "• " + " · ".join(parts),
+    ]
+    if aml.get("indirect_sanctions_pct"):
+        lines.append(
+            f"• 2-й хоп: ~{_fmt_pct(aml['indirect_sanctions_pct'])} через "
+            f"{len(aml.get('hop2_flagged') or [])} посредник(ов)"
+        )
+    return lines
+
+
 def format_verdict(v: AddressVerdict) -> str:
     emoji = RISK_EMOJI[v.risk_level]
     lines = [
-        f"{emoji} <b>{v.entity or '—'}</b>",
-        f"<i>Тип:</i> {TYPE_RU[v.entity_type]}",
+        f"{emoji} <b>{RISK_RU[v.risk_level]}</b> · риск {v.risk_score}/100",
+        f"<code>{_score_bar(v.risk_score)}</code>",
         "",
-        f"<code>{v.address}</code>",
-        f"<i>Баланс:</i> {_fmt_amount(v.balance_usdt)} USDT · {_fmt_amount(v.balance_trx)} TRX",
+        f"🏷 <b>{_esc(v.entity or '—')}</b>",
+        f"<i>Тип:</i> {TYPE_RU[v.entity_type]}",
+        f"<code>{_esc(v.address)}</code>",
+        f"💰 {_fmt_amount(v.balance_usdt)} USDT · {_fmt_amount(v.balance_trx)} TRX",
     ]
 
-    # Связи с биржами (оставляем)
+    # Что нашли (флаги провайдеров + пояснения агрегатора)
+    if v.risk_flags:
+        lines.append("")
+        lines.append("<b>⚠️ Что нашли</b>")
+        for flag in v.risk_flags[:8]:
+            lines.append(f"• {_esc(_flag_ru(str(flag)))}")
+        if len(v.risk_flags) > 8:
+            lines.append(f"<i>…и ещё {len(v.risk_flags) - 8}</i>")
+
+    # Связи с биржами (по контрагентам переводов)
     if v.exchange_links:
         lines.append("")
-        lines.append("<b>Связи с биржами:</b>")
+        lines.append("<b>🏦 Связи с биржами</b>")
         for e in v.exchange_links[:5]:
             parts = []
             if e.get("deposits"):
@@ -155,52 +281,86 @@ def format_verdict(v: AddressVerdict) -> str:
             if e.get("withdrawals"):
                 parts.append(f"выводы ×{e['withdrawals']}")
             mark = " 🚫<b>САНКЦ.</b>" if e.get("sanctioned") else ""
-            lines.append(f"  • {e['name']}{mark}: {', '.join(parts)}")
+            lines.append(f"• {_esc(e['name'])}{mark} — {_esc(', '.join(parts))}")
 
-    # Туннель: AML показываем только для НЕ-биржевых кошельков
-    ext = v.external_aml or {}
-    if ext.get("skipped"):
-        pass  # биржа/сервис — AML не нужен
-    elif ext.get("available"):
-        lines.append("")
-        prov = ext.get("provider", "AML")
-        lines.append(f"🔍 <b>AML-проверка</b> ({prov} · USDT · TRC20)")
-        if ext.get("pending"):
-            lines.append("⏳ Результат ещё готовится. Повторите проверку через минуту.")
-        else:
-            rs = ext.get("risk_score")
-            lines.append(f"{_aml_risk_emoji(rs)} Риск: <b>{_fmt_pct(rs)}</b>")
-            entities = ext.get("entities", [])
-            for level, title in _AML_GROUPS:
-                items = [e for e in entities if e.get("level") == level]
-                if not items:
-                    continue
-                items.sort(key=lambda e: e.get("risk_score") or 0, reverse=True)
-                lines.append("")
-                lines.append(f"<b>{title}:</b>")
-                for it in items:
-                    lines.append(f"• {it.get('entity', '—')} — {_fmt_pct(it.get('risk_score'))}")
-    elif ext:
-        lines.append("")
-        lines.append(f"<i>AML:</i> {ext.get('reason', 'внешний API не настроен')}")
+    lines += _exposure_line(v.aml)
 
+    # Кластер депозитников биржи (накопительная база)
+    cluster = (v.raw_labels or {}).get("cluster") or {}
+    if cluster.get("siblings_on_anchor") or cluster.get("known_deposits_exchange"):
+        lines.append("")
+        lines.append(
+            f"<b>🔗 Кластер {_esc(cluster.get('exchange'))}</b> — "
+            f"родственных депозитников: {cluster.get('siblings_on_anchor', 0)} "
+            f"на том же хот-кошельке, {cluster.get('known_deposits_exchange', 0)} по бирже"
+        )
+
+    # Внешние AML-сервисы: туннель — для бирж/контрактов не запрашиваются
+    providers = [p for p in (v.external_aml, v.bitok_aml) if p]
+    shown = [p for p in providers if not p.get("skipped")]
+    if shown:
+        lines.append("")
+        lines.append("<b>🔍 AML-сервисы</b> <i>(USDT · TRC20)</i>")
+        for i, ext in enumerate(shown, 1):
+            lines += _aml_provider_lines(ext, i)
+    elif providers:
+        lines.append("")
+        lines.append("<i>🔍 AML-сервисы: биржа/сервис — проверка не требуется</i>")
+
+    if v.sources:
+        lines.append("")
+        lines.append(f"<i>Источники: {_esc(' · '.join(dict.fromkeys(v.sources)))}</i>")
     if v.cached:
-        lines.append("")
         lines.append("<i>(из кеша)</i>")
     return "\n".join(lines)
 
 
+def _verdict_kb(address: str) -> InlineKeyboardMarkup:
+    """Кнопки под вердиктом: перепроверить и открыть адрес в TronScan."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Перепроверить", callback_data=f"recheck:{address}"),
+            InlineKeyboardButton(
+                text="🔎 TronScan", url=f"https://tronscan.org/#/address/{address}"
+            ),
+        ]]
+    )
+
+
+PROGRESS_TEXT = (
+    "⏳ Проверяю адрес…\n<code>{addr}</code>\n\n"
+    "<i>TronScan · GoPlus · OFAC · Swapster · Bitok</i>"
+)
+
+
 dp = Dispatcher()
 dp.message.middleware(AccessMiddleware())
+dp.callback_query.middleware(AccessMiddleware())
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Пришлите TRC20-адрес (начинается с <code>T</code>, длина 34 символа).\n\n"
-        "Я определю, кому он принадлежит: биржа, смарт-контракт, скам или неизвестный.",
+        "Я определю, кому он принадлежит (биржа, смарт-контракт, скам, кошелёк) "
+        "и проверю AML: наши on-chain связи + два внешних сервиса — "
+        "<b>Swapster</b> и <b>Bitok</b>.\n\n"
+        "Можно прислать до 5 адресов одним сообщением.",
         parse_mode=ParseMode.HTML,
     )
+
+
+# Лимит длины сообщения в Telegram — 4096 символов.
+TG_MESSAGE_LIMIT = 4096
+
+
+async def _check_and_render(addr: str) -> str:
+    """Свежая проверка (без кеша — для AML важна актуальность транзакций)."""
+    v = await check_address(addr, use_cache=False)
+    text = format_verdict(v)
+    if len(text) > TG_MESSAGE_LIMIT:
+        text = text[: TG_MESSAGE_LIMIT - 40].rsplit("\n", 1)[0] + "\n<i>…обрезано</i>"
+    return text
 
 
 @dp.message(F.text)
@@ -222,14 +382,43 @@ async def on_text(message: Message):
                 parse_mode=ParseMode.HTML,
             )
             continue
+        # Проверка идёт десятки секунд (два внешних AML) — показываем прогресс,
+        # затем правим это же сообщение готовым вердиктом.
+        progress = await message.answer(
+            PROGRESS_TEXT.format(addr=addr), parse_mode=ParseMode.HTML
+        )
         try:
-            # Бот всегда проверяет заново (use_cache=False): для AML важна
-            # свежесть — у адреса могли появиться новые «грязные» транзакции.
-            v = await check_address(addr, use_cache=False)
-            await message.answer(format_verdict(v), parse_mode=ParseMode.HTML)
+            await progress.edit_text(
+                await _check_and_render(addr),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_verdict_kb(addr),
+            )
         except Exception as e:
             log.exception("check failed")
-            await message.answer(f"⚠️ Ошибка при проверке: {e}")
+            await progress.edit_text(f"⚠️ Ошибка при проверке: {e}")
+
+
+@dp.callback_query(F.data.startswith("recheck:"))
+async def on_recheck(callback: CallbackQuery):
+    addr = (callback.data or "").split(":", 1)[1]
+    if not is_valid_trc20_address(addr):
+        await callback.answer("Невалидный адрес", show_alert=True)
+        return
+    await callback.answer("Проверяю заново…")
+    try:
+        text = await _check_and_render(addr)
+    except Exception as e:
+        log.exception("recheck failed")
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr)
+        )
+    except TelegramBadRequest as e:
+        # Telegram ругается, если текст не изменился — это нормальный исход.
+        if "not modified" not in str(e):
+            raise
 
 
 async def main():
