@@ -8,7 +8,7 @@ import os
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -28,25 +28,61 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 
 def _parse_ids(raw: str) -> set[int]:
-    """Разбор списка TG-ID из env: '123, 456 789' → {123,456,789}."""
+    """Разбор списка TG-ID из env: '123, 456 789' → {123,456,789}.
+
+    Терпим к типичным ошибкам оператора: кавычки вокруг значения (их добавляет
+    raw-редактор Railway), «;» вместо запятой, лишние пробелы. Всё, что не
+    похоже на положительный user_id, отбрасываем с warning — при fail-closed
+    молча пустой белый список означает бота, который не отвечает никому."""
     out: set[int] = set()
-    for chunk in raw.replace(",", " ").split():
+    for chunk in raw.replace(",", " ").replace(";", " ").split():
+        chunk = chunk.strip("\"'")
         try:
-            out.add(int(chunk))
+            uid = int(chunk)
         except ValueError:
             log.warning("ALLOWED_TG_IDS: пропускаю невалидный id %r", chunk)
+            continue
+        if uid <= 0:  # отрицательные — это id чатов/каналов, не пользователей
+            log.warning("ALLOWED_TG_IDS: %r не похоже на user_id (нужно положительное число)", chunk)
+            continue
+        out.add(uid)
     return out
 
 
-# Белый список Telegram user_id. Пусто → доступ открыт (чтобы не залочиться
-# до настройки env); задан → бот отвечает только этим пользователям.
-ALLOWED_TG_IDS = _parse_ids(os.getenv("ALLOWED_TG_IDS", ""))
+# Белый список Telegram user_id — единственный способ попасть в бота.
+# Сырое значение храним, чтобы отличить «не задан» от «задан, но не разобрался».
+ALLOWED_TG_IDS_RAW = os.getenv("ALLOWED_TG_IDS", "")
+ALLOWED_TG_IDS = _parse_ids(ALLOWED_TG_IDS_RAW)
 
 
 def _is_allowed(user_id: int | None) -> bool:
-    if not ALLOWED_TG_IDS:
-        return True
-    return user_id in ALLOWED_TG_IDS
+    """Fail-closed: пускаем ТОЛЬКО тех, кто явно перечислен в ALLOWED_TG_IDS.
+
+    Пустой список = бот закрыт для ВСЕХ (раньше был открыт). Каждая проверка
+    жжёт платные лимиты KYT (Swapster + Bitok), поэтому «по умолчанию открыт»
+    — недопустимый дефолт. Разлочка: незнакомец видит свой user_id в отказе,
+    админ добавляет его в env и передеплоивает."""
+    return user_id is not None and user_id in ALLOWED_TG_IDS
+
+
+def log_access_mode(logger: logging.Logger) -> None:
+    """Строка в логе старта: сразу видно, кого пускает бот.
+    Зовут оба входа — main() здесь и lifespan в api/main.py."""
+    if ALLOWED_TG_IDS:
+        logger.info("Доступ к боту: %d Telegram ID в белом списке", len(ALLOWED_TG_IDS))
+    elif ALLOWED_TG_IDS_RAW.strip():
+        # Самая частая ошибка оператора: @username, кавычки, id канала.
+        # Сказать «не задан» здесь — отправить его чинить не ту вещь.
+        logger.error(
+            "ALLOWED_TG_IDS задан (%r), но ни один id не распознан — бот НИКОГО не пустит. "
+            "Нужны числовые user_id через запятую, без кавычек и без @username.",
+            ALLOWED_TG_IDS_RAW,
+        )
+    else:
+        logger.error(
+            "ALLOWED_TG_IDS не задан — бот НИКОГО не пустит (fail-closed). "
+            "Задайте ALLOWED_TG_IDS=<ваш_id> в env и передеплойте."
+        )
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -57,15 +93,21 @@ class AccessMiddleware(BaseMiddleware):
         if not _is_allowed(user.id if user else None):
             uid = user.id if user else "?"
             log.warning("Доступ запрещён: user_id=%s", uid)
-            if isinstance(event, Message):
-                await event.answer(
-                    "⛔ Доступ к боту ограничен.\n"
-                    f"Ваш Telegram ID: <code>{uid}</code> — передайте его администратору "
-                    "для добавления в белый список.",
-                    parse_mode=ParseMode.HTML,
-                )
-            elif isinstance(event, CallbackQuery):
-                await event.answer("⛔ Доступ ограничен", show_alert=True)
+            # Уведомление об отказе — best-effort: юзер мог заблокировать бота,
+            # колбэк — протухнуть. Сбой отправки не должен ронять гейт и сыпать
+            # трейсбеками на флуде, но из обработчика выходим в любом случае.
+            try:
+                if isinstance(event, Message):
+                    await event.answer(
+                        "⛔ Доступ к боту ограничен.\n"
+                        f"Ваш Telegram ID: <code>{uid}</code> — передайте его администратору "
+                        "для добавления в белый список.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(f"⛔ Доступ ограничен. Ваш ID: {uid}", show_alert=True)
+            except TelegramAPIError as e:
+                log.warning("Не удалось отправить отказ user_id=%s: %s", uid, e)
             return  # обработчик не вызываем
         return await handler(event, data)
 
@@ -428,13 +470,7 @@ async def main():
     from core.cluster import init_db as init_cluster_db
     await init_db()
     await init_cluster_db()
-    if ALLOWED_TG_IDS:
-        log.info("Доступ ограничен %d Telegram ID", len(ALLOWED_TG_IDS))
-    else:
-        log.warning(
-            "ALLOWED_TG_IDS не задан — бот ОТКРЫТ всем. "
-            "Задайте ALLOWED_TG_IDS, чтобы закрыть доступ по Telegram ID."
-        )
+    log_access_mode(log)
     bot = Bot(BOT_TOKEN)
     await dp.start_polling(bot)
 

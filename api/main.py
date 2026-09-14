@@ -61,13 +61,10 @@ async def _run_bot():
         log.warning("BOT_TOKEN not set — Telegram bot disabled, API-only mode")
         return
     try:
-        from bot.main import ALLOWED_TG_IDS, dp
+        from bot.main import dp, log_access_mode
         from aiogram import Bot
 
-        if ALLOWED_TG_IDS:
-            log.info("Bot access restricted to %d Telegram ID(s)", len(ALLOWED_TG_IDS))
-        else:
-            log.warning("ALLOWED_TG_IDS not set — bot is OPEN to everyone")
+        log_access_mode(log)
         bot = Bot(BOT_TOKEN)
         log.info("Starting Telegram bot polling...")
         await dp.start_polling(bot)
@@ -114,7 +111,16 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot_enabled": bool(BOT_TOKEN)}
+    # Размер белого списка — чтобы пустой ALLOWED_TG_IDS было видно без логов
+    # (бот при этом «здоров», но не отвечает никому). Импорт ленивый и мягкий:
+    # healthcheck Railway не должен падать из-за бота.
+    try:
+        from bot.main import ALLOWED_TG_IDS
+
+        whitelist = len(ALLOWED_TG_IDS)
+    except Exception:  # pragma: no cover — аварийный путь импорта
+        whitelist = None
+    return {"status": "ok", "bot_enabled": bool(BOT_TOKEN), "bot_whitelist": whitelist}
 
 
 @app.get("/check/{address}")

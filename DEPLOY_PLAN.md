@@ -155,7 +155,11 @@ git push -u origin main
 > | Имя | Значение |
 > |---|---|
 > | `BOT_TOKEN` | <токен от @BotFather, который ты получал раньше> |
+> | `ALLOWED_TG_IDS` | <твой Telegram user_id — узнать у @userinfobot> |
 > | `CACHE_TTL_SECONDS` | `604800` |
+>
+> `ALLOWED_TG_IDS` — обязательная: бот fail-closed и без неё не ответит НИКОМУ,
+> включая тебя. Только цифры через запятую, без кавычек и без @username.
 >
 > `TRONSCAN_API_KEY`, `GOPLUS_API_KEY`, `API_KEY` — пока пропусти, не обязательно.
 >
@@ -167,7 +171,7 @@ git push -u origin main
 - Если бота вообще не создавал — пусть создаст через `/newbot` (см. шаг 1 в README.md)
 
 **Критерии готовности:**
-- В Variables видно `BOT_TOKEN` и `CACHE_TTL_SECONDS`
+- В Variables видно `BOT_TOKEN`, `ALLOWED_TG_IDS` и `CACHE_TTL_SECONDS`
 - В логах Railway виден старт без ошибок (см. задачу 8)
 
 ---
@@ -202,6 +206,7 @@ git push -u origin main
 ```
 INFO:     Started server process
 INFO:     Waiting for application startup.
+INFO:app:Доступ к боту: 1 Telegram ID в белом списке
 INFO:app:Starting Telegram bot polling...
 INFO:aiogram.dispatcher: Start polling
 INFO:     Application startup complete.
@@ -213,6 +218,8 @@ INFO:     Uvicorn running on http://0.0.0.0:XXXX
 | Ошибка в логах | Что делать |
 |---|---|
 | `BOT_TOKEN not set — Telegram bot disabled, API-only mode` | Вернуться к задаче 6, добавить `BOT_TOKEN` |
+| `ALLOWED_TG_IDS не задан — бот НИКОГО не пустит` | Вернуться к задаче 6, добавить `ALLOWED_TG_IDS` со своим user_id |
+| `ALLOWED_TG_IDS задан (...), но ни один id не распознан` | В значении кавычки, `@username` или id канала. Оставить только цифры user_id через запятую |
 | `aiogram.exceptions.TelegramUnauthorizedError` | Токен невалиден — проверить значение `BOT_TOKEN`, нет ли пробелов, не отозван ли |
 | `TelegramConflictError: terminated by other getUpdates request` | У пользователя где-то ещё запущен бот с тем же токеном. Спросить — может локально или на другом сервисе. Остановить второй экземпляр |
 | `sqlite3.OperationalError: unable to open database file` | Volume не подключён или mount path не `/data`. Вернуться к задаче 7 |
@@ -276,7 +283,7 @@ curl -i https://URL_ОТ_ПОЛЬЗОВАТЕЛЯ/check/INVALID
 
 1. **Билд падает с ошибкой Python/pip** — покажи последние 50 строк билд-логов и обсуди с пользователем
 2. **Healthcheck не проходит** — проверь что в `railway.json` `healthcheckPath: "/health"` совпадает с реальным эндпоинтом в `api/main.py`
-3. **Бот не отвечает, но логи чистые** — пользователь может писать не тому боту. Пусть найдёт своего по username, который вводил при создании у @BotFather
+3. **Бот не отвечает, но логи чистые** — сначала проверь `ALLOWED_TG_IDS`: бот fail-closed и молча игнорирует всех, кого нет в белом списке (в логах будет `Доступ запрещён: user_id=...` — этот id и надо добавить). Проверить можно и по `/health`: `"bot_whitelist": 0` означает, что список пуст. Если со списком всё в порядке — пользователь может писать не тому боту; пусть найдёт своего по username, который вводил при создании у @BotFather
 
 ## Что НЕ делать
 
