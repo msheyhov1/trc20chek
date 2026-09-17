@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -20,12 +20,17 @@ from aiogram.types import (
 )
 
 from core import check_address
+from core.addresses import extract_addresses, looks_like_address_attempt
 from core.models import AddressVerdict, RiskLevel, is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
+# Сколько адресов проверяем из одного сообщения. Проверки последовательны и
+# каждая тратит платные лимиты KYT, поэтому лимит нужен.
+MAX_ADDRESSES_PER_MESSAGE = int(os.getenv("MAX_ADDRESSES_PER_MESSAGE", "5"))
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -388,8 +393,32 @@ def _verdict_kb(address: str) -> InlineKeyboardMarkup:
 
 
 PROGRESS_TEXT = (
-    "⏳ Проверяю адрес…\n<code>{addr}</code>\n\n"
-    "<i>TronScan · GoPlus · OFAC · Swapster · Bitok</i>"
+    "⏳ Проверяю адрес{counter}…\n<code>{addr}</code>\n\n"
+    "<i>TronScan · GoPlus · OFAC · блэклист Tether · Swapster · Bitok</i>\n"
+    "<i>Два платных KYT считаются десятки секунд — это нормально.</i>"
+)
+
+HELP_TEXT = (
+    "<b>Что я делаю</b>\n"
+    "Определяю, кому принадлежит TRON-адрес (биржа, депозитник биржи, "
+    "смарт-контракт, скам, санкционный, личный кошелёк) и считаю AML-риск.\n\n"
+    "<b>Источники</b>\n"
+    "• TronScan — публичные метки, баланс, признаки токенов\n"
+    "• Переводы TronScan — связи с биржами, экспозиция, 2-й хоп\n"
+    "• OFAC SDN — прямое попадание в санкционный список\n"
+    "• Блэклист Tether — заблокированы ли средства эмитентом USDT\n"
+    "• GoPlus — риск-флаги адреса\n"
+    "• Swapster и Bitok — два независимых платных KYT\n\n"
+    "<b>Как присылать</b>\n"
+    "Просто текстом. Понимаю адрес с пунктуацией вокруг, ссылку на TronScan "
+    f"и hex-формат <code>41…</code>. До {MAX_ADDRESSES_PER_MESSAGE} адресов одним сообщением.\n\n"
+    "<b>Команды</b>\n"
+    "/help — эта справка\n"
+    "/id — ваш Telegram ID (нужен для белого списка)\n"
+    "/status — что сконфигурировано на сервере\n\n"
+    "<b>Важно</b>\n"
+    "«Нет находок» и «не удалось проверить» — разные вещи. Если источник "
+    "недоступен, я пишу об этом первой строкой вердикта."
 )
 
 
@@ -401,61 +430,134 @@ dp.callback_query.middleware(AccessMiddleware())
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Пришлите TRC20-адрес (начинается с <code>T</code>, длина 34 символа).\n\n"
-        "Я определю, кому он принадлежит (биржа, смарт-контракт, скам, кошелёк) "
-        "и проверю AML: наши on-chain связи + два внешних сервиса — "
-        "<b>Swapster</b> и <b>Bitok</b>.\n\n"
-        "Можно прислать до 5 адресов одним сообщением.",
+        "👋 Пришлите TRON-адрес — определю владельца и проверю AML.\n\n"
+        "Понимаю адрес в любом виде: с текстом вокруг, в скобках, ссылкой на "
+        "TronScan или в hex-формате <code>41…</code>.\n\n"
+        f"До {MAX_ADDRESSES_PER_MESSAGE} адресов одним сообщением. Подробнее — /help",
         parse_mode=ParseMode.HTML,
     )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    """Свой ID нужен, чтобы попасть в белый список. Раньше узнать его можно
+    было только получив отказ от бота — то есть не будучи в списке."""
+    uid = message.from_user.id if message.from_user else "?"
+    await message.answer(
+        f"Ваш Telegram ID: <code>{uid}</code>\n\n"
+        "Его добавляют в переменную <code>ALLOWED_TG_IDS</code> на сервере.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    """Что сконфигурировано. Пустые ключи — штатная причина пустых вердиктов,
+    и видеть её должен не только тот, у кого есть доступ к логам."""
+    from core import aml_bitok, aml_external
+    from core.providers import flow as flow_provider
+    from core.providers import goplus, tether
+
+    def mark(ok: bool) -> str:
+        return "✅" if ok else "➖"
+
+    lines = [
+        "<b>Конфигурация сервера</b>",
+        f"{mark(bool(flow_provider.TRONSCAN_API_KEY))} ключ TronScan "
+        f"<i>(без него ниже лимиты)</i>",
+        f"{mark(bool(goplus.GOPLUS_API_KEY))} ключ GoPlus <i>(работает и без него)</i>",
+        f"{mark(tether.is_enabled())} проверка блэклиста Tether",
+        f"{mark(aml_external.is_configured())} Swapster",
+        f"{mark(aml_bitok.is_configured())} Bitok",
+        "",
+        f"Доступ к боту: {len(ALLOWED_TG_IDS)} Telegram ID в белом списке",
+        f"Страниц истории переводов: {flow_provider.FLOW_PAGES} "
+        f"(по {flow_provider.TRANSFERS_LIMIT})",
+    ]
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # Лимит длины сообщения в Telegram — 4096 символов.
 TG_MESSAGE_LIMIT = 4096
 
 
+def _fit_message(text: str) -> str:
+    """Укладывает вердикт в лимит Telegram.
+
+    Режем по границе строки и предупреждаем об обрезке, иначе пользователь не
+    отличит полный отчёт от усечённого. Сам порядок блоков в format_verdict
+    таков, что первыми идут вердикт и находки, а не второстепенное."""
+    if len(text) <= TG_MESSAGE_LIMIT:
+        return text
+    note = "\n<i>…отчёт обрезан, часть блоков не показана</i>"
+    head = text[: TG_MESSAGE_LIMIT - len(note)]
+    if "\n" in head:
+        head = head.rsplit("\n", 1)[0]
+    return head + note
+
+
 async def _check_and_render(addr: str) -> str:
     """Свежая проверка (без кеша — для AML важна актуальность транзакций)."""
     v = await check_address(addr, use_cache=False)
-    text = format_verdict(v)
-    if len(text) > TG_MESSAGE_LIMIT:
-        text = text[: TG_MESSAGE_LIMIT - 40].rsplit("\n", 1)[0] + "\n<i>…обрезано</i>"
-    return text
+    return _fit_message(format_verdict(v))
+
+
+async def _check_one(message: Message, addr: str, counter: str = "") -> None:
+    """Одна проверка: сообщение-прогресс, затем правка его же вердиктом."""
+    progress = await message.answer(
+        PROGRESS_TEXT.format(addr=addr, counter=counter), parse_mode=ParseMode.HTML
+    )
+    try:
+        text = await _check_and_render(addr)
+    except Exception as e:
+        log.exception("check failed for %s", addr)
+        await progress.edit_text(
+            f"⚠️ Не удалось проверить <code>{_esc(addr)}</code>: {_esc(e)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await progress.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr)
+    )
 
 
 @dp.message(F.text)
 async def on_text(message: Message):
-    text = (message.text or "").strip()
-    # Поддержка нескольких адресов через пробел/перенос
-    candidates = [c for c in text.split() if c.startswith("T") and len(c) == 34]
-    if not candidates:
-        await message.answer(
-            "Не похоже на TRC20-адрес. Пришлите строку из 34 символов, начинающуюся с <code>T</code>.",
-            parse_mode=ParseMode.HTML,
-        )
+    text = message.text or ""
+    addresses = extract_addresses(text, limit=MAX_ADDRESSES_PER_MESSAGE)
+
+    if not addresses:
+        if looks_like_address_attempt(text):
+            await message.answer(
+                "❌ Похоже на TRON-адрес, но контрольная сумма не сходится — "
+                "проверьте, не потерялся ли символ при копировании.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                "Не нашёл TRON-адреса. Пришлите его текстом, ссылкой на TronScan "
+                "или в hex-формате <code>41…</code>. Справка — /help",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
-    for addr in candidates[:5]:  # лимит на одно сообщение
-        if not is_valid_trc20_address(addr):
-            await message.answer(
-                f"❌ <code>{addr}</code> — невалидный TRC20-адрес (checksum failed).",
-                parse_mode=ParseMode.HTML,
-            )
-            continue
-        # Проверка идёт десятки секунд (два внешних AML) — показываем прогресс,
-        # затем правим это же сообщение готовым вердиктом.
-        progress = await message.answer(
-            PROGRESS_TEXT.format(addr=addr), parse_mode=ParseMode.HTML
+    total = len(addresses)
+    if total > 1:
+        # Проверки идут последовательно (платные лимиты KYT), поэтому сразу
+        # говорим, сколько их: иначе человек не понимает, сколько ждать.
+        await message.answer(
+            f"Нашёл адресов: {total}. Проверяю по очереди, каждый занимает "
+            f"десятки секунд.",
+            parse_mode=ParseMode.HTML,
         )
-        try:
-            await progress.edit_text(
-                await _check_and_render(addr),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_verdict_kb(addr),
-            )
-        except Exception as e:
-            log.exception("check failed")
-            await progress.edit_text(f"⚠️ Ошибка при проверке: {e}")
+    for i, addr in enumerate(addresses, 1):
+        counter = f" ({i} из {total})" if total > 1 else ""
+        await _check_one(message, addr, counter)
 
 
 @dp.callback_query(F.data.startswith("recheck:"))

@@ -3,13 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="referrer" content="same-origin" />
   <title>TRC20 Address Checker</title>
+  <!-- Инлайновый favicon: без него каждый заход даёт 404 в логах -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234a90e2'/%3E%3Ctext x='16' y='23' font-family='system-ui,sans-serif' font-size='19' font-weight='700' text-anchor='middle' fill='white'%3ET%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <main class="container">
     <h1>TRC20 Checker</h1>
-    <p class="subtitle">Проверка принадлежности TRON-адреса</p>
+    <p class="subtitle">Кому принадлежит TRON-адрес и какой у него AML-риск</p>
 
     <form id="form">
       <input
@@ -17,13 +21,27 @@
         type="text"
         placeholder="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
         autocomplete="off"
+        autocapitalize="off"
         spellcheck="false"
+        inputmode="text"
         required
       />
       <button type="submit" id="submitBtn">Проверить</button>
     </form>
+    <p class="hint">
+      Можно вставить адрес с текстом вокруг, ссылку на TronScan или hex-формат
+      <code>41…</code>
+    </p>
 
     <div id="result" class="result hidden"></div>
+
+    <section id="historyBlock" class="history hidden">
+      <div class="history-head">
+        <h3>Недавние проверки</h3>
+        <button type="button" id="clearHistory" class="link-btn">очистить</button>
+      </div>
+      <div id="historyList"></div>
+    </section>
   </main>
 
   <script src="/static/app.js"></script>

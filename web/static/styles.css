@@ -210,3 +210,106 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 }
 
 .flag.muted { color: #8a91a0; }
+
+/* Подсказка под формой */
+.hint {
+  color: #8a91a0;
+  font-size: 12px;
+  margin: -14px 0 24px;
+}
+
+.hint code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: #1a1d24;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* Кнопки-действия под вердиктом */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #2a2f3a;
+}
+
+.link-btn {
+  background: #0f1115;
+  border: 1px solid #2a2f3a;
+  color: #e7e9ee;
+  padding: 7px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.link-btn:hover { border-color: #4a90e2; }
+
+/* История проверок */
+.history { margin-top: 28px; }
+.history.hidden { display: none; }
+
+.history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.history-head h3 {
+  font-size: 13px;
+  color: #8a91a0;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.history-head .link-btn {
+  padding: 3px 9px;
+  font-size: 12px;
+  color: #8a91a0;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: #1a1d24;
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  padding: 9px 12px;
+  margin-bottom: 6px;
+  color: #e7e9ee;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.history-item:hover { border-color: #4a90e2; }
+
+.history-addr {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  flex-shrink: 0;
+}
+
+.history-meta {
+  color: #8a91a0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Телефон: кнопка под полем, а не рядом */
+@media (max-width: 520px) {
+  body { padding: 28px 16px; }
+  form { flex-direction: column; }
+  button[type="submit"] { width: 100%; }
+  .hint { margin-top: -10px; }
+}
