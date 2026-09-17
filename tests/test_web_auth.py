@@ -161,7 +161,7 @@ async def test_init_storage_marks_ok():
 async def test_health_reports_storage_and_providers():
     body = await am.health()
     assert body["status"] == "ok"
-    assert set(body["storage"]) == {"cache", "cluster", "history", "labels"}
+    assert set(body["storage"]) == {"cache", "cluster", "history", "labels", "watchlist"}
     assert set(body["providers"]) == {"tronscan_key", "goplus_key", "swapster", "bitok"}
     assert "daily_limit" in body["rate_limit"]
     assert "web_protected" in body

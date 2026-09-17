@@ -20,7 +20,7 @@ from aiogram.types import (
     TelegramObject,
 )
 
-from core import check_address, history, labels
+from core import check_address, history, labels, watchlist
 from core.addresses import extract_addresses, looks_like_address_attempt
 from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 
@@ -32,6 +32,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # Сколько адресов проверяем из одного сообщения. Проверки последовательны и
 # каждая тратит платные лимиты KYT, поэтому лимит нужен.
 MAX_ADDRESSES_PER_MESSAGE = int(os.getenv("MAX_ADDRESSES_PER_MESSAGE", "5"))
+# Пакетная проверка из файла: лимит выше, но тоже есть — каждая строка платная.
+MAX_ADDRESSES_PER_FILE = int(os.getenv("MAX_ADDRESSES_PER_FILE", "25"))
+BATCH_FILE_MAX_BYTES = int(os.getenv("BATCH_FILE_MAX_BYTES", str(256 * 1024)))
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -445,7 +448,11 @@ HELP_TEXT = (
     "/status — что сконфигурировано на сервере\n"
     "/history — последние проверки\n"
     "/stats — сколько проверок сделано (расход платных лимитов)\n"
-    "/labels, /label, /unlabel — свои метки адресов без редеплоя\n\n"
+    "/labels, /label, /unlabel — свои метки адресов без редеплоя\n"
+    "/watch, /unwatch, /watchlist — следить за адресом и узнать об изменении\n\n"
+    "<b>Пакетная проверка</b>\n"
+    "Пришлите файлом список адресов (по одному на строку или CSV) — проверю "
+    "по очереди.\n\n"
     "<b>Важно</b>\n"
     "«Нет находок» и «не удалось проверить» — разные вещи. Если источник "
     "недоступен, я пишу об этом первой строкой вердикта."
@@ -645,6 +652,105 @@ async def cmd_unlabel(message: Message):
     )
 
 
+@dp.message(Command("watch"))
+async def cmd_watch(message: Message):
+    """Поставить адрес под наблюдение: сообщу, если уровень риска изменится."""
+    addresses = extract_addresses(message.text or "")
+    if not addresses:
+        await message.answer(
+            "Формат: <code>/watch АДРЕС</code>\n\n"
+            "Буду перепроверять адрес и напишу, если уровень риска изменится.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    ok, note = await watchlist.add(addresses[0], message.chat.id)
+    await message.answer(
+        f"{'👁 ' if ok else '⚠️ '}<code>{_esc(addresses[0])}</code>\n{_esc(note)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("unwatch"))
+async def cmd_unwatch(message: Message):
+    addresses = extract_addresses(message.text or "")
+    if not addresses:
+        await message.answer("Формат: <code>/unwatch АДРЕС</code>", parse_mode=ParseMode.HTML)
+        return
+    removed = await watchlist.remove(addresses[0], message.chat.id)
+    await message.answer(
+        f"{'✅ Снято с наблюдения' if removed else 'Этот адрес не был под наблюдением'}: "
+        f"<code>{_esc(addresses[0])}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("watchlist"))
+async def cmd_watchlist(message: Message):
+    items = await watchlist.list_for(message.chat.id)
+    if not items:
+        await message.answer(
+            "Список наблюдения пуст.\n\n"
+            "Добавить: <code>/watch АДРЕС</code> — напишу, когда уровень риска "
+            "изменится.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>👁 Под наблюдением</b>"]
+    for it in items:
+        emoji = RISK_EMOJI.get(_level(it.get("last_level")), "⚪")
+        when = (
+            _fmt_age(int(time.time() - it["last_check"])).lstrip(", ")
+            if it.get("last_check") else "ещё не проверялся"
+        )
+        lines.append(
+            f"{emoji} <code>{_esc(it['address'])}</code>\n"
+            f"    {it.get('last_score') if it.get('last_score') is not None else '—'}/100 · "
+            f"{_esc(when)}"
+        )
+    lines.append("")
+    lines.append("Снять: <code>/unwatch АДРЕС</code>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(F.document)
+async def on_document(message: Message):
+    """Пакетная проверка из файла: по адресу на строку или CSV.
+
+    Полезно, когда список контрагентов выгружен из таблицы. Лимит на файл
+    отдельный и заметно выше, чем на сообщение, но всё равно есть: каждая
+    строка — это платная проверка."""
+    doc = message.document
+    if doc.file_size and doc.file_size > BATCH_FILE_MAX_BYTES:
+        await message.answer(
+            f"Файл слишком большой ({doc.file_size} Б). "
+            f"Лимит — {BATCH_FILE_MAX_BYTES} Б."
+        )
+        return
+    bot = message.bot
+    try:
+        buf = await bot.download(doc)
+        text = buf.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.exception("не удалось прочитать файл")
+        await message.answer(f"⚠️ Не удалось прочитать файл: {_esc(e)}",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    addresses = extract_addresses(text, limit=MAX_ADDRESSES_PER_FILE)
+    if not addresses:
+        await message.answer(
+            "В файле не нашёл TRON-адресов. Ожидаю по адресу на строку или CSV "
+            "с адресами в любой колонке."
+        )
+        return
+    await message.answer(
+        f"Нашёл адресов: {len(addresses)}. Проверяю по очереди — каждая "
+        f"проверка занимает десятки секунд."
+    )
+    for i, addr in enumerate(addresses, 1):
+        await _check_one(message, addr, f" ({i} из {len(addresses)})")
+
+
 # Лимит длины сообщения в Telegram — 4096 символов.
 TG_MESSAGE_LIMIT = 4096
 
@@ -756,6 +862,7 @@ async def main():
     await init_cluster_db()
     await history.init_db()
     await labels.init_db(LOCAL_LABELS)
+    await watchlist.init_db()
     log_access_mode(log)
     bot = Bot(BOT_TOKEN)
     await dp.start_polling(bot)

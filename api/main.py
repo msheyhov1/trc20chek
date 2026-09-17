@@ -12,14 +12,14 @@ import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
 from api.ratelimit import RateLimiter
-from core import check_address, history, labels
+from core import check_address, history, labels, watchlist
 from core.aggregator import RULESET_VERSION
 from core.cache import init_db
 from core.cluster import init_db as init_cluster_db
@@ -44,6 +44,8 @@ WEB_PUBLIC = os.getenv("WEB_PUBLIC", "") not in ("", "0", "false", "False")
 # Разрешить CORS с любого origin. По умолчанию выключено: веб-форма ходит на
 # свой же origin относительным URL и в CORS не нуждается.
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+# Сколько адресов принимает POST /check/batch за один запрос.
+BATCH_MAX = int(os.getenv("BATCH_MAX_ADDRESSES", "25"))
 
 _basic = HTTPBasic(auto_error=False)
 limiter = RateLimiter()
@@ -54,6 +56,7 @@ storage_status: dict[str, str] = {
     "cluster": "unknown",
     "history": "unknown",
     "labels": "unknown",
+    "watchlist": "unknown",
 }
 
 
@@ -110,6 +113,37 @@ async def _run_bot():
         log.exception("Bot crashed")
 
 
+async def _run_watchlist(stop: asyncio.Event) -> None:
+    """Фоновая перепроверка наблюдаемых адресов.
+
+    Живёт в том же процессе намеренно: отдельный процесс завёл бы второй
+    polling бота, и Telegram ответил бы 409 Conflict."""
+    if not watchlist.is_enabled() or storage_status.get("watchlist") != "ok":
+        return
+    if not BOT_TOKEN:
+        log.info("Мониторинг адресов: BOT_TOKEN не задан, уведомлять некуда")
+        return
+    from aiogram import Bot
+    from aiogram.enums import ParseMode
+
+    bot = Bot(BOT_TOKEN)
+
+    async def notify(chat_id: int, text: str) -> None:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+
+    async def check(address: str):
+        return await check_address(address, use_cache=False, source="watchlist")
+
+    try:
+        await watchlist.run_loop(check, notify, stop)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Мониторинг адресов остановлен из-за ошибки")
+    finally:
+        await bot.session.close()
+
+
 async def _init_storage(name: str, init) -> None:
     """Инициализация НЕобязательного хранилища.
 
@@ -127,6 +161,7 @@ async def _init_storage(name: str, init) -> None:
             "cluster": "кластеризация депозитников выключена",
             "history": "журнал проверок не ведётся",
             "labels": "ручные метки недоступны",
+            "watchlist": "мониторинг адресов выключен",
         }.get(name, f"{name} выключено")
         log.error(
             "Хранилище %s недоступно (%s): сервис работает, но %s. "
@@ -142,6 +177,7 @@ async def lifespan(app: FastAPI):
     await _init_storage("history", history.init_db)
     # Предзаданные метки из local.py засеваются в БД, не перетирая правки оператора.
     await _init_storage("labels", lambda: labels.init_db(LOCAL_LABELS))
+    await _init_storage("watchlist", watchlist.init_db)
     await history.prune()
     if WEB_PASSWORD:
         log.info("Web auth ENABLED (user=%s)", WEB_USER)
@@ -158,14 +194,18 @@ async def lifespan(app: FastAPI):
             "Задайте пароль/ключ либо WEB_PUBLIC=1, если сайт должен быть открыт."
         )
     bot_task = asyncio.create_task(_run_bot())
+    watch_stop = asyncio.Event()
+    watch_task = asyncio.create_task(_run_watchlist(watch_stop))
     try:
         yield
     finally:
-        bot_task.cancel()
-        try:
-            await bot_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        watch_stop.set()
+        for task in (bot_task, watch_task):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(
@@ -287,6 +327,34 @@ async def check(
     return verdict.to_dict()
 
 
+@app.post("/check/batch")
+async def check_batch(
+    request: Request,
+    addresses: list[str] = Body(..., embed=True, description="Список TRC20-адресов"),
+    api_key: str | None = Query(None, description="API key (лучше заголовком X-API-Key)"),
+    _auth: None = Depends(require_web_auth),
+):
+    """Пакетная проверка. Проверки идут ПОСЛЕДОВАТЕЛЬНО: каждая тратит платные
+    лимиты KYT, и параллельный запуск упёрся бы в них же, только быстрее."""
+    if len(addresses) > BATCH_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"За раз можно проверить не больше {BATCH_MAX} адресов",
+        )
+    # Лимит списывается за каждый адрес: иначе батч обходил бы защиту квоты.
+    for _ in addresses:
+        _authorize(request, api_key)
+
+    results = []
+    for addr in addresses:
+        if not is_valid_trc20_address(addr):
+            results.append({"address": addr, "error": "Invalid TRC20 address format"})
+            continue
+        verdict = await check_address(addr, use_cache=False, source="batch")
+        results.append(verdict.to_dict())
+    return {"results": results}
+
+
 @app.get("/history")
 async def history_endpoint(
     request: Request,
@@ -312,10 +380,14 @@ async def stats_endpoint(
     """Сколько проверок сделано. Прямой индикатор расхода платных лимитов KYT:
     раньше это было видно только по счёту от провайдера."""
     _authorize_read(request, api_key)
+    from core.aggregator import inflight_count
+
     return {
         "checks": await history.stats(),
         "labels": labels.count(),
+        "watchlist": await watchlist.stats(),
         "rate_limit": limiter.stats(),
+        "in_flight": inflight_count(),
         "ruleset_version": RULESET_VERSION,
     }
 

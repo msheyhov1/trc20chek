@@ -1544,17 +1544,28 @@ async def _apply_history(verdict: AddressVerdict, source: str) -> None:
     )
 
 
+# Общий бюджет одной проверки. Этапы идут последовательно (flow → hop2 →
+# внешние KYT), у каждого свой таймаут, но верхней границы у суммы не было.
+# По истечении отдаём то, что успело посчитаться: неполный ответ с честной
+# пометкой полезнее, чем бот, который молча держит пользователя минутами.
+CHECK_BUDGET_SECONDS = float(os.getenv("CHECK_BUDGET_SECONDS", "90"))
+
+# Дедупликация одновременных проверок одного адреса. Два пользователя,
+# нажавшие «проверить» на одном адресе, оплачивали два похода в Swapster и
+# Bitok. Второй теперь ждёт результат первого.
+_inflight: dict[tuple[str, bool], asyncio.Task] = {}
+
+
+def inflight_count() -> int:
+    """Сколько проверок выполняется прямо сейчас (для /stats)."""
+    return len(_inflight)
+
+
 async def check_address(
     address: str, use_cache: bool = True, source: str = "api"
 ) -> AddressVerdict:
-    """Главная точка входа.
-
-    - Валидирует адрес
-    - Смотрит кеш
-    - Параллельно опрашивает TronScan + GoPlus + flow + OFAC
-    - Сводит в единый Verdict, фиксируя состояние каждого источника
-    - Кеширует результат
-    """
+    """Главная точка входа. Дедуплицирует одновременные проверки одного адреса
+    и ограничивает проверку общим бюджетом времени."""
     if not is_valid_trc20_address(address):
         return AddressVerdict(
             address=address,
@@ -1564,6 +1575,67 @@ async def check_address(
             risk_flags=["Address failed base58check validation"],
         )
 
+    key = (address, use_cache)
+    running = _inflight.get(key)
+    if running is not None and not running.done():
+        log.info("Проверка %s уже выполняется — ждём её результат", address)
+        # shield: отмена ожидающего не должна ронять проверку, которую ждут другие.
+        return await asyncio.shield(running)
+
+    task = asyncio.create_task(_check_address_guarded(address, use_cache, source))
+    _inflight[key] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if _inflight.get(key) is task:
+            del _inflight[key]
+
+
+async def _check_address_guarded(
+    address: str, use_cache: bool, source: str
+) -> AddressVerdict:
+    """Проверка под общим дедлайном."""
+    if CHECK_BUDGET_SECONDS <= 0:
+        return await _check_address(address, use_cache, source)
+    try:
+        async with asyncio.timeout(CHECK_BUDGET_SECONDS):
+            return await _check_address(address, use_cache, source)
+    except TimeoutError:
+        log.warning(
+            "Проверка %s не уложилась в бюджет %.0f с — отдаём частичный результат",
+            address, CHECK_BUDGET_SECONDS,
+        )
+        partial = _partial.pop(address, None)
+        if partial is None:
+            partial = AddressVerdict(address=address, entity="Проверка не завершилась")
+        partial.risk_flags.insert(
+            0,
+            f"⏳ Проверка прервана по таймауту ({CHECK_BUDGET_SECONDS:.0f} с): часть "
+            f"источников не успела ответить. Повторите — платные KYT иногда "
+            f"считаются дольше обычного",
+        )
+        for name in ("swapster", "bitok", "hop2"):
+            partial.provider_status.setdefault(name, "timeout")
+        partial.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
+        partial.ruleset_version = RULESET_VERSION
+        return partial
+
+
+# Частично собранные вердикты: если проверка не уложится в бюджет, отдаём то,
+# что успели узнать, вместо пустого ответа.
+_partial: dict[str, AddressVerdict] = {}
+
+
+async def _check_address(
+    address: str, use_cache: bool, source: str
+) -> AddressVerdict:
+    """Собственно проверка.
+
+    - Смотрит кеш
+    - Параллельно опрашивает TronScan + GoPlus + flow + OFAC + блэклист Tether
+    - Сводит в единый Verdict, фиксируя состояние каждого источника
+    - Кеширует результат
+    """
     # Кеш
     if use_cache:
         cached = await cache.get(address)
@@ -1603,6 +1675,9 @@ async def check_address(
 
         verdict = AddressVerdict(address=address)
         verdict.provider_status = status
+        # Держим ссылку: при срабатывании общего дедлайна отдаём собранное,
+        # а не пустой вердикт.
+        _partial[address] = verdict
         token_summary = _apply_token_hygiene(flow_data, verdict)
         token_summary.update(_apply_transfer_signals(flow_data, flow_meta, verdict))
         token_summary["poisoning_suspects"] = _detect_poisoning(flow_data, verdict)
@@ -1707,4 +1782,5 @@ async def check_address(
     if use_cache:
         await cache.put(address, verdict.to_dict())
 
+    _partial.pop(address, None)
     return verdict
