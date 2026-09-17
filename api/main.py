@@ -19,10 +19,12 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
 from api.ratelimit import RateLimiter
-from core import check_address
+from core import check_address, history, labels
+from core.aggregator import RULESET_VERSION
 from core.cache import init_db
 from core.cluster import init_db as init_cluster_db
 from core.models import is_valid_trc20_address
+from core.providers.local import LOCAL_LABELS
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
@@ -47,7 +49,12 @@ _basic = HTTPBasic(auto_error=False)
 limiter = RateLimiter()
 
 # Состояние локальных хранилищ: заполняется в lifespan, видно в /health.
-storage_status: dict[str, str] = {"cache": "unknown", "cluster": "unknown"}
+storage_status: dict[str, str] = {
+    "cache": "unknown",
+    "cluster": "unknown",
+    "history": "unknown",
+    "labels": "unknown",
+}
 
 
 def require_web_auth(
@@ -115,9 +122,12 @@ async def _init_storage(name: str, init) -> None:
         storage_status[name] = "ok"
     except Exception as e:
         storage_status[name] = "unavailable"
-        what = "кеш проверок выключен" if name == "cache" else (
-            "кластеризация депозитников выключена"
-        )
+        what = {
+            "cache": "кеш проверок выключен",
+            "cluster": "кластеризация депозитников выключена",
+            "history": "журнал проверок не ведётся",
+            "labels": "ручные метки недоступны",
+        }.get(name, f"{name} выключено")
         log.error(
             "Хранилище %s недоступно (%s): сервис работает, но %s. "
             "Проверьте, что volume смонтирован на /data (см. DEPLOY_PLAN.md).",
@@ -129,6 +139,10 @@ async def _init_storage(name: str, init) -> None:
 async def lifespan(app: FastAPI):
     await _init_storage("cache", init_db)
     await _init_storage("cluster", init_cluster_db)
+    await _init_storage("history", history.init_db)
+    # Предзаданные метки из local.py засеваются в БД, не перетирая правки оператора.
+    await _init_storage("labels", lambda: labels.init_db(LOCAL_LABELS))
+    await history.prune()
     if WEB_PASSWORD:
         log.info("Web auth ENABLED (user=%s)", WEB_USER)
     elif API_KEY:
@@ -236,6 +250,24 @@ def _authorize(request: Request, api_key: str | None) -> None:
     limiter.record(client_ip(request))
 
 
+def _authorize_read(request: Request, api_key: str | None) -> None:
+    """Гейт для читающих эндпоинтов. Лимит проверок к ним не применяется: они
+    не тратят платные лимиты KYT, ограничивать их незачем."""
+    if API_KEY:
+        provided = request.headers.get("x-api-key") or api_key
+        if not provided or not secrets.compare_digest(provided, API_KEY):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return
+    if not is_protected():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Сервис не сконфигурирован для публичного доступа: задайте "
+                "WEB_PASSWORD или API_KEY, либо WEB_PUBLIC=1."
+            ),
+        )
+
+
 @app.get("/check/{address}")
 async def check(
     request: Request,
@@ -253,6 +285,39 @@ async def check(
     # Кеш — только по явному ?cache=true.
     verdict = await check_address(address, use_cache=cache)
     return verdict.to_dict()
+
+
+@app.get("/history")
+async def history_endpoint(
+    request: Request,
+    limit: int = Query(20, ge=1, le=200, description="Сколько записей вернуть"),
+    address: str | None = Query(None, description="Только по одному адресу"),
+    api_key: str | None = Query(None, description="API key (лучше заголовком X-API-Key)"),
+    _auth: None = Depends(require_web_auth),
+):
+    """Журнал проверок. Отвечает на вопрос «что я уже смотрел» и показывает,
+    как менялся вердикт по адресу."""
+    _authorize_read(request, api_key)
+    if address and not is_valid_trc20_address(address):
+        raise HTTPException(status_code=400, detail="Invalid TRC20 address format")
+    return {"items": await history.recent(limit=limit, address=address)}
+
+
+@app.get("/stats")
+async def stats_endpoint(
+    request: Request,
+    api_key: str | None = Query(None, description="API key (лучше заголовком X-API-Key)"),
+    _auth: None = Depends(require_web_auth),
+):
+    """Сколько проверок сделано. Прямой индикатор расхода платных лимитов KYT:
+    раньше это было видно только по счёту от провайдера."""
+    _authorize_read(request, api_key)
+    return {
+        "checks": await history.stats(),
+        "labels": labels.count(),
+        "rate_limit": limiter.stats(),
+        "ruleset_version": RULESET_VERSION,
+    }
 
 
 if WEB_DIR.exists():

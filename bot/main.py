@@ -5,6 +5,7 @@ import asyncio
 import html
 import logging
 import os
+import time
 from datetime import UTC, datetime
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -19,9 +20,9 @@ from aiogram.types import (
     TelegramObject,
 )
 
-from core import check_address
+from core import check_address, history, labels
 from core.addresses import extract_addresses, looks_like_address_attempt
-from core.models import AddressVerdict, RiskLevel, is_valid_trc20_address
+from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -116,6 +117,18 @@ class AccessMiddleware(BaseMiddleware):
                 log.warning("Не удалось отправить отказ user_id=%s: %s", uid, e)
             return  # обработчик не вызываем
         return await handler(event, data)
+
+_ENTITY_TYPE_VALUES = {e.value for e in EntityType}
+_RISK_LEVEL_VALUES = {r.value for r in RiskLevel}
+
+
+def _level(value: str | None) -> RiskLevel:
+    """Строка из журнала → RiskLevel. Незнакомое значение не должно ронять вывод."""
+    try:
+        return RiskLevel(value)
+    except (ValueError, TypeError):
+        return RiskLevel.UNKNOWN
+
 
 RISK_EMOJI = {
     RiskLevel.SAFE: "🟢",
@@ -415,7 +428,10 @@ HELP_TEXT = (
     "<b>Команды</b>\n"
     "/help — эта справка\n"
     "/id — ваш Telegram ID (нужен для белого списка)\n"
-    "/status — что сконфигурировано на сервере\n\n"
+    "/status — что сконфигурировано на сервере\n"
+    "/history — последние проверки\n"
+    "/stats — сколько проверок сделано (расход платных лимитов)\n"
+    "/labels, /label, /unlabel — свои метки адресов без редеплоя\n\n"
     "<b>Важно</b>\n"
     "«Нет находок» и «не удалось проверить» — разные вещи. Если источник "
     "недоступен, я пишу об этом первой строкой вердикта."
@@ -482,6 +498,139 @@ async def cmd_status(message: Message):
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    """Последние проверки. Возвращаться к уже смотренному адресу приходится
+    постоянно, а раньше его нужно было вводить заново."""
+    items = await history.recent(limit=10)
+    if not items:
+        await message.answer(
+            "Журнал пуст. Он ведётся на диске сервера и наполняется по мере проверок.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>🕘 Последние проверки</b>"]
+    for it in items:
+        emoji = RISK_EMOJI.get(_level(it.get("risk_level")), "⚪")
+        when = _fmt_age(int(time.time() - (it.get("checked_at") or 0))).lstrip(", ")
+        lines.append(
+            f"{emoji} <code>{_esc(it['address'])}</code>\n"
+            f"    {_esc(it.get('entity') or '—')} · {it.get('risk_score', 0)}/100 · {_esc(when)}"
+        )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Расход платных лимитов KYT по факту, а не по счёту от провайдера."""
+    st = await history.stats()
+    if not st.get("enabled"):
+        await message.answer("Журнал проверок выключен (HISTORY_ENABLED=0).")
+        return
+    by = st.get("by_risk_level") or {}
+    lines = [
+        "<b>📊 Статистика проверок</b>",
+        f"Всего: {st.get('total', 0)} · уникальных адресов: {st.get('unique_addresses', 0)}",
+        f"За последние сутки: {st.get('last_24h', 0)}",
+        "",
+        "<i>По вердиктам:</i>",
+    ]
+    for level, title in (("dangerous", "🔴 опасно"), ("caution", "🟡 осторожно"),
+                         ("safe", "🟢 безопасно"), ("unknown", "⚪ нет данных")):
+        if by.get(level):
+            lines.append(f"• {title}: {by[level]}")
+    lines.append("")
+    lines.append(f"Ручных меток в базе: {labels.count()}")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("labels"))
+async def cmd_labels(message: Message):
+    items = await labels.all_labels(limit=20)
+    if not items:
+        await message.answer(
+            "Ручных меток нет.\n\n"
+            "Добавить: <code>/label АДРЕС тип уровень заметка</code>\n"
+            "Например: <code>/label TR7N… labeled safe наш горячий кошелёк</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>🏷 Ручные метки</b> <i>(наивысший приоритет в вердикте)</i>"]
+    for it in items:
+        lines.append(
+            f"• <code>{_esc(it['address'])}</code> — {_esc(it.get('entity') or '—')}"
+            f" · {_esc(it.get('entity_type') or '?')} · {_esc(it.get('risk_level') or '?')}"
+        )
+    lines.append("")
+    lines.append("Удалить: <code>/unlabel АДРЕС</code>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+_LABEL_USAGE = (
+    "Формат: <code>/label АДРЕС [тип] [уровень] [заметка]</code>\n\n"
+    "тип: exchange, contract, project, scam, sanctioned, high_risk_service, "
+    "frozen, labeled, wallet, unknown\n"
+    "уровень: safe, caution, dangerous, unknown\n\n"
+    "Например:\n"
+    "<code>/label TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t labeled safe наш кошелёк</code>"
+)
+
+
+@dp.message(Command("label"))
+async def cmd_label(message: Message):
+    """Своя метка без правки кода и редеплоя.
+
+    Метка имеет наивысший приоритет в вердикте, поэтому автор записывается в
+    базу: это сильное действие, и должно быть видно, кто его сделал."""
+    parts = (message.text or "").split()
+    addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
+    if not addresses:
+        await message.answer(_LABEL_USAGE, parse_mode=ParseMode.HTML)
+        return
+    addr = addresses[0]
+    rest = parts[2:]
+    entity_type = rest[0] if rest and rest[0] in _ENTITY_TYPE_VALUES else None
+    if entity_type:
+        rest = rest[1:]
+    risk_level = rest[0] if rest and rest[0] in _RISK_LEVEL_VALUES else None
+    if risk_level:
+        rest = rest[1:]
+    note = " ".join(rest) or None
+    author = str(message.from_user.id) if message.from_user else "?"
+    try:
+        saved = await labels.put(
+            addr, entity=note, entity_type=entity_type, risk_level=risk_level,
+            note=None, author=author,
+        )
+    except Exception as e:
+        log.exception("не удалось сохранить метку")
+        await message.answer(f"⚠️ Не удалось сохранить метку: {_esc(e)}",
+                             parse_mode=ParseMode.HTML)
+        return
+    await message.answer(
+        f"✅ Метка сохранена для <code>{_esc(addr)}</code>\n"
+        f"название: {_esc(note or '—')}\n"
+        f"тип: {_esc(saved.get('entity_type') or 'не задан')} · "
+        f"уровень: {_esc(saved.get('risk_level') or 'не задан')}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("unlabel"))
+async def cmd_unlabel(message: Message):
+    parts = (message.text or "").split()
+    addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
+    if not addresses:
+        await message.answer("Формат: <code>/unlabel АДРЕС</code>", parse_mode=ParseMode.HTML)
+        return
+    removed = await labels.delete(addresses[0])
+    await message.answer(
+        f"{'✅ Метка удалена' if removed else 'Метки на этом адресе не было'}: "
+        f"<code>{_esc(addresses[0])}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # Лимит длины сообщения в Telegram — 4096 символов.
 TG_MESSAGE_LIMIT = 4096
 
@@ -503,7 +652,7 @@ def _fit_message(text: str) -> str:
 
 async def _check_and_render(addr: str) -> str:
     """Свежая проверка (без кеша — для AML важна актуальность транзакций)."""
-    v = await check_address(addr, use_cache=False)
+    v = await check_address(addr, use_cache=False, source="bot")
     return _fit_message(format_verdict(v))
 
 
@@ -588,8 +737,11 @@ async def main():
         raise RuntimeError("BOT_TOKEN env var is required")
     from core.cache import init_db
     from core.cluster import init_db as init_cluster_db
+    from core.providers.local import LOCAL_LABELS
     await init_db()
     await init_cluster_db()
+    await history.init_db()
+    await labels.init_db(LOCAL_LABELS)
     log_access_mode(log)
     bot = Bot(BOT_TOKEN)
     await dp.start_polling(bot)

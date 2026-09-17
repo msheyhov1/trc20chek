@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from . import aml_bitok, aml_external, balance, cache, cluster
+from . import aml_bitok, aml_external, balance, cache, cluster, history, labels
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 from .providers import flow, goplus, local, ofac, tether, tronscan
 from .providers.base import ProviderError
@@ -1352,7 +1352,33 @@ def _apply_provider_gaps(verdict: AddressVerdict) -> None:
         )
 
 
-async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
+async def _apply_history(verdict: AddressVerdict, source: str) -> None:
+    """Записать проверку в журнал и сравнить с предыдущей.
+
+    Смена уровня риска у того же адреса — самостоятельная находка: адрес, по
+    которому вчера было «безопасно», сегодня может быть в блэклисте. Ошибки
+    журнала глушатся внутри core.history: он необязательный."""
+    prev = await history.previous(verdict.address)
+    await history.record(verdict, source)
+    if not prev:
+        return
+    verdict.raw_labels["previous_check"] = prev
+    old_level, new_level = prev.get("risk_level"), verdict.risk_level.value
+    if old_level == new_level:
+        return
+    old_score = prev.get("risk_score")
+    grew = _RISK_ORDER.get(RiskLevel(old_level) if old_level else RiskLevel.UNKNOWN, 0) < \
+        _RISK_ORDER[verdict.risk_level]
+    arrow = "⬆️" if grew else "⬇️"
+    verdict.risk_flags.append(
+        f"{arrow} Вердикт изменился с прошлой проверки: было «{old_level}» "
+        f"({old_score}/100), стало «{new_level}» ({verdict.risk_score}/100)"
+    )
+
+
+async def check_address(
+    address: str, use_cache: bool = True, source: str = "api"
+) -> AddressVerdict:
     """Главная точка входа.
 
     - Валидирует адрес
@@ -1485,13 +1511,19 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         verdict.entity = "No public labels"
 
     # Ручные метки — последними: у них наивысший приоритет (см. _apply_local).
-    _apply_local(local.lookup(address), verdict)
+    # Приоритет источников: БД меток (правится оператором без редеплоя) выше
+    # предзаданных в local.py — в БД они и так засеяны при старте.
+    _apply_local(labels.lookup(address) or local.lookup(address), verdict)
 
     # Один явный флаг, если какой-то источник не ответил.
     _apply_provider_gaps(verdict)
 
     verdict.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
     verdict.ruleset_version = RULESET_VERSION
+
+    # Сравнение с прошлым результатом — то, зачем журнал и нужен: повторная
+    # проверка контрагента отвечает на вопрос «изменилось ли что-нибудь».
+    await _apply_history(verdict, source)
 
     # Кеш
     if use_cache:
