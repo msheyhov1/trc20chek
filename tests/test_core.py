@@ -58,6 +58,7 @@ def _no_network_by_default():
          patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())), \
          patch("core.aggregator.tether.check",
                new=AsyncMock(return_value=dict(NOT_BLACKLISTED))), \
+         patch("core.aggregator.token_security.fetch", new=AsyncMock(return_value={})), \
          patch("core.aggregator.aml_external.check", new=AsyncMock(return_value=dict(NO_AML))), \
          patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=dict(NO_AML))):
         yield
@@ -1421,3 +1422,43 @@ def test_heuristic_thresholds_come_from_env(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(agg)
+
+
+@pytest.mark.asyncio
+async def test_real_usdt_contract_is_not_flagged_high_risk():
+    """Регрессия: наличие функции блокировки у стейблкоина — норма, это и есть
+    механизм блэклиста Tether. На этом CI поймал ложное срабатывание: самый
+    легальный контракт сети классифицировался как высокорисковый сервис."""
+    ts_resp = {"address": VALID_ADDR, "accountType": 2,
+               "contractMap": {VALID_ADDR: True}, "name": "TetherToken", "vip": True}
+    # Так реально отвечает TronScan по контракту USDT
+    sec = {"token_level": "2", "is_vip": True, "black_list_type": "1",
+           "open_source": True, "increase_total_supply": True}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.token_security.fetch", new=AsyncMock(return_value=sec)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.CONTRACT
+    assert v.risk_level == RiskLevel.SAFE
+    # О функции блокировки всё равно сообщаем, но как о справке, а не угрозе
+    assert any("функция блокировки" in f and f.startswith("ℹ️") for f in v.risk_flags)
+
+
+def test_vip_token_is_never_escalated():
+    from core.providers.token_security import describe
+    _, serious = describe({"token_level": "3", "is_vip": True})
+    assert serious is False
+
+
+def test_blacklist_function_alone_is_not_serious():
+    from core.providers.token_security import describe
+    flags, serious = describe({"token_level": "2", "black_list_type": "1"})
+    assert serious is False
+    assert any("норма" in f for f in flags)
+
+
+def test_url_in_token_name_is_serious():
+    """Ссылка в имени токена — классическая приманка airdrop-фишинга."""
+    from core.providers.token_security import describe
+    _, serious = describe({"token_level": "2", "has_url": True})
+    assert serious is True
