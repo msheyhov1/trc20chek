@@ -1223,3 +1223,201 @@ async def test_plain_list_from_provider_still_works():
                new=AsyncMock(return_value=[_with_token("Tx", VALID_ADDR, 1_000_000)])):
         v = await check_address(VALID_ADDR, use_cache=False)
     assert v.aml["risky_counterparties"] == []
+
+
+# ---------- Направление экспозиции ----------
+
+@pytest.mark.asyncio
+async def test_exposure_splits_received_and_sent():
+    """Получить от санкционного адреса и отправить на него — разные события,
+    и в отчёте они должны читаться раздельно."""
+    transfers = [
+        _usdt(SANCTIONED_ADDR, VALID_ADDR, 700_000_000),   # получено 700
+        _usdt(VALID_ADDR, SANCTIONED_ADDR, 300_000_000),   # отправлено 300
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set",
+               new=AsyncMock(return_value={SANCTIONED_ADDR})):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["sanctions_exposure_pct"] == 100.0
+    assert v.aml["sanctions_received_pct"] == 70.0
+    assert v.aml["sanctions_sent_pct"] == 30.0
+    assert any("получено 70%" in f and "отправлено 30%" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_sanctioned_exchange_direction_is_tracked():
+    transfers = [_usdt("Thtx", VALID_ADDR, 500_000_000, from_tag="HTX 3")]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["sanctioned_exchange_received_pct"] == 100.0
+    assert v.aml["sanctioned_exchange_sent_pct"] == 0.0
+
+
+# ---------- Отравление истории (address poisoning) ----------
+
+@pytest.mark.asyncio
+async def test_detects_lookalike_dust_sender():
+    """Двойник совпадает по краям с настоящим контрагентом и присылает пыль —
+    так подсовывают адрес, чтобы его скопировали из истории."""
+    real = "TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb"
+    fake = "TWd4111111111111111111111111115jwb"   # те же 4 первых и 4 последних
+    transfers = [
+        _usdt(VALID_ADDR, real, 5_000_000_000),   # реальный платёж партнёру
+        _usdt(fake, VALID_ADDR, 1),               # пыль от двойника
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert any("отравление истории" in f for f in v.risk_flags)
+    suspects = v.aml["poisoning_suspects"]
+    assert len(suspects) == 1
+    assert suspects[0]["lookalike"] == fake
+    assert suspects[0]["resembles"] == real
+
+
+@pytest.mark.asyncio
+async def test_no_poisoning_flag_for_normal_counterparties():
+    """Разные адреса с реальными суммами — не отравление."""
+    transfers = [
+        _usdt(VALID_ADDR, "TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb", 1_000_000_000),
+        _usdt("TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8", VALID_ADDR, 2_000_000_000),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert not any("отравление" in f for f in v.risk_flags)
+    assert v.aml["poisoning_suspects"] == []
+
+
+@pytest.mark.asyncio
+async def test_lookalike_with_real_volume_is_not_flagged():
+    """Похожий адрес, через который шёл реальный объём — это партнёр,
+    а не приманка: два контрагента могут случайно совпасть по краям."""
+    a = "TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb"
+    b = "TWd4111111111111111111111111115jwb"
+    transfers = [
+        _usdt(VALID_ADDR, a, 1_000_000_000),
+        _usdt(VALID_ADDR, b, 900_000_000),     # тоже крупная сумма
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["poisoning_suspects"] == []
+
+
+# ---------- Высокорисковые обменники по тегу ----------
+
+@pytest.mark.asyncio
+async def test_high_risk_exchange_tag_is_not_treated_as_safe(monkeypatch):
+    """Обменник без KYC не должен получать «Биржа / БЕЗОПАСНО» и туннель,
+    отключающий платные KYT: именно через такие площадки выводят средства."""
+    from core import aggregator as agg
+    monkeypatch.setattr(agg, "HIGH_RISK_EXCHANGES", {"fastswap": "FastSwap"})
+    monkeypatch.setattr(agg, "HIGH_RISK_EXCHANGE_NAMES", {"FastSwap"})
+    monkeypatch.setattr(
+        agg, "_ALL_EXCHANGES",
+        {**agg.EXCHANGE_KEYWORDS, **agg.SANCTIONED_EXCHANGES, "fastswap": "FastSwap"},
+    )
+    swapster = AsyncMock(return_value=dict(NO_AML))
+    ts_resp = {"address": VALID_ADDR, "publicTag": "FastSwap hot"}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_external.check", new=swapster):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.HIGH_RISK_SERVICE
+    assert v.risk_level in (RiskLevel.CAUTION, RiskLevel.DANGEROUS)
+    assert v.risk_score >= 60
+    swapster.assert_awaited()          # туннель НЕ отключил второе мнение
+    assert any("повышенным риском" in f for f in v.risk_flags)
+
+
+def test_high_risk_exchanges_parsed_from_env(monkeypatch):
+    from core.aggregator import _parse_high_risk_exchanges
+    monkeypatch.setenv("HIGH_RISK_EXCHANGES", "fastswap:FastSwap, noname , :broken")
+    parsed = _parse_high_risk_exchanges()
+    assert parsed["fastswap"] == "FastSwap"
+    assert parsed["noname"] == "Noname"
+    assert "" not in parsed
+
+
+def test_high_risk_exchange_list_is_empty_by_default():
+    """Состав берётся из проверяемого источника: ошибочно записать легальную
+    биржу в высокорисковые хуже, чем не записать никого."""
+    from core.aggregator import HIGH_RISK_EXCHANGES
+    assert HIGH_RISK_EXCHANGES == {}
+
+
+# ---------- Безопасность контракта ----------
+
+@pytest.mark.asyncio
+async def test_contract_security_flags_are_applied():
+    """Контракт раньше получал SAFE/CAUTION и на этом анализ заканчивался."""
+    ts_resp = {"address": VALID_ADDR, "accountType": 2,
+               "contractMap": {VALID_ADDR: True}, "name": "SomeToken"}
+    sec = {"token_level": "4", "black_list_type": "1", "has_url": True,
+           "open_source": False, "is_proxy": True}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.token_security.fetch", new=AsyncMock(return_value=sec)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.HIGH_RISK_SERVICE      # не «просто контракт»
+    assert any("небезопасный" in f for f in v.risk_flags)
+    assert any("функция блокировки" in f for f in v.risk_flags)
+    assert any("зашита ссылка" in f for f in v.risk_flags)
+    assert v.provider_status["token_security"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_reputable_contract_stays_contract():
+    ts_resp = {"address": VALID_ADDR, "accountType": 2,
+               "contractMap": {VALID_ADDR: True}, "name": "TetherToken", "vip": True}
+    sec = {"token_level": "2", "is_vip": True, "open_source": True, "black_list_type": "2"}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.token_security.fetch", new=AsyncMock(return_value=sec)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.CONTRACT
+    assert v.risk_level == RiskLevel.SAFE
+    assert any("VIP-списка" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_token_security_not_requested_for_wallets():
+    """Для кошелька этот эндпоинт бессмысленен — лишний запрос не делаем."""
+    fetch = AsyncMock(return_value={})
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.token_security.fetch", new=fetch):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    fetch.assert_not_awaited()
+    assert "token_security" not in v.provider_status
+
+
+# ---------- Пороги эвристик настраиваются ----------
+
+def test_heuristic_thresholds_come_from_env(monkeypatch):
+    """Эвристики тюнят на данных, а не пересобирая образ."""
+    import importlib
+
+    from core import aggregator as agg
+    monkeypatch.setenv("DEPOSIT_CONCENTRATION", "0.75")
+    monkeypatch.setenv("TRANSIT_FORWARD_RATIO", "0.5")
+    monkeypatch.setenv("AML_HOP2_WEIGHT", "0.3")
+    monkeypatch.setenv("UNTAGGED_SERVICE_TX", "1000")
+    reloaded = importlib.reload(agg)
+    try:
+        assert reloaded.DEPOSIT_CONCENTRATION == 0.75
+        assert reloaded.TRANSIT_FORWARD_RATIO == 0.5
+        assert reloaded.HOP2_WEIGHT == 0.3
+        assert reloaded.UNTAGGED_SERVICE_TX == 1000
+    finally:
+        monkeypatch.undo()
+        importlib.reload(agg)

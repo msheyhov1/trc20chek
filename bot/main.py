@@ -308,13 +308,27 @@ def _exposure_line(aml: dict) -> list[str]:
         ("other_exposure_pct", "прочее"),
     ):
         value = aml.get(key) or 0
-        if value:
+        if not value:
+            continue
+        # Для санкционных категорий показываем направление: «получено от» и
+        # «отправлено на» — это разные обвинения к адресу.
+        got = aml.get(key.replace("_exposure_pct", "_received_pct")) or 0
+        sent = aml.get(key.replace("_exposure_pct", "_sent_pct")) or 0
+        if got or sent:
+            dirs = []
+            if got:
+                dirs.append(f"↓{_fmt_pct(got)}")
+            if sent:
+                dirs.append(f"↑{_fmt_pct(sent)}")
+            parts.append(f"{title} {_fmt_pct(value)} ({' '.join(dirs)})")
+        else:
             parts.append(f"{title} {_fmt_pct(value)}")
     if not parts:
         return []
     lines = [
         "",
-        f"<b>🧭 Экспозиция</b> <i>(по {aml['transfers_analyzed']} переводам)</i>",
+        f"<b>🧭 Экспозиция</b> <i>(по {aml['transfers_analyzed']} переводам; "
+        f"↓ получено, ↑ отправлено)</i>",
         "• " + " · ".join(parts),
     ]
     if aml.get("indirect_sanctions_pct"):

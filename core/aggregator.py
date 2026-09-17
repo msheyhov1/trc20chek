@@ -12,7 +12,7 @@ import httpx
 
 from . import aml_bitok, aml_external, balance, cache, cluster, history, labels
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
-from .providers import flow, goplus, local, ofac, tether, tronscan
+from .providers import flow, goplus, local, ofac, tether, token_security, tronscan
 from .providers.base import ProviderError
 
 PROVIDER_TETHER = tether.PROVIDER
@@ -207,7 +207,7 @@ def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
 
 
 # Транзит: адрес форвардит ≥ этой доли полученного и не копит существенный баланс.
-TRANSIT_FORWARD_RATIO = 0.8
+TRANSIT_FORWARD_RATIO = float(os.getenv("TRANSIT_FORWARD_RATIO", "0.8"))
 
 
 def _is_transit(transfers: list[dict[str, Any]], addr: str, balance_usdt: float) -> bool:
@@ -352,6 +352,32 @@ SANCTIONED_EXCHANGES: dict[str, str] = {
 }
 SANCTIONED_EXCHANGE_NAMES = set(SANCTIONED_EXCHANGES.values())
 
+# Сервисы с повышенным риском, опознаваемые по тегу TronScan: обменники без KYC,
+# P2P-площадки, мгновенные свопы. Для них НЕЛЬЗЯ использовать EXCHANGE: тот
+# трактуется как безопасный (правило known_service) и отключает платные KYT
+# через туннель, а именно через такие сервисы и выводят средства.
+#
+# Список по умолчанию пуст намеренно: состав нужно брать из проверяемого
+# источника, а не из общих соображений — ошибочно записать легальную биржу в
+# высокорисковые хуже, чем не записать никого. Заполняется через env
+# HIGH_RISK_EXCHANGES в формате `подстрока_тега:Каноническое имя` через запятую.
+def _parse_high_risk_exchanges() -> dict[str, str]:
+    raw = os.getenv("HIGH_RISK_EXCHANGES", "").strip()
+    out: dict[str, str] = {}
+    for chunk in raw.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        key, _, name = chunk.partition(":")
+        key = key.strip().lower()
+        if key:
+            out[key] = name.strip() or key.title()
+    return out
+
+
+HIGH_RISK_EXCHANGES: dict[str, str] = _parse_high_risk_exchanges()
+HIGH_RISK_EXCHANGE_NAMES = set(HIGH_RISK_EXCHANGES.values())
+
 # Каноническое имя → какой орган внёс биржу в список. Нужно, чтобы отчёт не
 # ссылался на OFAC там, где санкция британская или европейская: уровень риска
 # можно перепроверить, а ссылка на конкретный список читается как факт.
@@ -386,15 +412,19 @@ SANCTIONED_EXCHANGE_SOURCE: dict[str, str] = {
 # Раскрываем топ-N неизвестных посредников и смотрим ИХ санкционную экспозицию.
 HOP2_ENABLED = os.getenv("AML_HOP2", "1") not in ("0", "false", "False", "")
 HOP2_LIMIT = int(os.getenv("AML_HOP2_LIMIT", "12"))  # сколько посредников раскрывать
-HOP2_WEIGHT = 0.6  # вес косвенной (2-хоп) экспозиции относительно прямой
+HOP2_WEIGHT = float(os.getenv("AML_HOP2_WEIGHT", "0.6"))  # вес косвенной экспозиции
 # Ограничение параллелизма hop2, чтобы не бить в QPS-лимит TronScan-ключа.
 HOP2_CONCURRENCY = int(os.getenv("AML_HOP2_CONCURRENCY", "4"))
 
 # Депозитный/транзитный адрес биржи (funnel-эвристика, см. _detect_exchange_deposit).
 # Концентрация оттока на одну биржу и доля пересылаемого — пороги распознавания.
-DEPOSIT_CONCENTRATION = 0.9   # ≥90% оттока на одну биржу
-DEPOSIT_FORWARD_RATIO = 0.5   # пересылает ≥50% полученного извне
-DEPOSIT_BACKFLOW_RATIO = 0.15  # приход С этой биржи ≤15% оттока на неё (газ, не торговля)
+# Это эвристики: их тюнят на реальных данных, поэтому берём из env, а не
+# пересобираем образ ради смены числа.
+DEPOSIT_CONCENTRATION = float(os.getenv("DEPOSIT_CONCENTRATION", "0.9"))
+DEPOSIT_FORWARD_RATIO = float(os.getenv("DEPOSIT_FORWARD_RATIO", "0.5"))
+DEPOSIT_BACKFLOW_RATIO = float(os.getenv("DEPOSIT_BACKFLOW_RATIO", "0.15"))
+# Порог «очень высокая активность» → возможно нетегированный сервис.
+UNTAGGED_SERVICE_TX = int(os.getenv("UNTAGGED_SERVICE_TX", "50000"))
 
 # Серьёзные риск-флаги GoPlus → dangerous
 CRITICAL_GOPLUS_FLAGS = {
@@ -408,7 +438,7 @@ CRITICAL_GOPLUS_FLAGS = {
 }
 
 
-_ALL_EXCHANGES = {**EXCHANGE_KEYWORDS, **SANCTIONED_EXCHANGES}
+_ALL_EXCHANGES = {**EXCHANGE_KEYWORDS, **SANCTIONED_EXCHANGES, **HIGH_RISK_EXCHANGES}
 
 
 def _normalize_exchange(tag: str | None) -> str | None:
@@ -454,6 +484,15 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
     exch = _normalize_exchange(main_tag)
     if exch:
         verdict.entity = exch
+        if exch in HIGH_RISK_EXCHANGE_NAMES:
+            # Обменник без KYC — не «безопасная биржа»: он не получает ни
+            # правила known_service, ни туннеля, отключающего платные KYT.
+            verdict.entity_type = EntityType.HIGH_RISK_SERVICE
+            verdict.risk_flags.append(
+                f"⚠️ {exch} — сервис с повышенным риском (обменник без "
+                f"верификации): через такие площадки выводят средства"
+            )
+            return
         verdict.entity_type = EntityType.EXCHANGE
         verdict.risk_level = RiskLevel.SAFE
         if "hot" in main_tag.lower():
@@ -705,7 +744,7 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
     )
     # Эвристика: огромная активность → возможно нетегированный сервис/биржа
     activity = verdict.raw_labels.get("activity_tx") or 0
-    if isinstance(activity, int) and activity > 50_000:
+    if isinstance(activity, int) and activity > UNTAGGED_SERVICE_TX:
         verdict.entity = f"Возможно сервис/биржа (связан с {top}, нетегирован)"
         verdict.risk_flags.append(
             f"⚠️ Очень высокая активность ({activity:,} транзакций) — "
@@ -863,6 +902,95 @@ def _apply_transfer_signals(
     }
 
 
+# Отравление истории: сколько символов должно совпасть у адреса-двойника.
+# По разборам SlowMist и TRM Labs двойник совпадает по первым 3-4 и последним 4
+# символам — именно столько обычно видно в интерфейсе кошелька, когда адрес
+# сокращён, и именно поэтому жертва копирует его из истории не глядя.
+POISON_PREFIX = int(os.getenv("POISON_PREFIX_CHARS", "4"))
+POISON_SUFFIX = int(os.getenv("POISON_SUFFIX_CHARS", "4"))
+# Пылевой перевод: столько или меньше — приманка, а не платёж.
+POISON_DUST_MAX = float(os.getenv("POISON_DUST_MAX", "1.0"))
+
+
+def _detect_poisoning(
+    transfers: list[dict[str, Any]], verdict: AddressVerdict
+) -> list[dict[str, Any]]:
+    """Адреса-двойники в истории (address poisoning).
+
+    Атака: жертве присылают перевод с адреса, визуально похожего на настоящего
+    контрагента, чтобы она скопировала его из истории и отправила деньги не туда.
+    Признаки, которые ищем: совпадение префикса и суффикса при разной середине,
+    нулевая или пылевая сумма и единственное появление отправителя.
+
+    Данные уже есть в ответе flow — дополнительных запросов не нужно.
+    Это эвристика, а не стандарт, поэтому и в выводе подаётся как предположение.
+    """
+    addr = verdict.address
+    # Сколько раз встречается контрагент и на какой объём — «настоящий» партнёр
+    # обычно появляется не один раз и не на пыль.
+    seen: dict[str, int] = {}
+    volume: dict[str, float] = {}
+    for t in transfers:
+        for side in ("from_address", "to_address"):
+            cp = t.get(side)
+            if cp and cp != addr:
+                seen[cp] = seen.get(cp, 0) + 1
+                volume[cp] = volume.get(cp, 0.0) + _amount(t)
+
+    def key(a: str) -> tuple[str, str]:
+        return a[:POISON_PREFIX], a[-POISON_SUFFIX:]
+
+    # Группируем по «внешнему виду» сокращённого адреса.
+    groups: dict[tuple[str, str], list[str]] = {}
+    for cp in seen:
+        groups.setdefault(key(cp), []).append(cp)
+
+    suspects: list[dict[str, Any]] = []
+    for look, members in groups.items():
+        if len(members) < 2:
+            continue
+        # Настоящий контрагент — тот, через кого шёл реальный объём.
+        real = max(members, key=lambda a: volume.get(a, 0.0))
+        for cp in members:
+            if cp == real:
+                continue
+            if volume.get(cp, 0.0) > POISON_DUST_MAX or seen.get(cp, 0) > 1:
+                continue  # не пыль и не одиночный — на приманку не похоже
+            suspects.append({
+                "lookalike": cp,
+                "resembles": real,
+                "shared": f"{look[0]}…{look[1]}",
+                "amount": round(volume.get(cp, 0.0), 6),
+            })
+
+    if suspects:
+        first = suspects[0]
+        verdict.risk_flags.append(
+            f"🎭 Похоже на отравление истории: адрес {first['lookalike']} "
+            f"начинается и заканчивается так же, как {first['resembles']} "
+            f"({first['shared']}), но прислал только пыль. Так подсовывают "
+            f"похожий адрес, чтобы его скопировали из истории. "
+            f"Всего таких: {len(suspects)}. Сверяйте адрес полностью, не по краям"
+        )
+    return suspects
+
+
+def _apply_token_security(data: dict[str, Any] | None, verdict: AddressVerdict) -> None:
+    """Безопасность контракта. Раньше контракт получал SAFE/CAUTION и на этом
+    анализ заканчивался — туннель исключал его из внешних AML."""
+    if not data:
+        return
+    verdict.raw_labels["token_security"] = data
+    flags, serious = token_security.describe(data)
+    verdict.risk_flags.extend(flags)
+    if serious and verdict.entity_type is EntityType.CONTRACT:
+        # Контракт с функцией блокировки или помеченный небезопасным — это не
+        # «смарт-контракт, вероятно всё в порядке».
+        verdict.entity_type = EntityType.HIGH_RISK_SERVICE
+    if "TronScan security" not in verdict.sources:
+        verdict.sources.append("TronScan security")
+
+
 def _apply_tether(result: dict[str, Any] | None, verdict: AddressVerdict) -> None:
     """Блокировка адреса эмитентом USDT.
 
@@ -949,9 +1077,11 @@ def _parse_transfers(
         if addr == t.get("from_address"):
             cp = t.get("to_address")
             tag = (t.get("to_address_tag") or {}).get("to_address_tag")
+            direction = "out"   # адрес ОТПРАВИЛ контрагенту
         elif addr == t.get("to_address"):
             cp = t.get("from_address")
             tag = (t.get("from_address_tag") or {}).get("from_address_tag")
+            direction = "in"    # адрес ПОЛУЧИЛ от контрагента
         else:
             continue
         if not cp:
@@ -959,9 +1089,20 @@ def _parse_transfers(
         amt = _amount(t)
         total += amt
         d = per_cp.setdefault(
-            cp, {"volume": 0.0, "exch": None, "sanctioned": cp in sanctioned}
+            cp,
+            {
+                "volume": 0.0,
+                # Направление важно для AML: получить средства от санкционного
+                # адреса — принять грязные деньги, отправить — финансировать.
+                # Раньше и то и другое давало одинаковый вклад в один `volume`.
+                "volume_in": 0.0,
+                "volume_out": 0.0,
+                "exch": None,
+                "sanctioned": cp in sanctioned,
+            },
         )
         d["volume"] += amt
+        d[f"volume_{direction}"] += amt
         if d["exch"] is None:
             d["exch"] = _normalize_exchange(tag)
     return total, per_cp
@@ -1027,6 +1168,11 @@ async def _fetch_hop2(
     }
 
 
+def _pct_str(value: float) -> str:
+    """Процент для текста флага: 70 вместо «70.0», но 0.9 остаётся «0.9»."""
+    return f"{value:.0f}" if abs(value - round(value)) < 0.05 else f"{value:g}"
+
+
 def _compute_aml(
     verdict: AddressVerdict,
     transfers: list[dict[str, Any]],
@@ -1060,15 +1206,22 @@ def _compute_aml(
     # 1-хоп экспозиция по объёму контрагентов
     total, per_cp = _parse_transfers(addr, transfers, sanctioned)
     vol = {"sanctions": 0.0, "sanctioned_exchange": 0.0, "exchange": 0.0, "other": 0.0}
+    # Тот же объём с разбивкой по направлению: «получено от» и «отправлено на».
+    flow_dir = {"sanctions_in": 0.0, "sanctions_out": 0.0,
+                "sanctioned_exchange_in": 0.0, "sanctioned_exchange_out": 0.0}
     sanctioned_cps: set[str] = set()
     risky_exchanges: set[str] = set()
     for cp, d in per_cp.items():
         amt = d["volume"]
         if d["sanctioned"]:
             vol["sanctions"] += amt
+            flow_dir["sanctions_in"] += d.get("volume_in", 0.0)
+            flow_dir["sanctions_out"] += d.get("volume_out", 0.0)
             sanctioned_cps.add(cp)
         elif d["exch"] in SANCTIONED_EXCHANGE_NAMES:
             vol["sanctioned_exchange"] += amt
+            flow_dir["sanctioned_exchange_in"] += d.get("volume_in", 0.0)
+            flow_dir["sanctioned_exchange_out"] += d.get("volume_out", 0.0)
             risky_exchanges.add(d["exch"])
         elif d["exch"]:
             vol["exchange"] += amt
@@ -1088,6 +1241,12 @@ def _compute_aml(
         "direct_sanctioned": direct,
         "sanctions_exposure_pct": pct(vol["sanctions"]),
         "sanctioned_exchange_exposure_pct": pct(vol["sanctioned_exchange"]),
+        # Направление экспозиции: получить от санкционного адреса и отправить
+        # на него — разные события, и в отчёте они должны читаться раздельно.
+        "sanctions_received_pct": pct(flow_dir["sanctions_in"]),
+        "sanctions_sent_pct": pct(flow_dir["sanctions_out"]),
+        "sanctioned_exchange_received_pct": pct(flow_dir["sanctioned_exchange_in"]),
+        "sanctioned_exchange_sent_pct": pct(flow_dir["sanctioned_exchange_out"]),
         "exchange_exposure_pct": pct(vol["exchange"]),
         "other_exposure_pct": pct(vol["other"]),
         "risky_exposure_pct": risky_pct,
@@ -1187,20 +1346,29 @@ def _compute_aml(
 
     # ---- Поясняющие флаги экспозиции ----
     if vol["sanctions"] > 0 and not direct:
+        # Направление называем явно: «получил от санкционного» и «отправил на
+        # санкционный» — это разные обвинения, и читатель отчёта должен видеть,
+        # какое из них к адресу относится.
+        parts = []
+        if flow_dir["sanctions_in"] > 0:
+            parts.append(f"получено {_pct_str(pct(flow_dir['sanctions_in']))}%")
+        if flow_dir["sanctions_out"] > 0:
+            parts.append(f"отправлено {_pct_str(pct(flow_dir['sanctions_out']))}%")
+        detail = f" ({', '.join(parts)})" if parts else ""
         verdict.risk_flags.append(
-            f"Экспозиция к санкционным адресам: {pct(vol['sanctions'])}% объёма "
-            f"({len(sanctioned_cps)} контрагент(ов))"
+            f"Экспозиция к санкционным адресам: {_pct_str(pct(vol['sanctions']))}% объёма"
+            f"{detail}, {len(sanctioned_cps)} контрагент(ов)"
         )
     if vol["sanctioned_exchange"] > 0 and not self_sanctioned_exch:
         verdict.risk_flags.append(
             f"⚠️ Переводы с санкционными биржами ({', '.join(sorted(risky_exchanges))}): "
-            f"{pct(vol['sanctioned_exchange'])}% объёма — деньги могут заморозить"
+            f"{_pct_str(pct(vol['sanctioned_exchange']))}% объёма — деньги могут заморозить"
         )
     if indirect_pct > 0 and not direct_danger:
         n = len((hop2 or {}).get("flagged", []))
         verdict.risk_flags.append(
             f"Косвенная связь с санкциями через {n} посредник(ов): "
-            f"~{indirect_pct}% объёма (2-й хоп)"
+            f"~{_pct_str(indirect_pct)}% объёма (2-й хоп)"
         )
 
     # ---- Внешние KYT — последний штрих ОДНОГО расчёта ----
@@ -1437,12 +1605,22 @@ async def check_address(
         verdict.provider_status = status
         token_summary = _apply_token_hygiene(flow_data, verdict)
         token_summary.update(_apply_transfer_signals(flow_data, flow_meta, verdict))
+        token_summary["poisoning_suspects"] = _detect_poisoning(flow_data, verdict)
         _apply_tronscan(ts_data, verdict)
         _apply_goplus(gp_data, verdict)
         _apply_flow(flow_data, verdict)
         # Блокировка эмитентом бьёт всё остальное, поэтому применяется до
         # решения о туннеле: для FROZEN платные KYT уже ничего не добавят.
         _apply_tether(tether_result, verdict)
+
+        # Безопасность контракта спрашиваем ТОЛЬКО для контрактов: для кошелька
+        # этот эндпоинт бессмысленен, а лишний запрос — лишняя задержка.
+        if verdict.entity_type is EntityType.CONTRACT and token_security.is_enabled():
+            _, sec_data, sec_status = await _guarded(
+                "token_security", token_security.fetch(address, client), None
+            )
+            verdict.provider_status["token_security"] = sec_status
+            _apply_token_security(sec_data, verdict)
 
         # 2-й хоп: только для кошельков/неизвестных (биржи/контракты/прямые
         # санкции раскрывать бессмысленно — их контрагенты это «все подряд»).
