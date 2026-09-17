@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections import Counter
 from typing import Any
@@ -11,6 +12,9 @@ import httpx
 from . import aml_bitok, aml_external, balance, cache, cluster
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 from .providers import flow, goplus, local, ofac, tronscan
+from .providers.base import ProviderError
+
+log = logging.getLogger(__name__)
 
 # Туннель: для этих типов внешний AML-API НЕ запрашивается — биржа/депозитник
 # биржи/контракт — это инфраструктура, её AML-скор ничего не говорит о владельце,
@@ -248,17 +252,28 @@ EXCHANGE_KEYWORDS: dict[str, str] = {
     "bitpanda": "Bitpanda",
     "bitvavo": "Bitvavo",
     "luno": "Luno",
-    "nobitex": "Nobitex",
-    "wallex": "Wallex",
     # кастодиальные/лендинг (держат USDT, часто метятся как биржи)
     "nexo": "Nexo",
     "cex.io": "CEX.IO",
 }
 
 # Биржи под санкциями. Деньги с них блокируются комплаенсом ("заморозка").
-# Источники: UK A7-пакет от 26.05.2026 (HTX/Huobi, EXMO, Bitpapa, Rapira,
-# Aifory, Arvix, ABCEX) + OFAC (Garantex/Grinex/Cryptex).
 # Ловим по тегам TronScan: и сам хот-кошелёк биржи, и переводы с/на него.
+#
+# ВАЖНО: название не должно одновременно быть в EXCHANGE_KEYWORDS — иначе
+# _normalize_exchange отдаст предпочтение обычному словарю (он первый в
+# _ALL_EXCHANGES) и санкционная биржа получит вердикт «безопасно».
+# Это проверяет test_no_overlap_between_exchange_dicts.
+#
+# Источники и даты (см. ROADMAP.md §5.3):
+#   UK, 26.05.2026 — HTX/Huobi
+#   UK A7-пакет    — EXMO, Bitpapa, Rapira, Aifory, Arvix, ABCEX
+#   OFAC           — Garantex, Grinex, Cryptex
+#   OFAC 02.06.2026 — Nobitex, Wallex, Bitpin, Ramzinex (иранские, оборот в USDT-TRC20)
+#   OFAC 22.06.2026 — Bitcoin Xchange (сеть финансирования ISIS)
+#   OFAC 07.08.2026 — Shelbit, Aban Tether
+#   EU 21-й пакет, 23.07.2026 — WhiteBird, NoOne, Tradex/Brightum, Monease, Exnode
+#   EU 20-й пакет, 23.04.2026 — TengriCoin
 SANCTIONED_EXCHANGES: dict[str, str] = {
     "exmo": "EXMO",
     "rapira": "Rapira",
@@ -271,6 +286,26 @@ SANCTIONED_EXCHANGES: dict[str, str] = {
     "garantex": "Garantex",
     "grinex": "Grinex",
     "cryptex": "Cryptex",
+    # OFAC 02.06.2026 — иранские биржи
+    "nobitex": "Nobitex",
+    "wallex": "Wallex",
+    "bitpin": "Bitpin",
+    "ramzinex": "Ramzinex",
+    # OFAC 07.08.2026
+    "shelbit": "Shelbit",
+    "aban tether": "Aban Tether",
+    "abantether": "Aban Tether",
+    # OFAC 22.06.2026
+    "bitcoin xchange": "Bitcoin Xchange",
+    # EU 21-й пакет, 23.07.2026
+    "whitebird": "WhiteBird",
+    "noonecrypto": "NoOne",
+    "noone": "NoOne",
+    "brightum": "Tradex (Brightum)",
+    "monease": "Monease",
+    "exnode": "Exnode",
+    # EU 20-й пакет, 23.04.2026
+    "tengricoin": "TengriCoin",
 }
 SANCTIONED_EXCHANGE_NAMES = set(SANCTIONED_EXCHANGES.values())
 
@@ -605,18 +640,127 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
         )
 
 
-def _amount(t: dict[str, Any]) -> float:
-    """Нормализованная сумма перевода (с учётом decimals). 0 при сбое.
+# ---------- Какие токены участвуют в объёмной математике ----------
+# Экспозиция считается как ДОЛЯ от общего объёма, поэтому в знаменатель нельзя
+# пускать произвольный токен: любой может выпустить свой TRC20 с символом «USDT»
+# и огромным quant, прислать себе один перевод и тем самым разбавить санкционную
+# экспозицию до нуля. Это не шум, а дешёвый вектор уклонения (ROADMAP §1.1).
+#
+# Поэтому сверяем КОНТРАКТ (tokenInfo.tokenId), а не символ: символ подделывается
+# тривиально, адрес контракта — нет.
+_STABLECOINS: dict[str, str] = {
+    "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t": "USDT",
+    "TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8": "USDC",
+    "TPYmHEhy5n8TCEfYGqW2rPxsghSfzghPDn": "USDD",
+    "TUpMhErZL2fhh4sVNULAbNKLokS4GjC1F4": "TUSD",
+    "TMwFHYXLJaRUPeW6421aqXL4ZEzPRFGkGT": "USDJ",
+}
 
-    Прим.: суммируем разные токены как сопоставимые — это аппроксимация.
-    В TRC20 подавляющая часть оборота — USDT (≈$1), так что для оценки
-    ДОЛИ экспозиции этого достаточно."""
+
+def _volume_tokens() -> dict[str, str]:
+    """Контракты, участвующие в объёмной математике. Расширяется через env
+    AML_VOLUME_TOKENS (`адрес:символ` через запятую)."""
+    extra = os.getenv("AML_VOLUME_TOKENS", "").strip()
+    if not extra:
+        return _STABLECOINS
+    out = dict(_STABLECOINS)
+    for chunk in extra.replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        addr, _, sym = chunk.partition(":")
+        addr = addr.strip()
+        if is_valid_trc20_address(addr):
+            out[addr] = (sym.strip() or "?").upper()
+        else:
+            log.warning("AML_VOLUME_TOKENS: пропускаю невалидный адрес %r", addr)
+    return out
+
+
+VOLUME_TOKENS = _volume_tokens()
+
+# Символы, под которые мимикрируют скам-токены. Совпадение символа при ЧУЖОМ
+# контракте — признак отравления истории / подготовки к дрейну.
+_IMPERSONATED_SYMBOLS = {"USDT", "USDC", "USDD", "TUSD", "TETHER", "USD", "TRX"}
+
+
+def _token_id(t: dict[str, Any]) -> str:
+    info = t.get("tokenInfo") or {}
+    return str(info.get("tokenId") or t.get("contract_address") or "")
+
+
+def _raw_amount(t: dict[str, Any]) -> float:
+    """Сумма перевода по его собственным decimals, без фильтра по токену."""
     try:
         q = int(t.get("quant") or 0)
         dec = int((t.get("tokenInfo") or {}).get("tokenDecimal", 6))
         return q / (10 ** dec)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _amount(t: dict[str, Any]) -> float:
+    """Нормализованная сумма перевода для объёмной математики. 0, если токен не
+    входит в VOLUME_TOKENS — такой перевод не должен влиять на доли экспозиции.
+
+    Прим.: разные стейблкоины суммируются как сопоставимые — это аппроксимация,
+    но все они ≈$1, так что для оценки ДОЛИ этого достаточно.
+
+    Обратная совместимость: если в переводе вообще нет tokenId (старые фикстуры,
+    неполный ответ), считаем как раньше — иначе молча обнулили бы весь анализ."""
+    tid = _token_id(t)
+    if tid and tid not in VOLUME_TOKENS:
+        return 0.0
+    return _raw_amount(t)
+
+
+def _apply_token_hygiene(
+    transfers: list[dict[str, Any]], verdict: AddressVerdict
+) -> dict[str, Any]:
+    """Смотрит, какие токены реально ходили через адрес.
+
+    Возвращает сводку для `verdict.aml` и добавляет флаги:
+      • переводы токена, мимикрирующего под USDT с чужого контракта;
+      • доля переводов, исключённых из объёмной математики.
+    """
+    counted = ignored = 0
+    fakes: dict[str, str] = {}   # контракт → заявленный символ
+    symbols: set[str] = set()
+    for t in transfers:
+        tid = _token_id(t)
+        info = t.get("tokenInfo") or {}
+        sym = str(info.get("tokenAbbr") or "").strip()
+        name = str(info.get("tokenName") or "").strip()
+        if tid and tid in VOLUME_TOKENS:
+            counted += 1
+            symbols.add(VOLUME_TOKENS[tid])
+            continue
+        if tid:
+            ignored += 1
+            looks_like = sym.upper() in _IMPERSONATED_SYMBOLS or "tether" in name.lower()
+            if looks_like:
+                fakes[tid] = sym or name
+        else:
+            counted += 1  # нет tokenId — считаем как раньше (см. _amount)
+
+    if fakes:
+        listed = ", ".join(sorted({v for v in fakes.values() if v})) or "USDT"
+        verdict.risk_flags.append(
+            f"⚠️ Переводы поддельного «{listed}»: символ совпадает, а контракт чужой "
+            f"({len(fakes)} шт.). Типичное отравление истории или подготовка к обману "
+            f"при копировании адреса. Из расчёта экспозиции такие переводы исключены"
+        )
+    if ignored and counted and ignored >= counted:
+        verdict.risk_flags.append(
+            f"ℹ️ Большая часть переводов ({ignored} из {ignored + counted}) — в токенах "
+            f"вне списка учёта, экспозиция посчитана по {counted}"
+        )
+    return {
+        "transfers_counted": counted,
+        "transfers_ignored": ignored,
+        "tokens_counted": sorted(symbols),
+        "impersonating_tokens": sorted(fakes),
+    }
 
 
 def _parse_transfers(
@@ -715,6 +859,7 @@ def _compute_aml(
     transfers: list[dict[str, Any]],
     sanctioned: set[str],
     hop2: dict[str, Any] | None = None,
+    tokens: dict[str, Any] | None = None,
 ) -> None:
     """Централизованная риск-модель (AML).
 
@@ -780,6 +925,9 @@ def _compute_aml(
         "sanctioned_counterparties": sorted(sanctioned_cps),
         "sanctioned_exchanges": sorted(risky_exchanges),
         "goplus_critical_flags": goplus_critical,
+        # Гигиена токенов: сколько переводов реально попало в объёмную математику
+        # и не мимикрирует ли кто-то под USDT (см. _apply_token_hygiene).
+        **(tokens or {}),
     }
 
     # Известный ЛЕГАЛЬНЫЙ сервис (биржа/контракт, НЕ санкционный): косвенная
@@ -913,13 +1061,74 @@ def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
         verdict.risk_flags.append(f"Local note: {data['note']}")
 
 
+async def _guarded(name: str, coro, default):
+    """Вызов провайдера с фиксацией исхода.
+
+    Провайдер, который не смог получить данные, обязан быть ВИДЕН в вердикте:
+    иначе «сбой TronScan» и «у адреса нет меток» дают одинаковый вывод, и
+    отсутствие данных выглядит как отсутствие риска (ROADMAP §1.3)."""
+    try:
+        return name, await coro, "ok"
+    except ProviderError as e:
+        log.warning("Провайдер %s недоступен: %s", name, e)
+        return name, default, "error"
+    except Exception:  # pragma: no cover — неожиданный сбой не должен ронять проверку
+        log.exception("Провайдер %s: неожиданная ошибка", name)
+        return name, default, "error"
+
+
+# Человекочитаемые имена провайдеров для флага о неполной проверке.
+_PROVIDER_RU = {
+    "tronscan": "TronScan (метки и баланс)",
+    "goplus": "GoPlus (риск-флаги)",
+    "flow": "TronScan переводы (связи и экспозиция)",
+    "ofac": "OFAC SDN (санкционный список)",
+    "swapster": "Swapster",
+    "bitok": "Bitok",
+    "hop2": "2-й хоп",
+}
+
+
+def _aml_status(ext: dict[str, Any]) -> str:
+    """Исход внешнего KYT в терминах provider_status.
+
+    «Не настроен» отделяем от «ошибка»: первое — решение оператора, второе —
+    сбой, о котором пользователю надо сказать."""
+    if not isinstance(ext, dict):
+        return "error"
+    if ext.get("skipped"):
+        return "skipped"
+    if ext.get("available"):
+        return "pending" if ext.get("pending") else "ok"
+    reason = str(ext.get("reason") or "")
+    return "not_configured" if "не настроен" in reason else "error"
+
+
+def _apply_provider_gaps(verdict: AddressVerdict) -> None:
+    """Один явный флаг про то, что проверка неполная. Без него пользователь
+    не может отличить «чисто» от «не проверили»."""
+    failed = [n for n, st in verdict.provider_status.items() if st == "error"]
+    if failed:
+        names = ", ".join(_PROVIDER_RU.get(n, n) for n in failed)
+        verdict.risk_flags.insert(
+            0,
+            f"❗ Проверка НЕПОЛНАЯ: недоступны источники — {names}. "
+            f"Отсутствие находок здесь не означает отсутствие риска",
+        )
+    if verdict.provider_status.get("ofac") == "bundled":
+        verdict.risk_flags.append(
+            "ℹ️ Санкционный список взят из вшитого снимка (GitHub недоступен) — "
+            "новые санкционные адреса могут отсутствовать"
+        )
+
+
 async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     """Главная точка входа.
 
     - Валидирует адрес
     - Смотрит кеш
-    - Параллельно опрашивает TronScan + GoPlus + локальную БД
-    - Сводит в единый Verdict
+    - Параллельно опрашивает TronScan + GoPlus + flow + OFAC
+    - Сводит в единый Verdict, фиксируя состояние каждого источника
     - Кеширует результат
     """
     if not is_valid_trc20_address(address):
@@ -935,34 +1144,34 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     if use_cache:
         cached = await cache.get(address)
         if cached:
-            v = AddressVerdict(
-                address=cached["address"],
-                entity=cached.get("entity"),
-                entity_type=EntityType(cached.get("entity_type", "unknown")),
-                risk_level=RiskLevel(cached.get("risk_level", "unknown")),
-                risk_flags=cached.get("risk_flags", []),
-                sources=cached.get("sources", []),
-                raw_labels=cached.get("raw_labels", {}),
-                exchange_links=cached.get("exchange_links", []),
-                risk_score=cached.get("risk_score", 0),
-                aml=cached.get("aml", {}),
-                balance_trx=cached.get("balance_trx", 0.0),
-                balance_usdt=cached.get("balance_usdt", 0.0),
-                external_aml=cached.get("external_aml", {}),
-                cached=True,
-            )
+            v = AddressVerdict.from_dict(cached)
+            v.cached = True
             return v
 
-    # Параллельный запрос провайдеров
+    # Параллельный запрос провайдеров. Сбой одного не отменяет остальные, но
+    # фиксируется в provider_status и выводится пользователю.
     async with httpx.AsyncClient() as client:
-        ts_data, gp_data, flow_data, sanctioned = await asyncio.gather(
-            tronscan.fetch_account(address, client),
-            goplus.fetch_address_security(address, client),
-            flow.fetch_transfers(address, client),
-            ofac.fetch_sanctioned_set(client),
+        results = await asyncio.gather(
+            _guarded("tronscan", tronscan.fetch_account(address, client), {}),
+            _guarded("goplus", goplus.fetch_address_security(address, client), {}),
+            _guarded("flow", flow.fetch_transfers(address, client), []),
+            _guarded("ofac", ofac.fetch_sanctioned_set(client), set()),
         )
+        data = {name: value for name, value, _ in results}
+        status = {name: st for name, _, st in results}
+        ts_data = data["tronscan"]
+        gp_data = data["goplus"]
+        flow_data = data["flow"]
+        sanctioned = data["ofac"]
+        if status["ofac"] == "ok":
+            # live | cache | bundled — откуда фактически взят список.
+            # "none" приходит только когда модуль не ходил в сеть (подменён в тестах).
+            src = ofac.last_source()
+            status["ofac"] = src if src != "none" else ("ok" if sanctioned else "empty")
 
         verdict = AddressVerdict(address=address)
+        verdict.provider_status = status
+        token_summary = _apply_token_hygiene(flow_data, verdict)
         _apply_tronscan(ts_data, verdict)
         _apply_goplus(gp_data, verdict)
         _apply_flow(flow_data, verdict)
@@ -976,9 +1185,14 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
             and verdict.entity_type not in (EntityType.EXCHANGE, EntityType.CONTRACT)
         ):
             total_h, per_cp_h = _parse_transfers(address, flow_data, sanctioned)
-            hop2 = await _fetch_hop2(per_cp_h, total_h, sanctioned, client)
+            try:
+                hop2 = await _fetch_hop2(per_cp_h, total_h, sanctioned, client)
+                verdict.provider_status["hop2"] = "ok"
+            except ProviderError as e:
+                log.warning("2-й хоп недоступен: %s", e)
+                verdict.provider_status["hop2"] = "error"
 
-    _compute_aml(verdict, flow_data, sanctioned, hop2)
+    _compute_aml(verdict, flow_data, sanctioned, hop2, token_summary)
     if hop2 and hop2.get("flagged"):
         verdict.sources.append("TronScan flow (2-hop)")
 
@@ -1003,10 +1217,14 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         reason = "биржа/сервис — внешний AML не требуется"
         verdict.external_aml = {"skipped": True, "reason": reason}
         verdict.bitok_aml = {"skipped": True, "reason": reason}
+        verdict.provider_status["swapster"] = "skipped"
+        verdict.provider_status["bitok"] = "skipped"
     else:
         verdict.external_aml, verdict.bitok_aml = await asyncio.gather(
             aml_external.check(address), aml_bitok.check(address)
         )
+        for key, ext in (("swapster", verdict.external_aml), ("bitok", verdict.bitok_aml)):
+            verdict.provider_status[key] = _aml_status(ext)
         # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто,
         # но только если адрес ещё и ведёт себя как транзит (не личный юзер).
         transit = _is_transit(flow_data, address, verdict.balance_usdt)
@@ -1015,6 +1233,9 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         _label_from_bitok(verdict)
         # Оба сервиса могут ПОВЫСИТЬ итоговый риск (понизить — никогда).
         _apply_external_aml_risk(verdict)
+
+    # Один явный флаг, если какой-то источник не ответил.
+    _apply_provider_gaps(verdict)
 
     # Кеш
     if use_cache:

@@ -61,8 +61,9 @@ async def _run_bot():
         log.warning("BOT_TOKEN not set — Telegram bot disabled, API-only mode")
         return
     try:
-        from bot.main import dp, log_access_mode
         from aiogram import Bot
+
+        from bot.main import dp, log_access_mode
 
         log_access_mode(log)
         bot = Bot(BOT_TOKEN)

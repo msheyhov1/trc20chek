@@ -1,14 +1,12 @@
 """Тесты ядра без внешних запросов — провайдеры подменяются моками."""
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from core.aggregator import check_address
-from core.models import EntityType, RiskLevel, is_valid_trc20_address
-
+from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 
 # ---------- Валидация ----------
 
@@ -658,3 +656,281 @@ async def test_aml_tunnel_skips_exchange_for_both_providers():
     assert v.bitok_aml.get("skipped") is True
     swapster.assert_not_awaited()
     bitok.assert_not_awaited()
+
+
+# ---------- Гигиена токенов: фильтр объёмной математики по контракту ----------
+
+FAKE_USDT_CONTRACT = "TFakeUSDTcontract00000000000000000"
+
+
+def _spam(frm, to, quant, symbol="USDT"):
+    """Перевод токена-подделки: символ как у USDT, контракт чужой."""
+    return {
+        "from_address": frm, "to_address": to,
+        "from_address_tag": {"from_address_tag": ""},
+        "to_address_tag": {"to_address_tag": ""},
+        "quant": str(quant),
+        "tokenInfo": {
+            "tokenDecimal": 6, "tokenId": FAKE_USDT_CONTRACT,
+            "tokenAbbr": symbol, "tokenName": "Tether USD",
+        },
+    }
+
+
+def _usdt(frm, to, quant, *, from_tag="", to_tag=""):
+    """Перевод НАСТОЯЩЕГО USDT (с tokenId реального контракта)."""
+    t = _tr(frm, to, quant, from_tag=from_tag, to_tag=to_tag)
+    t["tokenInfo"]["tokenId"] = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    t["tokenInfo"]["tokenAbbr"] = "USDT"
+    return t
+
+
+@pytest.mark.asyncio
+async def test_spam_token_cannot_dilute_sanction_exposure():
+    """Вектор уклонения: выпустить свой токен с символом USDT и прислать себе
+    один перевод на огромную сумму, чтобы санкционная доля упала до нуля.
+    Объём считается только по токенам из VOLUME_TOKENS, поэтому не работает."""
+    transfers = [
+        _usdt(VALID_ADDR, SANCTIONED_ADDR, 900_000_000),   # 900 настоящих USDT
+        _usdt("Tgood", VALID_ADDR, 100_000_000),           # 100 настоящих USDT
+        _spam("Tspam", VALID_ADDR, 10_000_000_000_000),    # 10 млн поддельных
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set",
+               new=AsyncMock(return_value={SANCTIONED_ADDR})):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["sanctions_exposure_pct"] == 90.0   # не размылось
+    assert v.risk_score == 90
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.aml["impersonating_tokens"] == [FAKE_USDT_CONTRACT]
+    assert any("поддельного" in f for f in v.risk_flags)
+
+
+@pytest.mark.asyncio
+async def test_spam_token_does_not_break_deposit_detection():
+    """Тот же спам не должен сбивать funnel-атрибуцию депозитника биржи:
+    концентрация оттока считается по тому же объёму."""
+    addr = VALID_ADDR
+    transfers = [
+        _usdt(addr, "TBybitHot", 4_159_330_000, to_tag="Bybit"),
+        _usdt("Tsrc1", addr, 4_129_330_000),
+        _usdt("Tsrc2", addr, 10_000_000),
+        _usdt("Tsrc2", addr, 20_000_000),
+        _spam("Tspam", addr, 10_000_000_000_000),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE
+    assert v.entity == "Депозитный кошелёк Bybit"
+
+
+def test_amount_counts_only_allowlisted_contracts():
+    from core.aggregator import _amount
+    real = _usdt("Ta", "Tb", 1_000_000)
+    assert _amount(real) == 1.0
+    assert _amount(_spam("Ta", "Tb", 1_000_000)) == 0.0
+    # Перевод без tokenId — считаем как раньше, иначе обнулили бы старые данные
+    legacy = _tr("Ta", "Tb", 1_000_000)
+    assert _amount(legacy) == 1.0
+
+
+def test_volume_tokens_extendable_via_env(monkeypatch):
+    """Свой токен можно добавить в учёт через env, мусор отбрасывается."""
+    from core import aggregator as agg
+    monkeypatch.setenv("AML_VOLUME_TOKENS", f"{VALID_ADDR}:MYUSD, @garbage")
+    tokens = agg._volume_tokens()
+    assert tokens[VALID_ADDR] == "MYUSD"
+    assert "@garbage" not in tokens
+
+
+# ---------- Санкционные биржи: словари и свежесть списка ----------
+
+def test_no_overlap_between_exchange_dicts():
+    """Название в обоих словарях = санкционная биржа получит вердикт «безопасно»:
+    _normalize_exchange отдаёт предпочтение обычному словарю (он первый)."""
+    from core.aggregator import EXCHANGE_KEYWORDS, SANCTIONED_EXCHANGES
+    assert not set(EXCHANGE_KEYWORDS) & set(SANCTIONED_EXCHANGES)
+    assert not set(EXCHANGE_KEYWORDS.values()) & set(SANCTIONED_EXCHANGES.values())
+
+
+@pytest.mark.parametrize(
+    "tag,expected",
+    [
+        ("Nobitex 1", "Nobitex"),          # OFAC 02.06.2026
+        ("Wallex Hot", "Wallex"),
+        ("Bitpin", "Bitpin"),
+        ("Ramzinex", "Ramzinex"),
+        ("WhiteBird", "WhiteBird"),        # EU 21-й пакет 23.07.2026
+        ("Exnode Pay", "Exnode"),
+        ("Brightum", "Tradex (Brightum)"),
+        ("Shelbit", "Shelbit"),            # OFAC 07.08.2026
+        ("AbanTether", "Aban Tether"),
+        ("Bitcoin Xchange 2", "Bitcoin Xchange"),
+        ("TengriCoin", "TengriCoin"),
+    ],
+)
+def test_newly_sanctioned_exchanges_recognized(tag, expected):
+    from core.aggregator import SANCTIONED_EXCHANGE_NAMES, _normalize_exchange
+    name = _normalize_exchange(tag)
+    assert name == expected
+    assert name in SANCTIONED_EXCHANGE_NAMES
+
+
+@pytest.mark.asyncio
+async def test_sanctioned_iranian_exchange_hot_wallet():
+    """Хот-кошелёк Nobitex: раньше «биржа / безопасно / KYT пропущен»."""
+    ts_resp = {"address": VALID_ADDR, "publicTag": "Nobitex 1"}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 100
+    assert "Nobitex" in (v.entity or "")
+    # Туннель не должен отключать второе мнение для санкционного адреса
+    assert not v.external_aml.get("skipped")
+
+
+# ---------- provider_status: сбой источника виден в вердикте ----------
+
+@pytest.mark.asyncio
+async def test_provider_failure_is_visible_in_verdict():
+    """«GoPlus недоступен» не должно выглядеть как «GoPlus сказал чисто»."""
+    from core.providers.base import ProviderError
+
+    async def broken(*a, **kw):
+        raise ProviderError("rate limit")
+
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=broken), \
+         patch("core.aggregator.flow.fetch_transfers", new=broken):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.provider_status["goplus"] == "error"
+    assert v.provider_status["flow"] == "error"
+    assert v.provider_status["tronscan"] == "ok"
+    assert any("НЕПОЛНАЯ" in f for f in v.risk_flags)
+    assert v.risk_flags[0].startswith("❗")   # первым, а не в хвосте
+
+
+@pytest.mark.asyncio
+async def test_no_gap_flag_when_all_providers_ok():
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert not any("НЕПОЛНАЯ" in f for f in v.risk_flags)
+    assert v.provider_status["goplus"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_aml_status_distinguishes_not_configured_from_error():
+    from core.aggregator import _aml_status
+    assert _aml_status({"available": True, "pending": False}) == "ok"
+    assert _aml_status({"available": True, "pending": True}) == "pending"
+    assert _aml_status({"skipped": True}) == "skipped"
+    assert _aml_status({"available": False, "reason": "Bitok не настроен"}) == "not_configured"
+    assert _aml_status({"available": False, "reason": "Bitok: HTTP 500"}) == "error"
+
+
+# ---------- Кеш: round-trip вердикта ----------
+
+@pytest.mark.asyncio
+async def test_cache_roundtrip_keeps_every_field(tmp_path, monkeypatch):
+    """to_dict() → from_dict() не должен терять поля. Раньше терялся bitok_aml:
+    кешированный вердикт отдавал риск 96/dangerous без блока, его объяснявшего."""
+    from core import cache
+    monkeypatch.setattr(cache, "CACHE_PATH", tmp_path / "cache.db")
+    await cache.init_db()
+
+    bitok = {
+        "available": True, "provider": "Bitok", "pending": False, "risk_score": 96.0,
+        "risk_level": "dangerous", "level_raw": "severe", "entity": "Darknet market",
+        "entity_category": "darknet_market", "entity_category_ru": "даркнет-маркет",
+        "entities": [],
+    }
+    patches = {
+        "core.aggregator.tronscan.fetch_account": AsyncMock(return_value={}),
+        "core.aggregator.goplus.fetch_address_security": AsyncMock(return_value=EMPTY_GP),
+        "core.aggregator.aml_bitok.check": AsyncMock(return_value=bitok),
+    }
+    ctx = [patch(k, new=v) for k, v in patches.items()]
+    for c in ctx:
+        c.start()
+    try:
+        fresh = await check_address(VALID_ADDR, use_cache=True)
+        restored = await check_address(VALID_ADDR, use_cache=True)
+    finally:
+        for c in ctx:
+            c.stop()
+
+    assert restored.cached is True
+    assert restored.bitok_aml == fresh.bitok_aml          # раньше было {}
+    assert restored.provider_status == fresh.provider_status
+    payload = fresh.to_dict()
+    payload.pop("cached")
+    again = AddressVerdict.from_dict(payload).to_dict()
+    again.pop("cached")
+    assert again == payload
+
+
+def test_from_dict_tolerates_unknown_enum_values():
+    """Старый кеш с неизвестным типом не должен ронять восстановление."""
+    v = AddressVerdict.from_dict(
+        {"address": VALID_ADDR, "entity_type": "frozen", "risk_level": "extreme"}
+    )
+    assert v.entity_type == EntityType.UNKNOWN
+    assert v.risk_level == RiskLevel.UNKNOWN
+
+
+def test_to_dict_deduplicates_sources():
+    v = AddressVerdict(address=VALID_ADDR, sources=["TronScan", "GoPlus", "TronScan"])
+    assert v.to_dict()["sources"] == ["TronScan", "GoPlus"]
+
+
+# ---------- Балансы: реальные имена полей TronScan ----------
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # /api/accountv2 — задокументированное поле
+        {"balance": 5_000_000, "withPriceTokens": [
+            {"tokenId": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", "balance": "1234500000",
+             "amount": "1234.5", "tokenDecimal": 6}]},
+        # /api/account — легаси, только сырой balance
+        {"balance": 5_000_000, "trc20token_balances": [
+            {"tokenId": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", "balance": "1234500000",
+             "tokenDecimal": 6}]},
+        # исторический вариант, который читал старый код
+        {"balance": 5_000_000, "tokens": [
+            {"tokenId": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", "amount": "1234.5"}]},
+        # snake_case
+        {"balance": 5_000_000, "balances": [
+            {"token_id": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", "balance": "1234500000",
+             "token_decimal": 6}]},
+    ],
+)
+def test_extract_balances_known_response_shapes(payload):
+    from core.balance import extract_balances
+    trx, usdt = extract_balances(payload)
+    assert trx == 5.0
+    assert abs(usdt - 1234.5) < 0.01
+
+
+def test_extract_balances_ignores_fake_usdt_contract():
+    """Поддельный USDT не должен показываться как баланс USDT."""
+    from core.balance import extract_balances
+    trx, usdt = extract_balances(
+        {"balance": 1_000_000,
+         "withPriceTokens": [{"tokenId": FAKE_USDT_CONTRACT, "amount": "999999"}]}
+    )
+    assert usdt == 0.0
+
+
+def test_extract_balances_empty_and_garbage():
+    from core.balance import extract_balances
+    assert extract_balances({}) == (0.0, 0.0)
+    assert extract_balances({"balance": "nope", "tokens": "nope"}) == (0.0, 0.0)

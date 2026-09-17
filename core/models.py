@@ -24,6 +24,14 @@ class EntityType(str, Enum):
     UNKNOWN = "unknown"
 
 
+def _enum_or(enum_cls, value: Any, default):
+    """Безопасное восстановление enum из строки: незнакомое значение → default."""
+    try:
+        return enum_cls(value)
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass
 class AddressVerdict:
     address: str
@@ -45,6 +53,10 @@ class AddressVerdict:
     # external_aml — Swapster, bitok_aml — Bitok KYT. Формат у обоих одинаковый.
     external_aml: dict[str, Any] = field(default_factory=dict)
     bitok_aml: dict[str, Any] = field(default_factory=dict)
+    # Состояние каждого провайдера в ЭТОЙ проверке: ok | error | skipped |
+    # not_configured | pending | fallback. «Провайдер недоступен» обязан быть виден
+    # в вердикте — иначе отсутствие данных выглядит как отсутствие риска.
+    provider_status: dict[str, str] = field(default_factory=dict)
     cached: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,12 +71,36 @@ class AddressVerdict:
             "balance_usdt": self.balance_usdt,
             "external_aml": self.external_aml,
             "bitok_aml": self.bitok_aml,
+            "provider_status": self.provider_status,
             "risk_flags": self.risk_flags,
-            "sources": self.sources,
+            "sources": list(dict.fromkeys(self.sources)),
             "raw_labels": self.raw_labels,
             "exchange_links": self.exchange_links,
             "cached": self.cached,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> AddressVerdict:
+        """Обратная операция к to_dict(). Единственное место восстановления вердикта
+        (кеш, история): новое поле добавляется сюда один раз, а не в каждом вызове."""
+        return cls(
+            address=d.get("address", ""),
+            entity=d.get("entity"),
+            entity_type=_enum_or(EntityType, d.get("entity_type"), EntityType.UNKNOWN),
+            risk_level=_enum_or(RiskLevel, d.get("risk_level"), RiskLevel.UNKNOWN),
+            risk_flags=list(d.get("risk_flags") or []),
+            sources=list(d.get("sources") or []),
+            raw_labels=dict(d.get("raw_labels") or {}),
+            exchange_links=list(d.get("exchange_links") or []),
+            risk_score=int(d.get("risk_score") or 0),
+            aml=dict(d.get("aml") or {}),
+            balance_trx=float(d.get("balance_trx") or 0.0),
+            balance_usdt=float(d.get("balance_usdt") or 0.0),
+            external_aml=dict(d.get("external_aml") or {}),
+            bitok_aml=dict(d.get("bitok_aml") or {}),
+            provider_status=dict(d.get("provider_status") or {}),
+            cached=bool(d.get("cached", False)),
+        )
 
 
 # ---------- Валидация TRC20 ----------

@@ -3,7 +3,6 @@ import pytest
 
 from core import aml_bitok as bk
 
-
 # ---------- подпись ----------
 
 def test_sign_with_body_known_vector():
