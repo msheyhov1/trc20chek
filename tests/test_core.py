@@ -47,12 +47,17 @@ EMPTY_GP = {"code": 1, "result": {
 NO_AML = {"available": False, "reason": "не настроен"}
 
 
+NOT_BLACKLISTED = {"blacklisted": False, "source": "contract"}
+
+
 @pytest.fixture(autouse=True)
 def _no_network_by_default():
-    """flow, OFAC и внешние AML по умолчанию пустые — тесты не ходят в сеть.
-    Конкретный тест переопределяет нужный патч своим внутри `with`."""
+    """flow, OFAC, блэклист Tether и внешние AML по умолчанию пустые — тесты не
+    ходят в сеть. Конкретный тест переопределяет нужный патч своим внутри `with`."""
     with patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])), \
          patch("core.aggregator.ofac.fetch_sanctioned_set", new=AsyncMock(return_value=set())), \
+         patch("core.aggregator.tether.check",
+               new=AsyncMock(return_value=dict(NOT_BLACKLISTED))), \
          patch("core.aggregator.aml_external.check", new=AsyncMock(return_value=dict(NO_AML))), \
          patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=dict(NO_AML))):
         yield
@@ -1082,3 +1087,139 @@ def test_extract_balances_empty_and_garbage():
     from core.balance import extract_balances
     assert extract_balances({}) == (0.0, 0.0)
     assert extract_balances({"balance": "nope", "tokens": "nope"}) == (0.0, 0.0)
+
+
+# ---------- Блокировка USDT эмитентом (самый жёсткий сигнал для TRC20) ----------
+
+BLACKLISTED = {"blacklisted": True, "source": "contract"}
+
+
+@pytest.mark.asyncio
+async def test_tether_blacklist_overrides_clean_history():
+    """Адрес без единой находки, но заблокирован эмитентом: средства неподвижны,
+    поэтому вердикт максимальный, а тип — FROZEN, а не «нет меток»."""
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.tether.check", new=AsyncMock(return_value=dict(BLACKLISTED))):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.FROZEN
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 100
+    assert "блэклист" in (v.entity or "").lower()
+    assert v.risk_flags[0].startswith("🚫")
+    assert any("заморожены" in f for f in v.risk_flags)
+    assert "Tether blacklist" in v.sources
+
+
+@pytest.mark.asyncio
+async def test_tether_blacklist_skips_paid_kyt():
+    """Второе мнение по заблокированным средствам ничего не добавит — не платим."""
+    swapster = AsyncMock(return_value=dict(NO_AML))
+    bitok = AsyncMock(return_value=dict(NO_AML))
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.tether.check", new=AsyncMock(return_value=dict(BLACKLISTED))), \
+         patch("core.aggregator.aml_external.check", new=swapster), \
+         patch("core.aggregator.aml_bitok.check", new=bitok):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    swapster.assert_not_awaited()
+    bitok.assert_not_awaited()
+    assert "заблокированы" in v.external_aml.get("reason", "")
+
+
+@pytest.mark.asyncio
+async def test_clean_tether_check_does_not_change_verdict():
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.UNKNOWN
+    assert v.raw_labels["tether"]["blacklisted"] is False
+    assert v.provider_status["tether"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_tether_check_failure_is_reported_not_silent():
+    """Недоступность проверки блэклиста не должна выглядеть как «не заблокирован»."""
+    from core.providers.base import ProviderError
+
+    async def broken(*a, **kw):
+        raise ProviderError("TronGrid недоступен")
+
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.tether.check", new=broken):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.provider_status["tether"] == "error"
+    assert any("НЕПОЛНАЯ" in f for f in v.risk_flags)
+    assert "tether" not in v.raw_labels
+
+
+# ---------- Признаки, которые TronScan уже присылает в ответе переводов ----------
+
+def _with_token(frm, to, quant, *, level="2", can_show=1, risky=False, token=None):
+    t = _tr(frm, to, quant)
+    t["tokenInfo"].update({
+        "tokenId": token or "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+        "tokenAbbr": "USDT",
+        "tokenLevel": level,
+        "tokenCanShow": can_show,
+    })
+    if risky:
+        t["riskTransaction"] = True
+    return t
+
+
+@pytest.mark.asyncio
+async def test_suspicious_token_level_is_flagged():
+    """tokenLevel «3»/«4» = подозрительный/небезопасный по оценке TronScan.
+    Поле приходило в том же ответе и раньше просто выбрасывалось."""
+    transfers = [_with_token("Tx", VALID_ADDR, 1_000_000, level="4", token="TFakeTok" + "0" * 26)]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert any("небезопасные" in f for f in v.risk_flags)
+    assert v.aml["risky_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_hidden_token_and_risky_transaction_flags():
+    transfers = [
+        _with_token("Tx", VALID_ADDR, 1_000_000, can_show=0, token="TSpam" + "0" * 29),
+        _with_token("Ty", VALID_ADDR, 2_000_000, risky=True),
+    ]
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert any("скрыты TronScan" in f for f in v.risk_flags)
+    assert any("рискованные" in f for f in v.risk_flags)
+    assert v.aml["risky_transactions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_risky_counterparty_from_response_meta():
+    """normalAddressInfo приходит на уровне ответа — раньше терялся целиком."""
+    from core.providers.flow import TransferPage
+
+    page = TransferPage(
+        [_with_token("Tbad", VALID_ADDR, 1_000_000)],
+        {"normalAddressInfo": {"Tbad": {"risk": True}}, "contractInfo": {}},
+    )
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=page)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert any("Рискованные контрагенты" in f for f in v.risk_flags)
+    assert v.aml["risky_counterparties"] == ["Tbad"]
+
+
+@pytest.mark.asyncio
+async def test_plain_list_from_provider_still_works():
+    """Мок или старый вызов отдаёт обычный список без .meta — не должно падать."""
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers",
+               new=AsyncMock(return_value=[_with_token("Tx", VALID_ADDR, 1_000_000)])):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.aml["risky_counterparties"] == []

@@ -12,8 +12,10 @@ import httpx
 
 from . import aml_bitok, aml_external, balance, cache, cluster
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
-from .providers import flow, goplus, local, ofac, tronscan
+from .providers import flow, goplus, local, ofac, tether, tronscan
 from .providers.base import ProviderError
+
+PROVIDER_TETHER = tether.PROVIDER
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ RULESET_VERSION = "2026.09.1"
 # биржи/контракт — это инфраструктура, её AML-скор ничего не говорит о владельце,
 # а запросов к платным KYT в потоке проверок бирж больше всего.
 # Скам/санкции туннель НЕ отсекает: там как раз ценно второе мнение сервисов.
-_AML_SKIP_TYPES = frozenset({EntityType.EXCHANGE, EntityType.CONTRACT})
+_AML_SKIP_TYPES = frozenset({EntityType.EXCHANGE, EntityType.CONTRACT, EntityType.FROZEN})
 
 # Доля доминирующей биржевой сущности в AML, при которой НЕразмеченный адрес
 # считаем биржей/сервисом. Swapster видит off-chain принадлежность, которой нет
@@ -785,6 +787,106 @@ def _amount(t: dict[str, Any]) -> float:
     return _raw_amount(t)
 
 
+# Уровень безопасности токена по TronScan (строкой!): "3" подозрительный,
+# "4" небезопасный. "2" = «проходит базовые проверки» и подлинность НЕ доказывает:
+# новая подделка может быть ещё не отрепорчена, поэтому решающим остаётся tokenId.
+_BAD_TOKEN_LEVELS = {"3", "4"}
+
+
+def _apply_transfer_signals(
+    transfers: list[dict[str, Any]], meta: dict[str, Any], verdict: AddressVerdict
+) -> dict[str, Any]:
+    """Читает риск-признаки, которые TronScan уже присылает в ответе переводов.
+
+    Эти поля приходят в том же запросе, который агрегатор и так делает, но раньше
+    отбрасывались: дополнительных обращений к API не нужно.
+      • tokenInfo.tokenLevel / tokenCanShow — оценка самого токена;
+      • riskTransaction — TronScan пометил перевод рискованным;
+      • normalAddressInfo[адрес].risk — рискованный контрагент;
+      • contractInfo — какие контрагенты являются контрактами.
+    """
+    addr = verdict.address
+    risky_tokens: dict[str, str] = {}   # контракт → символ
+    hidden_tokens: set[str] = set()
+    risky_tx = 0
+    risky_cps: set[str] = set()
+    contract_cps: set[str] = set()
+
+    info = meta.get("normalAddressInfo") or {}
+    contracts = meta.get("contractInfo") or {}
+
+    for t in transfers:
+        ti = t.get("tokenInfo") or {}
+        tid = str(ti.get("tokenId") or "")
+        level = str(ti.get("tokenLevel") or "")
+        if tid and level in _BAD_TOKEN_LEVELS:
+            risky_tokens[tid] = str(ti.get("tokenAbbr") or tid)
+        if tid and str(ti.get("tokenCanShow", "")) == "0":
+            hidden_tokens.add(tid)
+        if t.get("riskTransaction"):
+            risky_tx += 1
+        for side in ("from_address", "to_address"):
+            cp = t.get(side)
+            if not cp or cp == addr:
+                continue
+            if isinstance(info.get(cp), dict) and info[cp].get("risk"):
+                risky_cps.add(cp)
+            if cp in contracts:
+                contract_cps.add(cp)
+
+    if risky_tokens:
+        names = ", ".join(sorted(set(risky_tokens.values()))[:5])
+        verdict.risk_flags.append(
+            f"⚠️ Переводы токенов, помеченных TronScan как подозрительные или "
+            f"небезопасные: {names} ({len(risky_tokens)} шт.)"
+        )
+    if hidden_tokens:
+        verdict.risk_flags.append(
+            f"⚠️ {len(hidden_tokens)} токен(ов) скрыты TronScan как непригодные "
+            f"к показу — обычно спам или крайний риск"
+        )
+    if risky_tx:
+        verdict.risk_flags.append(
+            f"⚠️ TronScan помечает {risky_tx} перевод(ов) этого адреса как рискованные"
+        )
+    if risky_cps:
+        verdict.risk_flags.append(
+            f"⚠️ Рискованные контрагенты по оценке TronScan: {len(risky_cps)} адрес(ов)"
+        )
+
+    return {
+        "risky_tokens": sorted(risky_tokens),
+        "hidden_tokens": sorted(hidden_tokens),
+        "risky_transactions": risky_tx,
+        "risky_counterparties": sorted(risky_cps),
+        "contract_counterparties": sorted(contract_cps),
+    }
+
+
+def _apply_tether(result: dict[str, Any] | None, verdict: AddressVerdict) -> None:
+    """Блокировка адреса эмитентом USDT.
+
+    Самый жёсткий из возможных сигналов для USDT-TRC20: заблокированные
+    средства физически неподвижны, поэтому тип FROZEN и максимальный скор
+    независимо от того, насколько чиста остальная история адреса."""
+    if not result:
+        return
+    verdict.raw_labels["tether"] = result
+    if not result.get("blacklisted"):
+        return
+    verdict.entity_type = EntityType.FROZEN
+    if not verdict.entity or verdict.entity == "No public labels":
+        verdict.entity = "Адрес в блэклисте Tether"
+    verdict.risk_flags.insert(
+        0,
+        "🚫 Адрес заблокирован эмитентом USDT (блэклист Tether): средства на нём "
+        "заморожены и не могут быть переведены. Отправлять сюда USDT нельзя — "
+        f"деньги будут потеряны (источник: {result.get('source')})",
+    )
+    if PROVIDER_TETHER not in verdict.sources:
+        verdict.sources.append(PROVIDER_TETHER)
+
+
 def _apply_token_hygiene(
     transfers: list[dict[str, Any]], verdict: AddressVerdict
 ) -> dict[str, Any]:
@@ -1285,25 +1387,36 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
             _guarded("goplus", goplus.fetch_address_security(address, client), {}),
             _guarded("flow", flow.fetch_transfers(address, client), []),
             _guarded("ofac", ofac.fetch_sanctioned_set(client), set()),
+            _guarded("tether", tether.check(address, client), None),
         )
         data = {name: value for name, value, _ in results}
         status = {name: st for name, _, st in results}
         ts_data = data["tronscan"]
         gp_data = data["goplus"]
         flow_data = data["flow"]
+        # Метаданные уровня ответа приходят вместе с переводами (flow.TransferPage);
+        # обычный список (мок, старый вызов) просто не имеет их.
+        flow_meta = getattr(flow_data, "meta", {})
         sanctioned = data["ofac"]
+        tether_result = data["tether"]
         if status["ofac"] == "ok":
             # live | cache | bundled — откуда фактически взят список.
             # "none" приходит только когда модуль не ходил в сеть (подменён в тестах).
             src = ofac.last_source()
             status["ofac"] = src if src != "none" else ("ok" if sanctioned else "empty")
+        if not tether.is_enabled():
+            status["tether"] = "skipped"
 
         verdict = AddressVerdict(address=address)
         verdict.provider_status = status
         token_summary = _apply_token_hygiene(flow_data, verdict)
+        token_summary.update(_apply_transfer_signals(flow_data, flow_meta, verdict))
         _apply_tronscan(ts_data, verdict)
         _apply_goplus(gp_data, verdict)
         _apply_flow(flow_data, verdict)
+        # Блокировка эмитентом бьёт всё остальное, поэтому применяется до
+        # решения о туннеле: для FROZEN платные KYT уже ничего не добавят.
+        _apply_tether(tether_result, verdict)
 
         # 2-й хоп: только для кошельков/неизвестных (биржи/контракты/прямые
         # санкции раскрывать бессмысленно — их контрагенты это «все подряд»).
@@ -1337,7 +1450,11 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     # владельце инфраструктуры). Решение принимается по ON-CHAIN типу, до расчёта
     # риска. Скам/санкции туннель НЕ отсекает: там второе мнение ценно.
     if verdict.entity_type in _AML_SKIP_TYPES:
-        reason = "биржа/сервис — внешний AML не требуется"
+        reason = (
+            "средства заблокированы эмитентом — второе мнение ничего не добавит"
+            if verdict.entity_type is EntityType.FROZEN
+            else "биржа/сервис — внешний AML не требуется"
+        )
         verdict.external_aml = {"skipped": True, "reason": reason}
         verdict.bitok_aml = {"skipped": True, "reason": reason}
         verdict.provider_status["swapster"] = "skipped"

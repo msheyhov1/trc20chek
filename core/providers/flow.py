@@ -29,11 +29,20 @@ TRANSFERS_LIMIT = 50  # максимум TronScan на один запрос
 FLOW_PAGES = max(1, int(os.getenv("FLOW_PAGES", "1")))
 
 
+# Поля уровня ответа (не внутри переводов), которые несут готовые риск-признаки:
+#   normalAddressInfo[адрес].risk — TronScan считает контрагента рискованным
+#   contractInfo[адрес]           — имя/тег/vip для контрагентов-контрактов
+# Раньше они отбрасывались вместе с остальным телом ответа.
+_META_KEYS = ("normalAddressInfo", "contractInfo")
+
+
 async def _fetch_page(
     address: str, start: int, client: httpx.AsyncClient
-) -> list[dict[str, Any]]:
-    """Одна страница переводов. Валидный ключ повышает лимиты, но НЕВАЛИДНЫЙ ломает
-    запрос (`ApiKey not exists`) — поэтому при неудаче с ключом ретрай без ключа."""
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Одна страница переводов + метаданные уровня ответа.
+
+    Валидный ключ повышает лимиты, но НЕВАЛИДНЫЙ ломает запрос
+    (`ApiKey not exists`) — поэтому при неудаче с ключом ретрай без ключа."""
     attempts = [True, False] if TRONSCAN_API_KEY else [False]
     errors: list[str] = []
     for with_key in attempts:
@@ -49,7 +58,8 @@ async def _fetch_page(
             data = r.json() or {}
             transfers = data.get("token_transfers") if isinstance(data, dict) else None
             if transfers is not None:
-                return transfers
+                meta = {k: data.get(k) or {} for k in _META_KEYS}
+                return transfers, meta
             errors.append(f"key={with_key}: no token_transfers in body")
             # тело-ошибка (напр. невалидный ключ) — пробуем следующий вариант
         except (httpx.HTTPError, ValueError) as e:
@@ -58,18 +68,37 @@ async def _fetch_page(
     raise ProviderError("TronScan transfers: " + "; ".join(errors))
 
 
-async def fetch_transfers(address: str, client: httpx.AsyncClient) -> list[dict[str, Any]]:
-    """Последние TRC20-переводы адреса (до FLOW_PAGES × 50). ProviderError, если
-    не удалось получить даже первую страницу; неполный добор — не ошибка."""
-    out = await _fetch_page(address, 0, client)
+class TransferPage(list):
+    """Список переводов, который дополнительно несёт метаданные ответа в `.meta`.
+
+    Наследование от list — осознанное: провайдер остаётся совместимым со всеми
+    существующими вызовами и тестами (`len`, итерация, срезы), а метаданные
+    читаются через `getattr(x, "meta", {})`, поэтому обычный список тоже подходит.
+    Альтернатива — возвращать кортеж — потребовала бы менять каждый вызов и
+    каждый мок, то есть ломать точку подмены ради второстепенных данных."""
+
+    def __init__(self, items=(), meta: dict[str, Any] | None = None) -> None:
+        super().__init__(items)
+        self.meta: dict[str, Any] = meta or {}
+
+
+async def fetch_transfers(address: str, client: httpx.AsyncClient) -> TransferPage:
+    """Последние TRC20-переводы адреса (до FLOW_PAGES × 50) плюс метаданные.
+
+    ProviderError, если не удалось получить даже первую страницу; неполный
+    добор — не ошибка, работаем с тем, что получили."""
+    items, meta = await _fetch_page(address, 0, client)
+    out = TransferPage(items, meta)
     for page in range(1, FLOW_PAGES):
         if len(out) < page * TRANSFERS_LIMIT:
             break  # история закончилась
         try:
-            more = await _fetch_page(address, page * TRANSFERS_LIMIT, client)
+            more, more_meta = await _fetch_page(address, page * TRANSFERS_LIMIT, client)
         except ProviderError:
             break  # первая страница есть — работаем с тем, что добрали
         if not more:
             break
         out.extend(more)
+        for key in _META_KEYS:
+            out.meta.setdefault(key, {}).update(more_meta.get(key) or {})
     return out
