@@ -9,7 +9,15 @@ publicTag/redTag/..., accountType/contractMap для контрактов, total
 и любой адрес определялся как «unknown». accountv2 оставлен как fallback — если
 задан рабочий TRONSCAN_API_KEY, он может дать чуть более полные данные.
 
+По актуальной документации TronScan задокументирован только /api/accountv2, а
+/api/account — легаси. Различия в наборе меток между ними не подтверждены; в полях
+балансов различаются: accountv2 → withPriceTokens[], account → trc20token_balances[]
+(см. core/balance.py).
+
 Ключ TRONSCAN_API_KEY опционален: и без него всё работает, с ним — выше лимиты.
+
+Ошибки: если оба эндпоинта недоступны — ProviderError (агрегатор отметит
+provider_status["tronscan"] = "error"), а не пустой словарь.
 """
 from __future__ import annotations
 
@@ -17,6 +25,8 @@ import os
 from typing import Any
 
 import httpx
+
+from .base import ProviderError
 
 TRONSCAN_BASE = "https://apilist.tronscanapi.com"
 TRONSCAN_API_KEY = os.getenv("TRONSCAN_API_KEY", "")
@@ -31,22 +41,27 @@ async def _get(path: str, address: str, client: httpx.AsyncClient) -> dict[str, 
         timeout=10.0,
     )
     r.raise_for_status()
-    return r.json() or {}
+    data = r.json()
+    if not isinstance(data, dict):
+        raise ValueError("unexpected response shape")
+    return data
 
 
 async def fetch_account(address: str, client: httpx.AsyncClient) -> dict[str, Any]:
-    """Данные по адресу из TronScan. Возвращает {} только если оба эндпоинта недоступны.
+    """Данные по адресу из TronScan.
 
-    Основной путь — бесплатный /api/account. Если он почему-то упал, а ключ задан,
-    пробуем /api/accountv2 (платный) как запасной вариант.
+    Основной путь — бесплатный /api/account. Если он упал, а ключ задан,
+    пробуем /api/accountv2 (платный) как запасной вариант. Оба недоступны →
+    ProviderError.
     """
+    errors: list[str] = []
     try:
         return await _get("/api/account", address, client)
-    except (httpx.HTTPError, ValueError):
-        pass
+    except (httpx.HTTPError, ValueError) as e:
+        errors.append(f"account: {e}")
     if TRONSCAN_API_KEY:
         try:
             return await _get("/api/accountv2", address, client)
-        except (httpx.HTTPError, ValueError):
-            pass
-    return {}
+        except (httpx.HTTPError, ValueError) as e:
+            errors.append(f"accountv2: {e}")
+    raise ProviderError("TronScan: " + "; ".join(errors))

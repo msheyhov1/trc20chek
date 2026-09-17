@@ -4,265 +4,297 @@
 
 ## Что это за проект
 
-TRC20 Address Checker — сервис определения принадлежности TRON-адреса (биржа / контракт / скам / неизвестный). Три интерфейса (REST API, Telegram-бот, веб-форма) поверх одного ядра.
+TRC20 Address Checker — сервис определения принадлежности TRON-адреса (биржа / контракт / скам / санкционный / заблокированный / неизвестный) и расчёта AML-риска. Три интерфейса (REST API, Telegram-бот, веб-форма) поверх одного ядра.
 
-Целевой деплой: **Railway** (один контейнер, API + бот в одном процессе, persistent volume на `/data`).
+Целевой деплой: **Railway** (один контейнер, API + бот + мониторинг в одном процессе, persistent volume на `/data`).
 
 ## Архитектура
 
 ```
-core/                # ядро (без сторонних зависимостей кроме httpx + aiosqlite)
-├── models.py        # AddressVerdict, RiskLevel, EntityType, is_valid_trc20_address (base58check)
-├── aggregator.py    # check_address() — главная точка входа
-├── cache.py         # SQLite-кеш на 7 дней
-├── cluster.py       # накопительная кластеризация депозитников бирж (SQLite на /data)
-├── balance.py       # извлечение балансов TRX/USDT из ответа TronScan
-├── aml_external.py  # внешний AML #1 — Swapster (PUT /aml → POST /aml)
-├── aml_bitok.py     # внешний AML #2 — Bitok KYT (HMAC-подпись, manual-checks)
+core/                    # ядро (зависимости: httpx + aiosqlite)
+├── models.py            # AddressVerdict (+from_dict/to_dict), RiskLevel, EntityType,
+│                        # ENTITY_TYPE_RU/RISK_LEVEL_RU, is_valid_trc20_address
+├── aggregator.py        # check_address() — главная точка входа
+├── addresses.py         # извлечение адресов из текста (regex, URL, hex 41…)
+├── cache.py             # SQLite-кеш (по умолчанию не используется — везде свежесть)
+├── cluster.py           # накопительная кластеризация депозитников бирж
+├── history.py           # журнал проверок: сравнение с прошлым, /history, /stats
+├── labels.py            # ручные метки в SQLite (правятся из бота без редеплоя)
+├── watchlist.py         # мониторинг адресов + фоновая перепроверка
+├── balance.py           # балансы TRX/USDT из ответа TronScan
+├── aml_external.py      # внешний AML #1 — Swapster
+├── aml_bitok.py         # внешний AML #2 — Bitok KYT (HMAC-подпись)
 └── providers/
-    ├── tronscan.py  # GET /api/accountv2 — метки бирж и контрактов
-    ├── goplus.py    # GET /api/v1/address_security/{addr} — риск-флаги
-    ├── flow.py      # GET /api/token_trc20/transfers — анализ контрагентов (связи с биржами)
-    ├── ofac.py      # OFAC SDN TRX-список (0xB10C) — прямой матч санкционных адресов
-    └── local.py     # ручные метки (наивысший приоритет)
+    ├── base.py          # ProviderError — соглашение об ошибках
+    ├── tronscan.py      # метки, тип аккаунта, баланс
+    ├── flow.py          # переводы TRC20 + метаданные ответа (TransferPage)
+    ├── goplus.py        # риск-флаги адреса
+    ├── ofac.py          # OFAC SDN TRX-список + вшитый снимок как fallback
+    ├── tether.py        # блэклист USDT (isBlackListed у контракта)
+    ├── token_security.py # безопасность контракта (TronScan Security Service)
+    └── local.py         # предзаданные метки (засеваются в labels.py)
 
-api/main.py          # FastAPI + lifespan-запуск бота фоновой задачей
-bot/main.py          # aiogram 3 — dp определён на верхнем уровне, импортируется из api/main.py
-web/                 # index.html + static/{styles.css, app.js}
-tests/               # 69 тестов, моки на провайдеров через unittest.mock
+api/
+├── main.py              # FastAPI + бот + мониторинг в lifespan
+└── ratelimit.py         # лимиты на IP и суточная квота
+bot/main.py              # aiogram 3, dp на верхнем уровне
+web/                     # index.html + static/{styles.css, app.js}
+core/data/               # вшитый снимок OFAC-списка (нужен в рантайме)
+docs/research/           # артефакты проверки источников (см. ROADMAP.md §5)
+tests/                   # 268 тестов, покрытие 85%
+ROADMAP.md               # аудит и план развития, статус по пунктам
 ```
 
-## Поток данных
+## Поток данных в `check_address`
 
-1. `check_address(addr)` валидирует TRC20 (base58check, префикс 0x41, длина 25 байт)
-2. Смотрит SQLite-кеш (TTL из `CACHE_TTL_SECONDS`, по умолчанию 7 дней)
-3. Параллельно (`asyncio.gather`) дёргает TronScan + GoPlus + flow (переводы) + OFAC-список
-4. `_apply_tronscan` → `_apply_goplus` (только собирает флаги) → `_apply_flow` → `_compute_aml` → `_apply_local` (локальная БД имеет приоритет)
-5. Внешние AML (Swapster + Bitok) — параллельно, если адрес не биржа/контракт; затем `_relabel_from_swapster` → `_label_from_bitok` → `_apply_external_aml_risk`
-6. Записывает результат в кеш и возвращает `AddressVerdict`
+Порядок фаз важен: сначала собираются ВСЕ метки, потом ОДИН раз считается риск,
+потом применяются ручные метки. Раньше риск считался до внешних AML, и их метка
+меняла тип уже после расчёта — получались взаимоисключающие строки в отчёте.
 
-### AML-модель (`_compute_aml` — централизованная риск-логика)
+1. Валидация TRC20 (base58check, префикс 0x41, 25 байт)
+2. Дедупликация: одновременная проверка того же адреса ждёт первую (single-flight)
+3. Общий бюджет времени (`CHECK_BUDGET_SECONDS`, по умолч. 90 с)
+4. Кеш (только по явному запросу)
+5. Параллельно: TronScan + GoPlus + переводы + OFAC + блэклист Tether
+6. Гигиена токенов, признаки из ответа переводов, детект отравления истории
+7. `_apply_tronscan` → `_apply_goplus` → `_apply_flow` → `_apply_tether`
+8. Для контрактов — `token_security`
+9. 2-й хоп (для кошельков/неизвестных)
+10. Кластеризация, баланс
+11. Внешние KYT (Swapster + Bitok параллельно, если не туннель) → метки от них
+12. **`_compute_aml`** — единственный расчёт риска, включая влияние внешних KYT
+13. `_apply_local` — ручные метки, наивысший приоритет
+14. `_apply_provider_gaps` — флаг о недоступных источниках
+15. Журнал: запись + сравнение с прошлым результатом
+16. Кеш (если включён)
 
-Все решения о `risk_level` / `risk_score` (0-100) приняты здесь, не в провайдерах.
-- **Прямое попадание в OFAC SDN** → `EntityType.SANCTIONED`, скор 100, DANGEROUS.
-- **GoPlus critical-флаг на адресе** (`CRITICAL_GOPLUS_FLAGS`) → скор 90, DANGEROUS, тип SCAM если был UNKNOWN.
-- **Косвенная экспозиция** (1 хоп): доля объёма переводов с/на санкционные адреса → драйвер скора для НЕ-сервисов. Считается по сумме (`_amount`, нормализация по decimals; аппроксимация — оборот в основном USDT).
-- **Entity-awareness (ключ против ложных срабатываний):** известные сервисы (`EXCHANGE`/`CONTRACT`) НЕ клеймятся грязными за КОСВЕННУЮ экспозицию (скор ≤10), но прямая санкция/скам роняет и их. Экспозиция всё равно показывается в `verdict.aml` для прозрачности.
-- `verdict.aml`: `{direct_sanctioned, sanctions_exposure_pct, exchange_exposure_pct, other_exposure_pct, transfers_analyzed, sanctioned_counterparties, goplus_critical_flags}`.
-- **2-й хоп** (`_fetch_hop2`): для кошельков/неизвестных раскрываем топ-`AML_HOP2_LIMIT` (12) неизвестных посредников по объёму, считаем ИХ санкционную экспозицию. Косвенная экспозиция = Σ(наша доля через посредника × его «грязность»), входит в скор с весом `HOP2_WEIGHT=0.6`. Биржи/контракты/прямые санкции НЕ раскрываем (бессмысленно + дорого). Отключается `AML_HOP2=0`. Параллельные запросы внутри одного `httpx.AsyncClient`.
-- **Глубже 2 хопов / amount-в-USD** — задел на будущее (нужны платные AML-API типа Crystal/TRM для Crystal-grade точности).
+### Соглашение об ошибках провайдеров
 
-### Внешние AML-сервисы (Swapster + Bitok)
+Провайдер **бросает `ProviderError`**, а не возвращает пустой результат. Агрегатор
+ловит в `_guarded`, пишет `verdict.provider_status[имя] = "error"` и вставляет первым
+флагом «Проверка НЕПОЛНАЯ: недоступны источники …».
 
-Два независимых KYT-провайдера, оба вызываются **параллельно** в конце `check_address`
-и кладутся в вердикт: `verdict.external_aml` (Swapster, `core/aml_external.py`) и
-`verdict.bitok_aml` (Bitok, `core/aml_bitok.py`). Формат ответа у обоих **одинаковый**,
-поэтому бот и веб рисуют их одним кодом:
+Это принципиально: для AML-инструмента «источник недоступен» не должно выглядеть
+как «ничего не найдено». Отсутствие данных ≠ отсутствие риска.
+
+`provider_status` значения: `ok`, `error`, `skipped`, `not_configured`, `pending`,
+`timeout`, а для OFAC — `live` / `cache` / `bundled` (откуда взят список).
+
+### AML-модель (`_compute_aml`)
+
+Все решения о `risk_level` / `risk_score` (0-100) приняты здесь.
+
+- **Блэклист Tether** → `EntityType.FROZEN`, 100, DANGEROUS. Самый жёсткий сигнал для
+  USDT: заблокированные средства физически неподвижны.
+- **Прямое попадание в OFAC SDN** → `SANCTIONED`, 100, `sanction_source = "OFAC SDN"`.
+- **Санкционная биржа** (свой тег или депозитник) → `SANCTIONED`, 100, источник из
+  `SANCTIONED_EXCHANGE_SOURCE` (`UK · EU` / `OFAC` / `EU`).
+- **GoPlus critical-флаг** → 90, DANGEROUS.
+- **Тип задаёт нижнюю границу риска** (`_TYPE_MIN_RISK`): метка от внешнего сервиса
+  может прийти с мягким уровнем, но тип и уровень не должны противоречить друг другу.
+- **Косвенная экспозиция** по доле объёма, с разбивкой по направлению
+  (`sanctions_received_pct` / `sanctions_sent_pct`): получить от санкционного адреса
+  и отправить на него — разные события.
+- **Entity-awareness:** `EXCHANGE`/`CONTRACT` не клеймятся за косвенную экспозицию
+  (`known_service`). `HIGH_RISK_SERVICE` в это правило НЕ входит.
+- **2-й хоп** (`AML_HOP2`): топ-12 неизвестных посредников, вес `AML_HOP2_WEIGHT`.
+
+### Объёмная математика считается ТОЛЬКО по стейблкоинам
+
+`_amount()` возвращает 0 для токенов вне `VOLUME_TOKENS` (USDT/USDC/USDD/TUSD/USDJ,
+расширяется через `AML_VOLUME_TOKENS`). Сверяется **контракт** (`tokenInfo.tokenId`),
+а не символ.
+
+Причина — вектор уклонения: любой может выпустить свой TRC20 с символом «USDT»,
+прислать себе один перевод на 10 млн и разбавить санкционную экспозицию с 90 % до 0 %.
+От того же спама сбивалась и атрибуция депозитников. Символ подделывается тривиально,
+адрес контракта — нет. Переводы вне allowlist используются для анализа контрагентов,
+но исключены из знаменателя; факт получения поддельного USDT — отдельный риск-флаг.
+
+### Внешние AML (Swapster + Bitok)
+
+Формат ответа у обоих одинаковый, бот и веб рисуют их одним кодом:
 
 ```
 {available, provider, pending, risk_score(0-100|None), risk_level(safe|caution|dangerous),
  level_raw, entity, entity_category, entity_category_ru, entities[], reason, details}
 ```
 
-- **Туннель** (`_AML_SKIP_TYPES` = `EXCHANGE`/`CONTRACT`): для бирж, их депозитников и
-  контрактов платные KYT НЕ дёргаем — их AML-скор ничего не говорит о владельце, а именно
-  таких проверок больше всего. Скам/санкции туннель НЕ отсекает: там второе мнение ценно.
-  В вердикте вместо результата лежит `{"skipped": true, "reason": ...}`.
-- **Bitok** (`core/aml_bitok.py`): HMAC-SHA256-подпись (`API-KEY-ID` / `API-TIMESTAMP` мс /
-  `API-SIGNATURE` = base64(HMAC(secret, `METHOD\nENDPOINT\nTS[\nBODY]`))). Флоу:
-  `POST /v1/manual-checks/check-address/` → поллинг `GET /v1/manual-checks/{id}/` до
-  `check_status == "checked"` → best-effort `address-exposure/` (имя сущности) и `risks/`
-  (категории экспозиции). Родная шкала `none|low|medium|high|severe` → наша
-  `safe|caution|dangerous`. Тело шлём ровно той compact-JSON строкой, что подписали —
-  иначе 401.
-- **`_label_from_bitok`**: Bitok знает off-chain имя сущности («Tether blacklist», «Binance»)
-  там, где у TronScan метки нет. Ставим её ТОЛЬКО если своей метки нет вообще
-  (`entity_type == UNKNOWN` и `entity` пусто/«No public labels»); категория маппится в тип
-  через `_BITOK_CATEGORY_TYPE`.
-- **`_apply_external_aml_risk`**: внешний AML может только **поднять** итоговый вердикт
-  (`caution`/`dangerous` → `verdict.risk_level`, `risk_score = max(...)`, плюс поясняющий
-  флаг). Понижать нельзя: чистый ответ KYT не отменяет наши on-chain находки, а `UNKNOWN`
-  («меток нет») не должен превращаться в «безопасно» из-за отсутствия данных у сервиса.
-  Выключается `EXTERNAL_AML_AFFECTS_RISK=0` (сервисы остаются в выводе, вердикт не трогают).
+- **Туннель** (`_AML_SKIP_TYPES` = `EXCHANGE`/`CONTRACT`/`FROZEN`): платные KYT не
+  дёргаем там, где их ответ ничего не добавит. Решение принимается по **on-chain** типу,
+  до расчёта риска. Скам/санкции туннель НЕ отсекает.
+- **Таймауты настенные**: `BITOK_TIMEOUT_SECONDS` и `SWAPSTER_TIMEOUT_SECONDS`
+  ограничивают проверку целиком, а не один запрос. Раньше худший случай Bitok был
+  ~940 с (таймаут умножался на число попыток поллинга).
+- **Внешний AML может только ПОДНЯТЬ вердикт.** Чистый ответ KYT не отменяет наши
+  on-chain находки, а `UNKNOWN` («меток нет») не превращается в «безопасно».
+  Выключается `EXTERNAL_AML_AFFECTS_RISK=0`.
+- **Категории Bitok**: `_BITOK_CATEGORY_TYPE` покрывает ВСЕ категории из
+  `ENTITY_CATEGORY_RU` — это проверяет тест. Раньше 13 не имели маппинга, включая
+  `mixer` и `enforcement_action` (ею Bitok размечает блокировку Tether).
 
-### flow-анализ (связи с биржами)
+### flow-анализ и депозитники
 
-`_apply_flow` смотрит последние ~50 TRC20-переводов и считает контрагентов с биржевыми
-метками (через `EXCHANGE_KEYWORDS`). Если адрес не опознан сильнее (контракт/прямая
-метка/скам), он помечается `EntityType.WALLET` — «Кошелёк (связан с Bybit/...)», а связи
-кладутся в `verdict.exchange_links` (`[{name, deposits, withdrawals, total}]`).
-Это **эвристика**: «часто шлёт на Bybit» ≠ «принадлежит Bybit». Сам адрес — это кошелёк
-пользователя, а не биржа; метку имеет контрагент перевода.
+`_apply_flow` смотрит контрагентов с биржевыми метками. Это **эвристика**: «часто шлёт
+на Bybit» ≠ «принадлежит Bybit». Если `publicTag` у САМОГО адреса → `EXCHANGE`; если
+помечен только контрагент → `WALLET` «Личный кошелёк (связан с …)».
 
-**Биржа vs личный кошелёк** (частый вопрос): решает, ЧЕЙ адрес помечен. Если `publicTag`
-у САМОГО адреса → `EXCHANGE` (проверяется первым в `_apply_tronscan`). Если помечен только
-контрагент → `WALLET` «Личный кошелёк (связан с …)» + флаг «не биржа». Нетегированный сервис
-ловим эвристикой: `totalTransactionCount > 50000` → «Возможно сервис/биржа (нетегирован)».
+**Депозитник биржи** (`_detect_exchange_deposit`) — funnel-паттерн: получает извне,
+пересылает почти весь отток на ОДНУ биржу (`DEPOSIT_CONCENTRATION`), сам от неё почти
+ничего не получает (`DEPOSIT_BACKFLOW_RATIO` — ключевой дискриминатор против личного
+торгового кошелька). Суммы НЕ обязаны совпадать 1:1: депозитник агрегирует приходы.
 
-**Депозитный/транзитный адрес биржи** (`_detect_exchange_deposit`): депозитники бирж НЕ размечены
-тегами, но узнаются по **funnel-паттерну** (поведение «deposit address», как у Arkham/Chainalysis,
-но без их off-chain кластеризации — только on-chain эвристика):
-- адрес ПОЛУЧАЕТ средства от сторонних адресов и пересылает почти весь отток на ОДНУ биржу
-  (концентрация оттока ≥ `DEPOSIT_CONCENTRATION` = 0.9);
-- сам ОТ этой биржи ничего не получает — иначе это личный торговый кошелёк (и заводит, и выводит).
-  Это ключевой дискриминатор против ложняка;
-- транзит: пересылает ≥ `DEPOSIT_FORWARD_RATIO` (0.5) полученного, ≥2 входящих перевода.
+**Кластеризация** (`core/cluster.py`): депозитники одной биржи пересылают на ОДИН якорь
+(хот-кошелёк), поэтому база со временем растёт в граф атрибуции.
 
-Суммы НЕ обязаны совпадать 1:1 — депозитник часто **агрегирует** несколько приходов в один вывод
-(4129.33 + 10 + 20 → 4159.33 на Bybit), поэтому смотрим концентрацию и пересылку по ОБЪЁМУ, а не
-совпадение сумм (старый sweep-1:1 остался только как `matched_pairs` для UI). При совпадении →
-`EntityType.EXCHANGE` «Депозитный кошелёк {биржа}», `SAFE`, детали в
-`verdict.raw_labels.flow.deposit_pattern` (`{exchange, concentration, forwarded_pct, in_sources,
-matched_pairs, sanctioned}`). Запускается в `_apply_flow` до WALLET-ветки. **Санкционная биржа**
-(HTX и т.п.): метку депозитника ставим так же, но риск НЕ маскируем — `deposit_pattern.sanctioned`
-поднимает адрес в `_compute_aml` (через `self_sanctioned_exch`) до `EntityType.SANCTIONED`, скор
-100, `DANGEROUS`.
+### Данные, которые приходят бесплатно
 
-### Кластеризация депозитников (`core/cluster.py` + `_apply_cluster`)
-
-On-chain deposit-clustering (как у Arkham, но без их off-chain интела — common-input/co-spend на
-TRON неприменим, это account-модель). Когда `_detect_exchange_deposit` опознаёт депозитник, он
-возвращает **якорь** `deposit_pattern.hot_wallet` — адрес хот/сборного кошелька биржи, на который
-уходит больше всего оттока. `_apply_cluster` пишет `address → {exchange, hot_wallet, sanctioned}`
-в `core/cluster.py` (SQLite на `/data/cluster.db`, отдельный от кеша файл) и дополняет вердикт:
-`verdict.raw_labels.cluster = {exchange, hot_wallet, siblings_on_anchor, siblings_sample,
-known_deposits_exchange}`. Разные депозитники ОДНОЙ биржи пересылают на ОДИН якорь, поэтому БД
-со временем растёт в граф — по якорю видно, сколько родственных депозитных адресов уже
-атрибутировано (`siblings_on_anchor` — точный сигнал по хот-кошельку, `known_deposits_exchange`
-— шире по имени биржи). Провайдер необязательный: любая ошибка SQLite ловится и НЕ роняет проверку
-(в тестах без `/data` просто деградирует — `cluster` не добавляется). Инициализация БД —
-`cluster.init_db()` в lifespan `api/main.py` и в `bot/main.py` рядом с `cache.init_db()`.
+Ответ `/api/token_trc20/transfers` содержит `tokenInfo.tokenLevel` (строкой! «3»
+подозрительный, «4» небезопасный), `tokenCanShow`, `riskTransaction`, а на уровне
+ответа — `normalAddressInfo[адрес].risk` и `contractInfo`. Всё это читается без
+дополнительных запросов (`_apply_transfer_signals`); метаданные ответа несёт
+`flow.TransferPage` — подкласс `list` с полем `.meta`, чтобы не ломать точку подмены
+в тестах.
 
 ## Команды для разработки
 
 ```bash
-# Установить зависимости
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
 
-# Прогнать тесты (должны быть все зелёные: 69/69)
-pytest -v
+# Тесты (должны быть все зелёные: 268/268)
+CACHE_PATH=./cache.db CLUSTER_PATH=./cluster.db HISTORY_PATH=./history.db \
+LABELS_PATH=./labels.db WATCHLIST_PATH=./watchlist.db pytest -q
 
-# Локальный запуск (API + bot, если BOT_TOKEN задан; иначе только API)
-export BOT_TOKEN=...           # опционально
-export CACHE_PATH=./cache.db   # для локальной разработки, чтобы не писать в /data
+ruff check .                                  # линтер
+# ВАЖНО: версия ruff закреплена в requirements-dev.txt и именно она стоит в CI.
+# Другая локальная версия даёт другой набор правил: UP038 есть в 0.6.9 и убрано
+# в 0.15 — локально было «All checks passed», а CI падал. Ставьте из файла.
+coverage run -m pytest -q && coverage report  # покрытие
+
+# Локальный запуск
+export WEB_PUBLIC=1              # иначе /check отвечает 503 (см. ниже)
+export CACHE_PATH=./cache.db     # чтобы не писать в /data
 uvicorn api.main:app --reload
 
-# Smoke test API
 curl http://localhost:8000/health
 curl http://localhost:8000/check/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 ```
 
 ## Переменные окружения
 
-| Имя | Обязательно | Что делает |
-|---|---|---|
-| `BOT_TOKEN` | нет (но бот без него выключен) | Токен Telegram-бота от @BotFather |
-| `TRONSCAN_API_KEY` | нет | Повышает лимиты TronScan API |
-| `GOPLUS_API_KEY` | нет | Повышает лимиты GoPlus API |
-| `API_KEY` | нет | Если задано — REST API требует `?api_key=...` |
-| `ALLOWED_TG_IDS` | **да, иначе бот никого не пустит** | Белый список Telegram user_id (через запятую/пробел). Единственный способ попасть в бота: пусто = закрыт для всех (fail-closed) |
-| `WEB_PASSWORD` | нет | Пароль на веб-сайт (HTTP Basic Auth на `/` и `/check`). Пусто = сайт открыт |
-| `WEB_USER` | нет | Логин для веб-пароля (по умолчанию `admin`) |
-| `CACHE_PATH` | нет | Путь к SQLite-кешу (по умолчанию `/data/cache.db`) |
-| `CLUSTER_PATH` | нет | Путь к SQLite кластеризации депозитников (по умолчанию `/data/cluster.db`) |
-| `CACHE_TTL_SECONDS` | нет | TTL кеша (по умолчанию 604800 = 7 дней) |
-| `AML_HOP2` | нет | 2-хоп анализ связанных кошельков (по умолч. вкл; `0` — выкл) |
-| `AML_HOP2_LIMIT` | нет | Сколько посредников раскрывать во 2-м хопе (по умолч. 12) |
-| `AML_HOP2_CONCURRENCY` | нет | Лимит параллельных hop2-запросов к TronScan (по умолч. 4, чтобы не бить в QPS) |
-| `SWAPSTER_API_TOKEN` | нет (без него Swapster «не настроен») | Токен AML-API Swapster |
-| `SWAPSTER_API_BASE_URL` | нет | По умолчанию `https://api.swapster.fi` (тест: `https://test-api.swapster.fi`) |
-| `SWAPSTER_PROXY_URL` | нет | Прокси со статичным IP под whitelist Swapster |
-| `SWAPSTER_TIMEOUT_SECONDS` | нет | Таймаут Swapster (по умолч. 30) |
-| `BITOK_API_KEY_ID` | нет (без него Bitok «не настроен») | API Key ID из кабинета Bitok KYT |
-| `BITOK_API_SECRET` | нет | API Secret (показывается один раз при создании ключа) |
-| `BITOK_API_BASE_URL` | нет | По умолчанию `https://kyt-api.bitok2.org` (контур РФ) |
-| `BITOK_NETWORK` | нет | Сеть для проверки (по умолч. `TRX`) |
-| `BITOK_TIMEOUT_SECONDS` | нет | Общий таймаут проверки Bitok, он же бюджет поллинга (по умолч. 45) |
-| `EXTERNAL_AML_AFFECTS_RISK` | нет | `0` — внешние AML показываются, но не меняют итоговый вердикт (по умолч. влияют) |
-| `AML_EXCHANGE_ENTITY_THRESHOLD` | нет | Доля биржевой сущности Swapster, при которой транзит помечается биржей (по умолч. 0.9) |
-| `PORT` | нет | Порт HTTP, Railway задаёт сам |
+Полный список с пояснениями — в `.env.example`. Ключевое:
+
+| Имя | Что делает |
+|---|---|
+| `BOT_TOKEN` | Токен Telegram-бота. Без него — API-only |
+| `ALLOWED_TG_IDS` | **Обязательно для бота.** Пусто = закрыт для всех (fail-closed) |
+| `WEB_PASSWORD` / `WEB_USER` | Пароль на сайт (Basic Auth на `/`, `/check`, `/history`, `/stats`) |
+| `API_KEY` | Защита API. Принимается заголовком `X-API-Key` или `?api_key=` |
+| `WEB_PUBLIC` | **Без пароля и ключа `/check` отвечает 503.** `1` = сайт открыт всем |
+| `RATE_LIMIT_PER_IP` / `RATE_LIMIT_DAILY` | Лимиты для открытого доступа |
+| `TRONSCAN_API_KEY` | Повышает лимиты TronScan |
+| `TRONGRID_API_KEY` | Опционален для проверки блэклиста Tether |
+| `SWAPSTER_API_TOKEN` | Токен Swapster |
+| `BITOK_API_KEY_ID` / `BITOK_API_SECRET` | Ключи Bitok KYT |
+| `CHECK_BUDGET_SECONDS` | Общий дедлайн проверки (90) |
+| `AML_VOLUME_TOKENS` | Дополнительные контракты для объёмной математики |
+| `HIGH_RISK_EXCHANGES` | Обменники без KYC: `тег:Имя` через запятую. Пусто по умолчанию |
+| `HISTORY_*`, `LABELS_PATH`, `WATCHLIST_*` | Журнал, метки, мониторинг |
+| `DEPOSIT_*`, `TRANSIT_*`, `POISON_*`, `AML_HOP2_*` | Пороги эвристик |
 
 ## Соглашения в коде
 
-- **Python 3.12+**, type hints везде через `from __future__ import annotations`
-- **async-first**: все провайдеры и кеш — async, через `httpx.AsyncClient` и `aiosqlite`
-- **Никаких сторонних эффектов при импорте**: `dp` в `bot/main.py` создаётся на модульном уровне, но polling стартует только из `if __name__ == "__main__"` или явно из `api/main.py` через lifespan
-- **Провайдер не падает на пользователя**: если внешний API недоступен, провайдер возвращает `{}` (см. `except httpx.HTTPError`). Агрегатор просто продолжит с тем, что есть
-- **Свежесть по умолчанию везде** (AML требует актуальных транзакций): бот вызывает `check_address(addr, use_cache=False)`; REST-эндпоинт `/check/{addr}` тоже свежий по умолчанию, кеш включается только явным `?cache=true`. Веб-форма ходит через API → тоже свежая. Кеш-инфраструктура (SQLite на `/data`) сохранена для опционального использования
-- **Доступ к боту только по TG ID** (`bot/main.py`): `AccessMiddleware` висит и на `dp.message`, и на `dp.callback_query` (инлайн-кнопки тоже под гейтом) и зовёт `_is_allowed` — **fail-closed**: пропускаем ТОЛЬКО user_id из `ALLOWED_TG_IDS`, пустой список = бот закрыт для всех, апдейт без пользователя (анонимный админ канала) = отказ. Открытого дефолта нет намеренно: каждая проверка жжёт платные лимиты KYT. Незнакомцу в отказе показывается его собственный user_id (в колбэке — алертом, иначе у него крутится спиннер), админ добавляет id в env и передеплоивает. Строку о режиме доступа при старте печатает общий `log_access_mode()` (зовут и `main()`, и lifespan `api/main.py`) — три ветки: список разобран → info; задан, но ни один id не распознан → error с сырым значением (частая ошибка: кавычки из raw-редактора Railway, `@username`, id канала — `_parse_ids` их срезает/отбрасывает); не задан → error. Размер белого списка виден в `/health` (`bot_whitelist`), чтобы пустой список диагностировался без логов. Отказ отправляется best-effort (ошибка Telegram API гасится — юзер мог заблокировать бота), но выход из обработчика безусловный. Тесты `test_access_middleware_registered_on_dispatcher` и `test_every_observer_with_handlers_is_gated` проверяют саму проводку на живом `dp`: тесты класса в отрыве от `dp` пропускают удаление регистрации
-- **Пароль на веб-сайт** (`api/main.py`): `require_web_auth` (HTTP Basic Auth, `secrets.compare_digest`) на `/` и `/check`. Включается `WEB_PASSWORD` (+`WEB_USER`, по умолч. `admin`); пусто = сайт открыт. `/health` НЕ закрыт (нужен Railway-healthcheck'у). Веб-форма ходит на `/check` относительным URL → браузер сам дошлёт Basic-креды того же origin. Бот не затронут — он зовёт `check_address()` напрямую, мимо HTTP
+- **Python 3.12+**, type hints, `from __future__ import annotations`
+- **async-first**: провайдеры и хранилища через `httpx.AsyncClient` и `aiosqlite`
+- **Никаких сторонних эффектов при импорте**: `dp` в `bot/main.py` создаётся на
+  модульном уровне, polling стартует только из `main()` или lifespan `api/main.py`
+- **Провайдер бросает `ProviderError`**, агрегатор фиксирует в `provider_status`
+- **Свежесть по умолчанию**: бот и `/check` ходят без кеша, кеш только по `?cache=true`
+- **Необязательные хранилища не роняют старт**: `_init_storage` логирует ошибку и
+  продолжает, состояние видно в `/health`. Раньше отсутствие volume давало restart-loop
+- **Подписи типов и уровней — только в `core/models.py`** и отдаются в API
+  (`entity_type_ru`, `risk_level_ru`). Бот и веб их не дублируют: словари расходились,
+  а новый тип ронял рендер бота по `KeyError`
+- **Доступ к боту только по TG ID**, fail-closed. `AccessMiddleware` висит на всех
+  обработчиках; тесты `test_access_middleware_registered_on_dispatcher` и
+  `test_every_observer_with_handlers_is_gated` проверяют проводку на живом `dp`
+- **Веб симметричен боту**: без пароля/ключа/`WEB_PUBLIC` эндпоинты закрыты
 
-## Интерфейс бота (`bot/main.py`)
+## Интерфейс бота
 
-Одно сообщение = весь вердикт. Порядок блоков (`format_verdict`):
+Команды: `/start`, `/help`, `/id`, `/status`, `/history`, `/stats`, `/labels`,
+`/label`, `/unlabel`, `/watch`, `/unwatch`, `/watchlist`. Файлом — пакетная проверка.
 
-1. Шапка: `🔴 ОПАСНО · риск 87/100` + шкала `▰▰▰▰▰▰▰▰▱▱` (`_score_bar`)
-2. Сущность, тип, адрес в `<code>` (копируется тапом), баланс USDT/TRX
-3. **⚠️ Что нашли** — `verdict.risk_flags` (первые 8), технические флаги провайдеров
-   переводятся в русский через `_flag_ru`
-4. **🏦 Связи с биржами** — `verdict.exchange_links` (топ-5, санкционные помечены)
-5. **🧭 Экспозиция** — разбивка объёма из `verdict.aml` + строка 2-го хопа
-6. **🔗 Кластер** — `raw_labels.cluster` (сколько родственных депозитников известно)
-7. **🔍 AML-сервисы** — Swapster и Bitok одним рендером (`_aml_provider_lines`)
-8. Источники
+Адрес распознаётся в любом виде: с пунктуацией, в скобках, в кавычках Telegram, в
+ссылке на TronScan, в hex-формате `41…` (`core/addresses.py`). Раньше парсер был
+`split()` + `startswith("T")` + `len == 34` и ломался на запятой.
 
-Правила: весь пользовательский текст экранируется (`_esc`) — метки приходят из внешних
-API; длина режется по `TG_MESSAGE_LIMIT` (4096). Пока идёт проверка (десятки секунд из-за
-двух KYT), бот шлёт сообщение-прогресс и **правит его же** готовым вердиктом. Под вердиктом
-инлайн-кнопки: «🔄 Перепроверить» (callback `recheck:{address}`, хендлер `on_recheck`
-правит то же сообщение; «message is not modified» — нормальный исход) и ссылка на TronScan.
-`AccessMiddleware` навешен и на `dp.message`, и на `dp.callback_query`.
+Порядок блоков вердикта (`format_verdict`): шапка со шкалой → сущность/тип/адрес/баланс
+→ «Что нашли» → «Связи с биржами» → «Экспозиция» (с направлением ↓получено ↑отправлено)
+→ «Кластер» → «AML-сервисы» → источники → время проверки.
 
-## Как добавить новый провайдер
+Весь пользовательский текст экранируется (`_esc`) — метки приходят из внешних API.
+Обрезка по `TG_MESSAGE_LIMIT` режет по границе строки и предупреждает об этом.
 
-1. Создать `core/providers/новый.py` с async-функцией `fetch_*(address, client) -> dict`
-2. В `core/aggregator.py`:
-   - Импортировать
-   - Добавить в `asyncio.gather` рядом с tronscan/goplus
-   - Написать `_apply_новый(data, verdict)` (по образцу существующих)
-   - Вызвать после `_apply_goplus`, до `_apply_local` (локальные метки всегда последние)
-3. Добавить тест в `tests/test_core.py` с моком через `unittest.mock.AsyncMock`
+## Как добавить нового провайдера
 
-## Как добавить новую биржу для распознавания
+1. `core/providers/новый.py` с async-функцией, бросающей `ProviderError` при сбое
+2. В `core/aggregator.py`: импорт, `_guarded(...)` в `asyncio.gather`, `_apply_новый(...)`
+   среди фаз меток (**до** `_compute_aml`), имя в `_PROVIDER_RU`
+3. Тест в `tests/test_providers.py` — обязательно на путь ошибки
 
-`core/aggregator.py` → словарь `EXCHANGE_KEYWORDS`. Ключ — подстрока в `publicTag` от TronScan в нижнем регистре, значение — каноническое имя для UI.
+## Как добавить биржу
 
-## Санкционные биржи (`SANCTIONED_EXCHANGES`)
+- Обычную: `EXCHANGE_KEYWORDS` (ключ — подстрока тега в нижнем регистре)
+- Санкционную: `SANCTIONED_EXCHANGES` **и** `SANCTIONED_EXCHANGE_SOURCE`
+- Высокорисковую (без KYC): env `HIGH_RISK_EXCHANGES`
 
-`core/aggregator.py` → `SANCTIONED_EXCHANGES` — биржи под санкциями (UK A7-пакет 26.05.2026: HTX/Huobi, EXMO, Bitpapa, Rapira, Aifory, Arvix, ABCEX; OFAC: Garantex/Grinex/Cryptex). Ловятся по тегам TronScan: и сам хот-кошелёк (→ `EntityType.SANCTIONED`, скор 100), и переводы с/на них через flow (категория `sanctioned_exchange` в экспозиции, поднимает риск). Чтобы добавить биржу — впиши `подстрока_тега: "Каноническое имя"`. UK санкционирует юрлица (адреса публикуются не всегда), поэтому покрытие = тегированные хот-кошельки + экспозиция, а не каждый адрес.
+Название не должно быть в двух словарях одновременно: `_normalize_exchange` отдаёт
+предпочтение обычному, и санкционная биржа получила бы «безопасно». Это проверяет
+`test_no_overlap_between_exchange_dicts` — до него Nobitex и Wallex лежали в обычных
+биржах и выдавали `exchange / safe / 0` с отключённым туннелем KYT.
 
-## Реальная структура ответа TronScan `accountv2` (важно для `_apply_tronscan`)
+## Реальная структура ответа TronScan (проверено)
 
-Проверено на живом API (нужен `TRONSCAN_API_KEY`):
+| Что | Где |
+|---|---|
+| Контракт | `accountType == 2` или адрес ключом в `contractMap` |
+| Биржа / метка | `publicTag` / `addressTag` (могут быть `null`) |
+| Баланс TRC20 | `withPriceTokens[]` (accountv2) или `trc20token_balances[]` (account) |
 
-| Тип адреса | `accountType` | Как распознать | Где имя |
-|---|---|---|---|
-| Контракт | `2` | сам адрес присутствует ключом в `contractMap` со значением `true` | `name` (напр. `"TetherToken"`) |
-| Биржа / размеченный | `0` | `publicTag` / `addressTag` (напр. `"Binance-Hot 4"`, `"HTX 1"`) | `publicTag` |
-| Неразмеченный (в т.ч. депозитники бирж) | `0` | тегов нет (`publicTag: null`) | — → `unknown` |
-
-- **Поля `isContract` в ответе НЕТ** — не полагаться на него (была причина бага: контракты не определялись).
-- `publicTag`/`addressTag` могут приходить как `null`, а не `""` — фильтровать через `if v`.
-- Депозитные адреса бирж индивидуальны и **не размечены** — корректный ответ `unknown`, не баг.
+- Поля `isContract` в ответе **НЕТ** (была причиной бага с контрактами).
+- Полей `tokens` / `tokenBalances` **тоже нет** — из-за них баланс USDT всегда был 0.
+- `/api/account` — легаси и в текущей документации отсутствует; задокументирован
+  `/api/accountv2`.
+- Депозитные адреса бирж не размечены — корректный ответ `unknown`, не баг.
 
 ## Известные ограничения
 
-- **Нельзя определить клиентский кошелёк** (TronLink, Trust Wallet и т.д.) — это софт, а не on-chain сущность
-- **Приватные кошельки без меток вернутся как `unknown`** — это by design (приватность TRON)
-- **Для compliance-grade точности** нужны платные источники (Arkham, TRM, Chainalysis) — структура агрегатора готова к их добавлению
+- **Клиентский кошелёк** (TronLink, Trust Wallet) определить нельзя — это софт
+- **Приватные адреса без меток** → `unknown`, это by design
+- **TRX-переводы не анализируются**: только TRC20. Добавление требует эндпоинта, чью
+  структуру ответа не проверить без живого доступа, а писать под угаданную схему — тот
+  же класс ошибки, что `isContract` и `tokens`
+- **Compliance-grade точность** требует платных источников (Arkham, TRM, Chainalysis)
 
 ## Деплой на Railway
 
-См. README.md. Ключевые моменты:
-- Билдится из `Dockerfile` (Railway автодетектит)
-- `railway.json` задаёт healthcheck `/health` и restart policy
-- **Обязательно добавить volume на `/data`** иначе SQLite-кеш умрёт при каждом деплое
-- `PORT` Railway передаёт сам — в Dockerfile `CMD` использует `${PORT:-8000}`
-- **НЕ задавать `startCommand` в `railway.json`** — Railway запускает его без шелла, и `$PORT` не разворачивается (uvicorn падает `Invalid value for '--port': '$PORT'`). Команду берём из `Dockerfile` `CMD` (shell-форма, `${PORT:-8000}` разворачивается)
-- **`TRONSCAN_API_KEY` теперь де-факто обязателен**: без ключа эндпоинт `/api/accountv2` отдаёт `401 Unauthorized`, метки бирж/контрактов не приходят, и всё определяется как `unknown`. Ключ берётся бесплатно на tronscan.org → My Account → API Keys. GoPlus при этом работает без ключа (отдаёт только риск-флаги, не метки сущностей)
+См. README.md. Ключевое:
+
+- Билдится из `Dockerfile` (не root, `HEALTHCHECK`, dev-зависимости не ставятся)
+- **Обязательно volume на `/data`** — там кеш, кластер, журнал, метки, мониторинг.
+  Без него сервис работает, но эти функции выключены (видно в `/health`)
+- **НЕ задавать `startCommand` в `railway.json`** — Railway запускает без шелла, и
+  `$PORT` не разворачивается. Команда берётся из `CMD` в `Dockerfile`
+- `TRONSCAN_API_KEY` де-факто обязателен для полноты меток
+- **Задайте `WEB_PASSWORD`, `API_KEY` или `WEB_PUBLIC=1`**, иначе `/check` отдаёт 503
 
 ## Что НЕ делать
 
-- Не запускать бот отдельным процессом на Railway — поломается shared cache между API и ботом. Если в будущем понадобится разделение, перевести кеш с SQLite на Postgres или Redis
-- Не коммитить `.env` с реальным `BOT_TOKEN` — в `.gitignore` он уже указан, но проверять перед каждым коммитом
-- Не убирать `if __name__ == "__main__"` в `bot/main.py` — иначе при импорте модуля из API запустятся два poll-а параллельно и Telegram отдаст 409 Conflict
+- Не запускать бот отдельным процессом — сломается общий кеш, а Telegram отдаст
+  409 Conflict на второй polling. Мониторинг по той же причине живёт в этом же процессе
+- Не коммитить `.env` с реальными токенами
+- Не убирать `if __name__ == "__main__"` в `bot/main.py`
+- Не писать код под угаданную структуру внешнего API — сверяйте с документацией
+  (зеркала и артефакты проверки: `docs/research/`, `ROADMAP.md` §5)
+- Не возвращать пустой результат вместо `ProviderError` — это скрывает сбой источника

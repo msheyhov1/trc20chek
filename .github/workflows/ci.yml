@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Отменяем прошлый прогон той же ветки: при серии пушей ждать все нет смысла.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Линтер
+        run: ruff check .
+
+      - name: Тесты
+        # Пути к SQLite переопределяем: по умолчанию это /data, которого в CI нет.
+        env:
+          CACHE_PATH: ${{ runner.temp }}/cache.db
+          CLUSTER_PATH: ${{ runner.temp }}/cluster.db
+        run: pytest -q
+
+      - name: Покрытие
+        env:
+          CACHE_PATH: ${{ runner.temp }}/cov-cache.db
+          CLUSTER_PATH: ${{ runner.temp }}/cov-cluster.db
+        run: |
+          coverage run --source=core,api,bot -m pytest -q
+          coverage report -m
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Образ собирается на Railway из этого же Dockerfile — ломающийся билд
+      # должен падать в CI, а не в деплое.
+      - name: Собрать образ
+        run: docker build -t trc20-checker:ci .
+
+      - name: Проверить, что приложение поднимается
+        run: |
+          docker run -d --name trc20-ci -e PORT=8000 -e CACHE_PATH=/tmp/cache.db \
+            -e CLUSTER_PATH=/tmp/cluster.db -p 8000:8000 trc20-checker:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "healthcheck прошёл"
+              curl -sS http://localhost:8000/health
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "приложение не ответило на /health"
+          docker logs trc20-ci
+          exit 1

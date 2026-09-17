@@ -2,24 +2,76 @@ const form = document.getElementById("form");
 const input = document.getElementById("addr");
 const btn = document.getElementById("submitBtn");
 const result = document.getElementById("result");
+const historyBlock = document.getElementById("historyBlock");
+const historyList = document.getElementById("historyList");
+const clearHistoryBtn = document.getElementById("clearHistory");
 
-const TYPE_RU = {
+// Адрес принимаем в любом виде: с текстом вокруг, ссылкой на TronScan, hex 41…
+// (та же логика, что в core/addresses.py на стороне бота).
+const B58 = "[1-9A-HJ-NP-Za-km-z]";
+const ADDR_RE = new RegExp(`(?<!${B58})(T${B58}{33})(?!${B58})`);
+const HEX_RE = /(?<![0-9A-Fa-fx])(41[0-9A-Fa-f]{40})(?![0-9A-Fa-f])/;
+
+function extractAddress(text) {
+  const b58 = ADDR_RE.exec(text || "");
+  if (b58) return b58[1];
+  const hex = HEX_RE.exec(text || "");
+  // hex конвертирует сервер: тут достаточно передать как есть, /check его отвергнет,
+  // поэтому подсказываем пользователю вместо молчаливой ошибки.
+  return hex ? hex[1] : (text || "").trim();
+}
+
+// Подписи типа и уровня приходят готовыми из API (entity_type_ru / risk_level_ru,
+// см. core/models.py). Раньше словари дублировались здесь и в bot/main.py — они
+// расходились при любой правке, а тип sanctioned был жёстко подписан «(OFAC)»
+// даже для санкций UK/EU. Локальные таблицы оставлены только как запасной
+// вариант для ответа старой версии API.
+const TYPE_RU_FALLBACK = {
   exchange: "Биржа",
   contract: "Смарт-контракт",
   project: "Проект",
   scam: "СКАМ",
-  sanctioned: "САНКЦИОННЫЙ (OFAC)",
+  sanctioned: "САНКЦИОННЫЙ",
+  high_risk_service: "Высокорисковый сервис",
+  frozen: "СРЕДСТВА ЗАБЛОКИРОВАНЫ",
   labeled: "Маркированный",
   wallet: "Кошелёк",
   unknown: "Неизвестно",
 };
 
-const RISK_RU = {
+const RISK_RU_FALLBACK = {
   safe: "БЕЗОПАСНО",
   caution: "ОСТОРОЖНО",
   dangerous: "ОПАСНО",
   unknown: "НЕТ ДАННЫХ",
 };
+
+function typeRu(v) {
+  return v.entity_type_ru || TYPE_RU_FALLBACK[v.entity_type] || v.entity_type || "—";
+}
+
+function riskRu(v) {
+  const level = v.risk_level || "unknown";
+  return v.risk_level_ru || RISK_RU_FALLBACK[level] || level;
+}
+
+/** «17.09.2026 22:19 UTC» — без даты отчёт нельзя приложить к решению. */
+function fmtWhen(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} `
+    + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`;
+}
+
+function fmtAge(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  if (seconds < 60) return ", только что";
+  if (seconds < 3600) return `, ${Math.floor(seconds / 60)} мин назад`;
+  if (seconds < 86400) return `, ${Math.floor(seconds / 3600)} ч назад`;
+  return `, ${Math.floor(seconds / 86400)} дн назад`;
+}
 
 // Родной уровень Bitok → подпись рядом с процентом
 const LEVEL_RU = {
@@ -193,9 +245,9 @@ function render(verdict) {
     </div>
     <div class="score">
       <div class="score-bar"><div class="score-fill ${escapeHtml(level)}" style="width:${Math.min(100, score)}%"></div></div>
-      <div class="score-label">Риск ${score}/100 · ${RISK_RU[level] || level}</div>
+      <div class="score-label">Риск ${score}/100 · ${escapeHtml(riskRu(verdict))}</div>
     </div>
-    <div class="meta">Тип: ${TYPE_RU[verdict.entity_type] || verdict.entity_type}</div>
+    <div class="meta">Тип: ${escapeHtml(typeRu(verdict))}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
     <div class="meta">Баланс: ${fmtAmount(verdict.balance_usdt)} USDT · ${fmtAmount(verdict.balance_trx)} TRX</div>
     ${section("Что нашли", flags)}
@@ -204,25 +256,142 @@ function render(verdict) {
     ${clusterBlock}
     ${amlBlock}
     ${sources ? `<div class="sources">Источники: ${escapeHtml(sources)}</div>` : ""}
-    ${verdict.cached ? `<div class="sources">из кеша</div>` : ""}
+    ${verdict.checked_at ? `<div class="sources">Проверено: ${escapeHtml(fmtWhen(verdict.checked_at))}</div>` : ""}
+    ${verdict.cached ? `<div class="sources">из кеша${escapeHtml(fmtAge(verdict.cache_age_seconds))}</div>` : ""}
+    <div class="actions">
+      <button type="button" class="link-btn" data-act="recheck">🔄 Перепроверить</button>
+      <button type="button" class="link-btn" data-act="copy">📋 Скопировать отчёт</button>
+      <a class="link-btn" href="https://tronscan.org/#/address/${encodeURIComponent(verdict.address)}"
+         target="_blank" rel="noopener noreferrer">🔎 TronScan</a>
+    </div>
   `;
   result.classList.remove("hidden");
+  wireActions(verdict);
 }
+
+/** Текстовый отчёт для копирования: то же, что на экране, но без разметки. */
+function verdictToText(v) {
+  const lines = [
+    `Адрес: ${v.address}`,
+    `Вердикт: ${riskRu(v)} · риск ${v.risk_score || 0}/100`,
+    `Тип: ${typeRu(v)}`,
+    `Сущность: ${v.entity || "—"}`,
+    `Баланс: ${fmtAmount(v.balance_usdt)} USDT · ${fmtAmount(v.balance_trx)} TRX`,
+  ];
+  if (v.checked_at) lines.push(`Проверено: ${fmtWhen(v.checked_at)}`);
+  if ((v.risk_flags || []).length) {
+    lines.push("", "Что нашли:");
+    for (const f of v.risk_flags) lines.push(`- ${flagRu(String(f))}`);
+  }
+  if ((v.sources || []).length) {
+    lines.push("", `Источники: ${[...new Set(v.sources)].join(" · ")}`);
+  }
+  return lines.join("\n");
+}
+
+function wireActions(verdict) {
+  const recheck = result.querySelector('[data-act="recheck"]');
+  if (recheck) recheck.addEventListener("click", () => check(verdict.address));
+  const copy = result.querySelector('[data-act="copy"]');
+  if (copy) {
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(verdictToText(verdict));
+        copy.textContent = "✅ Скопировано";
+      } catch {
+        copy.textContent = "⚠️ Не вышло скопировать";
+      }
+      setTimeout(() => { copy.textContent = "📋 Скопировать отчёт"; }, 2000);
+    });
+  }
+}
+
+// ---------- История последних проверок (только в этом браузере) ----------
+// Хранится локально: сервер журнала проверок не ведёт, а возвращаться к
+// адресу, который смотрел вчера, нужно постоянно.
+const HISTORY_KEY = "trc20-history";
+const HISTORY_MAX = 10;
+
+function readHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];   // приватный режим или заблокированное хранилище
+  }
+}
+
+function saveHistory(items) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, HISTORY_MAX)));
+  } catch {
+    /* не критично: история — удобство, а не часть вердикта */
+  }
+}
+
+function rememberCheck(v) {
+  const items = readHistory().filter(x => x.address !== v.address);
+  items.unshift({
+    address: v.address,
+    level: v.risk_level || "unknown",
+    score: v.risk_score || 0,
+    entity: v.entity || "",
+    at: v.checked_at || new Date().toISOString(),
+  });
+  saveHistory(items);
+  renderHistory();
+}
+
+function renderHistory() {
+  const items = readHistory();
+  if (!items.length) {
+    historyBlock.classList.add("hidden");
+    historyList.innerHTML = "";
+    return;
+  }
+  historyBlock.classList.remove("hidden");
+  historyList.innerHTML = items.map(it => `
+    <button type="button" class="history-item" data-addr="${escapeHtml(it.address)}">
+      <span class="dot ${escapeHtml(it.level)}"></span>
+      <span class="history-addr">${escapeHtml(it.address.slice(0, 10))}…${escapeHtml(it.address.slice(-6))}</span>
+      <span class="history-meta">${escapeHtml(it.entity || "—")} · ${it.score}/100</span>
+    </button>
+  `).join("");
+  for (const el of historyList.querySelectorAll(".history-item")) {
+    el.addEventListener("click", () => {
+      input.value = el.dataset.addr;
+      check(el.dataset.addr);
+    });
+  }
+}
+
+clearHistoryBtn.addEventListener("click", () => {
+  saveHistory([]);
+  renderHistory();
+});
 
 function renderError(msg) {
   result.innerHTML = `<div class="error">${escapeHtml(msg)}</div>`;
   result.classList.remove("hidden");
 }
 
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const addr = input.value.trim();
+async function check(rawAddress) {
+  const addr = extractAddress(rawAddress);
   if (!addr) return;
+  input.value = addr;
   btn.disabled = true;
   btn.textContent = "Проверка...";
-  // Проверка идёт десятки секунд (два внешних AML) — показываем, что процесс идёт.
-  result.innerHTML = `<div class="meta">⏳ Проверяю адрес… TronScan · GoPlus · OFAC · Swapster · Bitok</div>`;
+  // Проверка идёт десятки секунд (два платных KYT) — показываем, что процесс идёт.
+  result.innerHTML = `<div class="meta">⏳ Проверяю адрес… TronScan · GoPlus · OFAC · `
+    + `блэклист Tether · Swapster · Bitok<br><small>Два платных KYT считаются `
+    + `десятки секунд — это нормально.</small></div>`;
   result.classList.remove("hidden");
+
+  // Постоянная ссылка: отчёт можно переслать или открыть заново.
+  const url = new URL(window.location);
+  url.searchParams.set("addr", addr);
+  window.history.replaceState({}, "", url);
+
   try {
     const r = await fetch(`/check/${encodeURIComponent(addr)}`);
     if (!r.ok) {
@@ -232,10 +401,24 @@ form.addEventListener("submit", async (e) => {
     }
     const data = await r.json();
     render(data);
+    rememberCheck(data);
   } catch (err) {
     renderError(`Сетевая ошибка: ${err.message}`);
   } finally {
     btn.disabled = false;
     btn.textContent = "Проверить";
   }
+}
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  check(input.value);
 });
+
+// Открытие по ссылке с ?addr=… сразу запускает проверку.
+renderHistory();
+const initial = new URLSearchParams(window.location.search).get("addr");
+if (initial) {
+  input.value = initial;
+  check(initial);
+}

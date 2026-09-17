@@ -5,11 +5,13 @@ import asyncio
 import html
 import logging
 import os
+import time
+from datetime import UTC, datetime
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -18,13 +20,21 @@ from aiogram.types import (
     TelegramObject,
 )
 
-from core import check_address
+from core import check_address, history, labels, watchlist
+from core.addresses import extract_addresses, looks_like_address_attempt
 from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
+# Сколько адресов проверяем из одного сообщения. Проверки последовательны и
+# каждая тратит платные лимиты KYT, поэтому лимит нужен.
+MAX_ADDRESSES_PER_MESSAGE = int(os.getenv("MAX_ADDRESSES_PER_MESSAGE", "5"))
+# Пакетная проверка из файла: лимит выше, но тоже есть — каждая строка платная.
+MAX_ADDRESSES_PER_FILE = int(os.getenv("MAX_ADDRESSES_PER_FILE", "25"))
+BATCH_FILE_MAX_BYTES = int(os.getenv("BATCH_FILE_MAX_BYTES", str(256 * 1024)))
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -111,6 +121,18 @@ class AccessMiddleware(BaseMiddleware):
             return  # обработчик не вызываем
         return await handler(event, data)
 
+_ENTITY_TYPE_VALUES = {e.value for e in EntityType}
+_RISK_LEVEL_VALUES = {r.value for r in RiskLevel}
+
+
+def _level(value: str | None) -> RiskLevel:
+    """Строка из журнала → RiskLevel. Незнакомое значение не должно ронять вывод."""
+    try:
+        return RiskLevel(value)
+    except (ValueError, TypeError):
+        return RiskLevel.UNKNOWN
+
+
 RISK_EMOJI = {
     RiskLevel.SAFE: "🟢",
     RiskLevel.CAUTION: "🟡",
@@ -118,23 +140,11 @@ RISK_EMOJI = {
     RiskLevel.UNKNOWN: "⚪",
 }
 
-TYPE_RU = {
-    EntityType.EXCHANGE: "Биржа",
-    EntityType.CONTRACT: "Смарт-контракт",
-    EntityType.PROJECT: "Проект",
-    EntityType.SCAM: "СКАМ",
-    EntityType.SANCTIONED: "САНКЦИОННЫЙ (OFAC)",
-    EntityType.LABELED: "Маркированный",
-    EntityType.WALLET: "Кошелёк",
-    EntityType.UNKNOWN: "Неизвестно",
-}
-
-RISK_RU = {
-    RiskLevel.SAFE: "БЕЗОПАСНО",
-    RiskLevel.CAUTION: "ОСТОРОЖНО",
-    RiskLevel.DANGEROUS: "ОПАСНО",
-    RiskLevel.UNKNOWN: "НЕТ ДАННЫХ",
-}
+# Подписи типа и уровня берём из core.models (ENTITY_TYPE_RU / RISK_LEVEL_RU)
+# через verdict.entity_type_ru() / risk_level_ru(). Раньше словари дублировались
+# здесь и в web/static/app.js: они расходились при любой правке, а тип SANCTIONED
+# был жёстко подписан «(OFAC)» даже для санкций UK/EU. Плюс новый тип в перечислении
+# ронял рендер по KeyError — теперь подпись приходит из одного места.
 
 
 def _score_bar(score: int) -> str:
@@ -221,6 +231,33 @@ def _esc(x) -> str:
     return html.escape(str(x if x is not None else "—"), quote=False)
 
 
+def _fmt_when(iso: str | None) -> str:
+    """ISO-время проверки → «17.09.2026 22:19 UTC». Без даты отчёт нельзя
+    приложить к решению по операции, поэтому показываем её всегда."""
+    if not iso:
+        return "—"
+    try:
+        ts = datetime.fromisoformat(iso)
+    except ValueError:
+        return str(iso)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC).strftime("%d.%m.%Y %H:%M UTC")
+
+
+def _fmt_age(seconds: int | None) -> str:
+    """«, 3 ч назад» — насколько устарели данные из кеша."""
+    if seconds is None:
+        return ""
+    if seconds < 60:
+        return ", только что"
+    if seconds < 3600:
+        return f", {seconds // 60} мин назад"
+    if seconds < 86400:
+        return f", {seconds // 3600} ч назад"
+    return f", {seconds // 86400} дн назад"
+
+
 def _aml_provider_lines(ext: dict, number: int) -> list[str]:
     """Блок одного внешнего AML-сервиса (Swapster/Bitok) — формат общий."""
     provider = _esc(ext.get("provider") or "AML")
@@ -274,13 +311,27 @@ def _exposure_line(aml: dict) -> list[str]:
         ("other_exposure_pct", "прочее"),
     ):
         value = aml.get(key) or 0
-        if value:
+        if not value:
+            continue
+        # Для санкционных категорий показываем направление: «получено от» и
+        # «отправлено на» — это разные обвинения к адресу.
+        got = aml.get(key.replace("_exposure_pct", "_received_pct")) or 0
+        sent = aml.get(key.replace("_exposure_pct", "_sent_pct")) or 0
+        if got or sent:
+            dirs = []
+            if got:
+                dirs.append(f"↓{_fmt_pct(got)}")
+            if sent:
+                dirs.append(f"↑{_fmt_pct(sent)}")
+            parts.append(f"{title} {_fmt_pct(value)} ({' '.join(dirs)})")
+        else:
             parts.append(f"{title} {_fmt_pct(value)}")
     if not parts:
         return []
     lines = [
         "",
-        f"<b>🧭 Экспозиция</b> <i>(по {aml['transfers_analyzed']} переводам)</i>",
+        f"<b>🧭 Экспозиция</b> <i>(по {aml['transfers_analyzed']} переводам; "
+        f"↓ получено, ↑ отправлено)</i>",
         "• " + " · ".join(parts),
     ]
     if aml.get("indirect_sanctions_pct"):
@@ -292,13 +343,13 @@ def _exposure_line(aml: dict) -> list[str]:
 
 
 def format_verdict(v: AddressVerdict) -> str:
-    emoji = RISK_EMOJI[v.risk_level]
+    emoji = RISK_EMOJI.get(v.risk_level, "⚪")
     lines = [
-        f"{emoji} <b>{RISK_RU[v.risk_level]}</b> · риск {v.risk_score}/100",
+        f"{emoji} <b>{_esc(v.risk_level_ru())}</b> · риск {v.risk_score}/100",
         f"<code>{_score_bar(v.risk_score)}</code>",
         "",
         f"🏷 <b>{_esc(v.entity or '—')}</b>",
-        f"<i>Тип:</i> {TYPE_RU[v.entity_type]}",
+        f"<i>Тип:</i> {_esc(v.entity_type_ru())}",
         f"<code>{_esc(v.address)}</code>",
         f"💰 {_fmt_amount(v.balance_usdt)} USDT · {_fmt_amount(v.balance_trx)} TRX",
     ]
@@ -352,8 +403,10 @@ def format_verdict(v: AddressVerdict) -> str:
     if v.sources:
         lines.append("")
         lines.append(f"<i>Источники: {_esc(' · '.join(dict.fromkeys(v.sources)))}</i>")
+    if v.checked_at:
+        lines.append(f"<i>Проверено: {_esc(_fmt_when(v.checked_at))}</i>")
     if v.cached:
-        lines.append("<i>(из кеша)</i>")
+        lines.append(f"<i>(из кеша{_esc(_fmt_age(v.cache_age_seconds))})</i>")
     return "\n".join(lines)
 
 
@@ -370,8 +423,39 @@ def _verdict_kb(address: str) -> InlineKeyboardMarkup:
 
 
 PROGRESS_TEXT = (
-    "⏳ Проверяю адрес…\n<code>{addr}</code>\n\n"
-    "<i>TronScan · GoPlus · OFAC · Swapster · Bitok</i>"
+    "⏳ Проверяю адрес{counter}…\n<code>{addr}</code>\n\n"
+    "<i>TronScan · GoPlus · OFAC · блэклист Tether · Swapster · Bitok</i>\n"
+    "<i>Два платных KYT считаются десятки секунд — это нормально.</i>"
+)
+
+HELP_TEXT = (
+    "<b>Что я делаю</b>\n"
+    "Определяю, кому принадлежит TRON-адрес (биржа, депозитник биржи, "
+    "смарт-контракт, скам, санкционный, личный кошелёк) и считаю AML-риск.\n\n"
+    "<b>Источники</b>\n"
+    "• TronScan — публичные метки, баланс, признаки токенов\n"
+    "• Переводы TronScan — связи с биржами, экспозиция, 2-й хоп\n"
+    "• OFAC SDN — прямое попадание в санкционный список\n"
+    "• Блэклист Tether — заблокированы ли средства эмитентом USDT\n"
+    "• GoPlus — риск-флаги адреса\n"
+    "• Swapster и Bitok — два независимых платных KYT\n\n"
+    "<b>Как присылать</b>\n"
+    "Просто текстом. Понимаю адрес с пунктуацией вокруг, ссылку на TronScan "
+    f"и hex-формат <code>41…</code>. До {MAX_ADDRESSES_PER_MESSAGE} адресов одним сообщением.\n\n"
+    "<b>Команды</b>\n"
+    "/help — эта справка\n"
+    "/id — ваш Telegram ID (нужен для белого списка)\n"
+    "/status — что сконфигурировано на сервере\n"
+    "/history — последние проверки\n"
+    "/stats — сколько проверок сделано (расход платных лимитов)\n"
+    "/labels, /label, /unlabel — свои метки адресов без редеплоя\n"
+    "/watch, /unwatch, /watchlist — следить за адресом и узнать об изменении\n\n"
+    "<b>Пакетная проверка</b>\n"
+    "Пришлите файлом список адресов (по одному на строку или CSV) — проверю "
+    "по очереди.\n\n"
+    "<b>Важно</b>\n"
+    "«Нет находок» и «не удалось проверить» — разные вещи. Если источник "
+    "недоступен, я пишу об этом первой строкой вердикта."
 )
 
 
@@ -383,61 +467,366 @@ dp.callback_query.middleware(AccessMiddleware())
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Пришлите TRC20-адрес (начинается с <code>T</code>, длина 34 символа).\n\n"
-        "Я определю, кому он принадлежит (биржа, смарт-контракт, скам, кошелёк) "
-        "и проверю AML: наши on-chain связи + два внешних сервиса — "
-        "<b>Swapster</b> и <b>Bitok</b>.\n\n"
-        "Можно прислать до 5 адресов одним сообщением.",
+        "👋 Пришлите TRON-адрес — определю владельца и проверю AML.\n\n"
+        "Понимаю адрес в любом виде: с текстом вокруг, в скобках, ссылкой на "
+        "TronScan или в hex-формате <code>41…</code>.\n\n"
+        f"До {MAX_ADDRESSES_PER_MESSAGE} адресов одним сообщением. Подробнее — /help",
         parse_mode=ParseMode.HTML,
     )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    """Свой ID нужен, чтобы попасть в белый список. Раньше узнать его можно
+    было только получив отказ от бота — то есть не будучи в списке."""
+    uid = message.from_user.id if message.from_user else "?"
+    await message.answer(
+        f"Ваш Telegram ID: <code>{uid}</code>\n\n"
+        "Его добавляют в переменную <code>ALLOWED_TG_IDS</code> на сервере.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    """Что сконфигурировано. Пустые ключи — штатная причина пустых вердиктов,
+    и видеть её должен не только тот, у кого есть доступ к логам."""
+    from core import aml_bitok, aml_external
+    from core.providers import flow as flow_provider
+    from core.providers import goplus, tether
+
+    def mark(ok: bool) -> str:
+        return "✅" if ok else "➖"
+
+    lines = [
+        "<b>Конфигурация сервера</b>",
+        f"{mark(bool(flow_provider.TRONSCAN_API_KEY))} ключ TronScan "
+        f"<i>(без него ниже лимиты)</i>",
+        f"{mark(bool(goplus.GOPLUS_API_KEY))} ключ GoPlus <i>(работает и без него)</i>",
+        f"{mark(tether.is_enabled())} проверка блэклиста Tether",
+        f"{mark(aml_external.is_configured())} Swapster",
+        f"{mark(aml_bitok.is_configured())} Bitok",
+        "",
+        f"Доступ к боту: {len(ALLOWED_TG_IDS)} Telegram ID в белом списке",
+        f"Страниц истории переводов: {flow_provider.FLOW_PAGES} "
+        f"(по {flow_provider.TRANSFERS_LIMIT})",
+    ]
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    """Последние проверки. Возвращаться к уже смотренному адресу приходится
+    постоянно, а раньше его нужно было вводить заново."""
+    items = await history.recent(limit=10)
+    if not items:
+        await message.answer(
+            "Журнал пуст. Он ведётся на диске сервера и наполняется по мере проверок.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>🕘 Последние проверки</b>"]
+    for it in items:
+        emoji = RISK_EMOJI.get(_level(it.get("risk_level")), "⚪")
+        when = _fmt_age(int(time.time() - (it.get("checked_at") or 0))).lstrip(", ")
+        lines.append(
+            f"{emoji} <code>{_esc(it['address'])}</code>\n"
+            f"    {_esc(it.get('entity') or '—')} · {it.get('risk_score', 0)}/100 · {_esc(when)}"
+        )
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Расход платных лимитов KYT по факту, а не по счёту от провайдера."""
+    st = await history.stats()
+    if not st.get("enabled"):
+        await message.answer("Журнал проверок выключен (HISTORY_ENABLED=0).")
+        return
+    by = st.get("by_risk_level") or {}
+    lines = [
+        "<b>📊 Статистика проверок</b>",
+        f"Всего: {st.get('total', 0)} · уникальных адресов: {st.get('unique_addresses', 0)}",
+        f"За последние сутки: {st.get('last_24h', 0)}",
+        "",
+        "<i>По вердиктам:</i>",
+    ]
+    for level, title in (("dangerous", "🔴 опасно"), ("caution", "🟡 осторожно"),
+                         ("safe", "🟢 безопасно"), ("unknown", "⚪ нет данных")):
+        if by.get(level):
+            lines.append(f"• {title}: {by[level]}")
+    lines.append("")
+    lines.append(f"Ручных меток в базе: {labels.count()}")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("labels"))
+async def cmd_labels(message: Message):
+    items = await labels.all_labels(limit=20)
+    if not items:
+        await message.answer(
+            "Ручных меток нет.\n\n"
+            "Добавить: <code>/label АДРЕС тип уровень заметка</code>\n"
+            "Например: <code>/label TR7N… labeled safe наш горячий кошелёк</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>🏷 Ручные метки</b> <i>(наивысший приоритет в вердикте)</i>"]
+    for it in items:
+        lines.append(
+            f"• <code>{_esc(it['address'])}</code> — {_esc(it.get('entity') or '—')}"
+            f" · {_esc(it.get('entity_type') or '?')} · {_esc(it.get('risk_level') or '?')}"
+        )
+    lines.append("")
+    lines.append("Удалить: <code>/unlabel АДРЕС</code>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+_LABEL_USAGE = (
+    "Формат: <code>/label АДРЕС [тип] [уровень] [заметка]</code>\n\n"
+    "тип: exchange, contract, project, scam, sanctioned, high_risk_service, "
+    "frozen, labeled, wallet, unknown\n"
+    "уровень: safe, caution, dangerous, unknown\n\n"
+    "Например:\n"
+    "<code>/label TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t labeled safe наш кошелёк</code>"
+)
+
+
+@dp.message(Command("label"))
+async def cmd_label(message: Message):
+    """Своя метка без правки кода и редеплоя.
+
+    Метка имеет наивысший приоритет в вердикте, поэтому автор записывается в
+    базу: это сильное действие, и должно быть видно, кто его сделал."""
+    parts = (message.text or "").split()
+    addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
+    if not addresses:
+        await message.answer(_LABEL_USAGE, parse_mode=ParseMode.HTML)
+        return
+    addr = addresses[0]
+    rest = parts[2:]
+    entity_type = rest[0] if rest and rest[0] in _ENTITY_TYPE_VALUES else None
+    if entity_type:
+        rest = rest[1:]
+    risk_level = rest[0] if rest and rest[0] in _RISK_LEVEL_VALUES else None
+    if risk_level:
+        rest = rest[1:]
+    note = " ".join(rest) or None
+    author = str(message.from_user.id) if message.from_user else "?"
+    try:
+        saved = await labels.put(
+            addr, entity=note, entity_type=entity_type, risk_level=risk_level,
+            note=None, author=author,
+        )
+    except Exception as e:
+        log.exception("не удалось сохранить метку")
+        await message.answer(f"⚠️ Не удалось сохранить метку: {_esc(e)}",
+                             parse_mode=ParseMode.HTML)
+        return
+    await message.answer(
+        f"✅ Метка сохранена для <code>{_esc(addr)}</code>\n"
+        f"название: {_esc(note or '—')}\n"
+        f"тип: {_esc(saved.get('entity_type') or 'не задан')} · "
+        f"уровень: {_esc(saved.get('risk_level') or 'не задан')}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("unlabel"))
+async def cmd_unlabel(message: Message):
+    parts = (message.text or "").split()
+    addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
+    if not addresses:
+        await message.answer("Формат: <code>/unlabel АДРЕС</code>", parse_mode=ParseMode.HTML)
+        return
+    removed = await labels.delete(addresses[0])
+    await message.answer(
+        f"{'✅ Метка удалена' if removed else 'Метки на этом адресе не было'}: "
+        f"<code>{_esc(addresses[0])}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("watch"))
+async def cmd_watch(message: Message):
+    """Поставить адрес под наблюдение: сообщу, если уровень риска изменится."""
+    addresses = extract_addresses(message.text or "")
+    if not addresses:
+        await message.answer(
+            "Формат: <code>/watch АДРЕС</code>\n\n"
+            "Буду перепроверять адрес и напишу, если уровень риска изменится.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    ok, note = await watchlist.add(addresses[0], message.chat.id)
+    await message.answer(
+        f"{'👁 ' if ok else '⚠️ '}<code>{_esc(addresses[0])}</code>\n{_esc(note)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("unwatch"))
+async def cmd_unwatch(message: Message):
+    addresses = extract_addresses(message.text or "")
+    if not addresses:
+        await message.answer("Формат: <code>/unwatch АДРЕС</code>", parse_mode=ParseMode.HTML)
+        return
+    removed = await watchlist.remove(addresses[0], message.chat.id)
+    await message.answer(
+        f"{'✅ Снято с наблюдения' if removed else 'Этот адрес не был под наблюдением'}: "
+        f"<code>{_esc(addresses[0])}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(Command("watchlist"))
+async def cmd_watchlist(message: Message):
+    items = await watchlist.list_for(message.chat.id)
+    if not items:
+        await message.answer(
+            "Список наблюдения пуст.\n\n"
+            "Добавить: <code>/watch АДРЕС</code> — напишу, когда уровень риска "
+            "изменится.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>👁 Под наблюдением</b>"]
+    for it in items:
+        emoji = RISK_EMOJI.get(_level(it.get("last_level")), "⚪")
+        when = (
+            _fmt_age(int(time.time() - it["last_check"])).lstrip(", ")
+            if it.get("last_check") else "ещё не проверялся"
+        )
+        lines.append(
+            f"{emoji} <code>{_esc(it['address'])}</code>\n"
+            f"    {it.get('last_score') if it.get('last_score') is not None else '—'}/100 · "
+            f"{_esc(when)}"
+        )
+    lines.append("")
+    lines.append("Снять: <code>/unwatch АДРЕС</code>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@dp.message(F.document)
+async def on_document(message: Message):
+    """Пакетная проверка из файла: по адресу на строку или CSV.
+
+    Полезно, когда список контрагентов выгружен из таблицы. Лимит на файл
+    отдельный и заметно выше, чем на сообщение, но всё равно есть: каждая
+    строка — это платная проверка."""
+    doc = message.document
+    if doc.file_size and doc.file_size > BATCH_FILE_MAX_BYTES:
+        await message.answer(
+            f"Файл слишком большой ({doc.file_size} Б). "
+            f"Лимит — {BATCH_FILE_MAX_BYTES} Б."
+        )
+        return
+    bot = message.bot
+    try:
+        buf = await bot.download(doc)
+        text = buf.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.exception("не удалось прочитать файл")
+        await message.answer(f"⚠️ Не удалось прочитать файл: {_esc(e)}",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    addresses = extract_addresses(text, limit=MAX_ADDRESSES_PER_FILE)
+    if not addresses:
+        await message.answer(
+            "В файле не нашёл TRON-адресов. Ожидаю по адресу на строку или CSV "
+            "с адресами в любой колонке."
+        )
+        return
+    await message.answer(
+        f"Нашёл адресов: {len(addresses)}. Проверяю по очереди — каждая "
+        f"проверка занимает десятки секунд."
+    )
+    for i, addr in enumerate(addresses, 1):
+        await _check_one(message, addr, f" ({i} из {len(addresses)})")
 
 
 # Лимит длины сообщения в Telegram — 4096 символов.
 TG_MESSAGE_LIMIT = 4096
 
 
+def _fit_message(text: str) -> str:
+    """Укладывает вердикт в лимит Telegram.
+
+    Режем по границе строки и предупреждаем об обрезке, иначе пользователь не
+    отличит полный отчёт от усечённого. Сам порядок блоков в format_verdict
+    таков, что первыми идут вердикт и находки, а не второстепенное."""
+    if len(text) <= TG_MESSAGE_LIMIT:
+        return text
+    note = "\n<i>…отчёт обрезан, часть блоков не показана</i>"
+    head = text[: TG_MESSAGE_LIMIT - len(note)]
+    if "\n" in head:
+        head = head.rsplit("\n", 1)[0]
+    return head + note
+
+
 async def _check_and_render(addr: str) -> str:
     """Свежая проверка (без кеша — для AML важна актуальность транзакций)."""
-    v = await check_address(addr, use_cache=False)
-    text = format_verdict(v)
-    if len(text) > TG_MESSAGE_LIMIT:
-        text = text[: TG_MESSAGE_LIMIT - 40].rsplit("\n", 1)[0] + "\n<i>…обрезано</i>"
-    return text
+    v = await check_address(addr, use_cache=False, source="bot")
+    return _fit_message(format_verdict(v))
+
+
+async def _check_one(message: Message, addr: str, counter: str = "") -> None:
+    """Одна проверка: сообщение-прогресс, затем правка его же вердиктом."""
+    progress = await message.answer(
+        PROGRESS_TEXT.format(addr=addr, counter=counter), parse_mode=ParseMode.HTML
+    )
+    try:
+        text = await _check_and_render(addr)
+    except Exception as e:
+        log.exception("check failed for %s", addr)
+        await progress.edit_text(
+            f"⚠️ Не удалось проверить <code>{_esc(addr)}</code>: {_esc(e)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await progress.edit_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr)
+    )
 
 
 @dp.message(F.text)
 async def on_text(message: Message):
-    text = (message.text or "").strip()
-    # Поддержка нескольких адресов через пробел/перенос
-    candidates = [c for c in text.split() if c.startswith("T") and len(c) == 34]
-    if not candidates:
-        await message.answer(
-            "Не похоже на TRC20-адрес. Пришлите строку из 34 символов, начинающуюся с <code>T</code>.",
-            parse_mode=ParseMode.HTML,
-        )
+    text = message.text or ""
+    addresses = extract_addresses(text, limit=MAX_ADDRESSES_PER_MESSAGE)
+
+    if not addresses:
+        if looks_like_address_attempt(text):
+            await message.answer(
+                "❌ Похоже на TRON-адрес, но контрольная сумма не сходится — "
+                "проверьте, не потерялся ли символ при копировании.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer(
+                "Не нашёл TRON-адреса. Пришлите его текстом, ссылкой на TronScan "
+                "или в hex-формате <code>41…</code>. Справка — /help",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
-    for addr in candidates[:5]:  # лимит на одно сообщение
-        if not is_valid_trc20_address(addr):
-            await message.answer(
-                f"❌ <code>{addr}</code> — невалидный TRC20-адрес (checksum failed).",
-                parse_mode=ParseMode.HTML,
-            )
-            continue
-        # Проверка идёт десятки секунд (два внешних AML) — показываем прогресс,
-        # затем правим это же сообщение готовым вердиктом.
-        progress = await message.answer(
-            PROGRESS_TEXT.format(addr=addr), parse_mode=ParseMode.HTML
+    total = len(addresses)
+    if total > 1:
+        # Проверки идут последовательно (платные лимиты KYT), поэтому сразу
+        # говорим, сколько их: иначе человек не понимает, сколько ждать.
+        await message.answer(
+            f"Нашёл адресов: {total}. Проверяю по очереди, каждый занимает "
+            f"десятки секунд.",
+            parse_mode=ParseMode.HTML,
         )
-        try:
-            await progress.edit_text(
-                await _check_and_render(addr),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_verdict_kb(addr),
-            )
-        except Exception as e:
-            log.exception("check failed")
-            await progress.edit_text(f"⚠️ Ошибка при проверке: {e}")
+    for i, addr in enumerate(addresses, 1):
+        counter = f" ({i} из {total})" if total > 1 else ""
+        await _check_one(message, addr, counter)
 
 
 @dp.callback_query(F.data.startswith("recheck:"))
@@ -468,8 +857,12 @@ async def main():
         raise RuntimeError("BOT_TOKEN env var is required")
     from core.cache import init_db
     from core.cluster import init_db as init_cluster_db
+    from core.providers.local import LOCAL_LABELS
     await init_db()
     await init_cluster_db()
+    await history.init_db()
+    await labels.init_db(LOCAL_LABELS)
+    await watchlist.init_db()
     log_access_mode(log)
     bot = Bot(BOT_TOKEN)
     await dp.start_polling(bot)

@@ -212,8 +212,19 @@ async def check(address: str) -> dict[str, Any]:
         return {"available": False, "provider": PROVIDER,
                 "reason": "Bitok не настроен (BITOK_API_KEY_ID / BITOK_API_SECRET пусты)"}
 
+    # BITOK_TIMEOUT_SECONDS — НАСТЕННЫЙ бюджет всей проверки, как и обещает
+    # .env.example. Раньше значение уходило только в таймаут httpx и умножалось на
+    # число попыток поллинга: на дефолтах худший случай был ~940 с, и бот всё это
+    # время держал пользователя. Теперь считаем дедлайн от одной точки старта, а
+    # на отдельный запрос даём меньшую долю бюджета.
+    deadline = time.monotonic() + cfg["timeout"]
+    request_timeout = max(5.0, min(cfg["timeout"], 15.0))
+
+    def _left() -> float:
+        return deadline - time.monotonic()
+
     try:
-        async with httpx.AsyncClient(timeout=cfg["timeout"]) as client:
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
             check_data = await _request(
                 client, cfg, "POST", "/v1/manual-checks/check-address/",
                 {"network": cfg["network"], "address": address},
@@ -223,10 +234,9 @@ async def check(address: str) -> dict[str, Any]:
                 return {"available": False, "provider": PROVIDER,
                         "reason": "Bitok: API не вернул id проверки"}
 
-            # Делитель страхуем: POLL_DELAY можно обнулить (тесты) — без деления на 0.
-            attempts = max(int((cfg["timeout"] - 5) / max(POLL_DELAY, 0.5)), 5)
-            for _ in range(attempts):
-                if check_data.get("check_status") != "checking":
+            while check_data.get("check_status") == "checking":
+                # Нужен запас на сам запрос статуса, иначе выйдем за бюджет.
+                if _left() <= POLL_DELAY + 1.0:
                     break
                 await asyncio.sleep(POLL_DELAY)
                 check_data = await _request(client, cfg, "GET", f"/v1/manual-checks/{check_id}/")
@@ -241,8 +251,11 @@ async def check(address: str) -> dict[str, Any]:
                         "details": check_data}
 
             # Сущность и детальные риски — best-effort: их сбой не ломает результат.
+            # Если бюджет исчерпан, отдаём риск без них: скор важнее имени.
             entity = entity_category = None
             risks: list[dict[str, Any]] = []
+            if _left() <= 1.0:
+                return _result(check_data, None, None, [])
             try:
                 exposure = await _request(
                     client, cfg, "GET", f"/v1/manual-checks/{check_id}/address-exposure/")
@@ -264,6 +277,15 @@ async def check(address: str) -> dict[str, Any]:
         return {"available": False, "provider": PROVIDER,
                 "reason": f"Bitok: ошибка соединения ({e})"}
 
+    return _result(check_data, entity, entity_category, risks)
+
+
+def _result(
+    check_data: dict[str, Any],
+    entity: str | None,
+    entity_category: str | None,
+    risks: list[dict[str, Any]],
+) -> dict[str, Any]:
     level_raw = (check_data.get("risk_level") or "undefined").lower()
     return {
         "available": True,
