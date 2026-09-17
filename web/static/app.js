@@ -3,23 +3,57 @@ const input = document.getElementById("addr");
 const btn = document.getElementById("submitBtn");
 const result = document.getElementById("result");
 
-const TYPE_RU = {
+// Подписи типа и уровня приходят готовыми из API (entity_type_ru / risk_level_ru,
+// см. core/models.py). Раньше словари дублировались здесь и в bot/main.py — они
+// расходились при любой правке, а тип sanctioned был жёстко подписан «(OFAC)»
+// даже для санкций UK/EU. Локальные таблицы оставлены только как запасной
+// вариант для ответа старой версии API.
+const TYPE_RU_FALLBACK = {
   exchange: "Биржа",
   contract: "Смарт-контракт",
   project: "Проект",
   scam: "СКАМ",
-  sanctioned: "САНКЦИОННЫЙ (OFAC)",
+  sanctioned: "САНКЦИОННЫЙ",
+  high_risk_service: "Высокорисковый сервис",
+  frozen: "СРЕДСТВА ЗАБЛОКИРОВАНЫ",
   labeled: "Маркированный",
   wallet: "Кошелёк",
   unknown: "Неизвестно",
 };
 
-const RISK_RU = {
+const RISK_RU_FALLBACK = {
   safe: "БЕЗОПАСНО",
   caution: "ОСТОРОЖНО",
   dangerous: "ОПАСНО",
   unknown: "НЕТ ДАННЫХ",
 };
+
+function typeRu(v) {
+  return v.entity_type_ru || TYPE_RU_FALLBACK[v.entity_type] || v.entity_type || "—";
+}
+
+function riskRu(v) {
+  const level = v.risk_level || "unknown";
+  return v.risk_level_ru || RISK_RU_FALLBACK[level] || level;
+}
+
+/** «17.09.2026 22:19 UTC» — без даты отчёт нельзя приложить к решению. */
+function fmtWhen(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} `
+    + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`;
+}
+
+function fmtAge(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  if (seconds < 60) return ", только что";
+  if (seconds < 3600) return `, ${Math.floor(seconds / 60)} мин назад`;
+  if (seconds < 86400) return `, ${Math.floor(seconds / 3600)} ч назад`;
+  return `, ${Math.floor(seconds / 86400)} дн назад`;
+}
 
 // Родной уровень Bitok → подпись рядом с процентом
 const LEVEL_RU = {
@@ -193,9 +227,9 @@ function render(verdict) {
     </div>
     <div class="score">
       <div class="score-bar"><div class="score-fill ${escapeHtml(level)}" style="width:${Math.min(100, score)}%"></div></div>
-      <div class="score-label">Риск ${score}/100 · ${RISK_RU[level] || level}</div>
+      <div class="score-label">Риск ${score}/100 · ${escapeHtml(riskRu(verdict))}</div>
     </div>
-    <div class="meta">Тип: ${TYPE_RU[verdict.entity_type] || verdict.entity_type}</div>
+    <div class="meta">Тип: ${escapeHtml(typeRu(verdict))}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
     <div class="meta">Баланс: ${fmtAmount(verdict.balance_usdt)} USDT · ${fmtAmount(verdict.balance_trx)} TRX</div>
     ${section("Что нашли", flags)}
@@ -204,7 +238,8 @@ function render(verdict) {
     ${clusterBlock}
     ${amlBlock}
     ${sources ? `<div class="sources">Источники: ${escapeHtml(sources)}</div>` : ""}
-    ${verdict.cached ? `<div class="sources">из кеша</div>` : ""}
+    ${verdict.checked_at ? `<div class="sources">Проверено: ${escapeHtml(fmtWhen(verdict.checked_at))}</div>` : ""}
+    ${verdict.cached ? `<div class="sources">из кеша${escapeHtml(fmtAge(verdict.cache_age_seconds))}</div>` : ""}
   `;
   result.classList.remove("hidden");
 }

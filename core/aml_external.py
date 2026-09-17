@@ -102,29 +102,39 @@ async def check(address: str) -> dict[str, Any]:
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    client_kw: dict[str, Any] = {"timeout": cfg["timeout"], "headers": headers}
+    # На ОДИН запрос — меньшая доля бюджета, чтобы два запроса с retry успели
+    # уложиться в общий дедлайн (см. asyncio.timeout ниже).
+    per_request = max(5.0, min(cfg["timeout"], 15.0))
+    client_kw: dict[str, Any] = {"timeout": per_request, "headers": headers}
     if cfg["proxy"]:
         client_kw["proxy"] = cfg["proxy"]
 
+    # SWAPSTER_TIMEOUT_SECONDS — НАСТЕННЫЙ бюджет всей проверки. Раньше значение
+    # ограничивало один запрос, а флоу делает два (PUT + POST), каждый с retry на
+    # 429 и паузой до 10 с: худший случай выходил за две минуты без верхней границы.
     try:
-        async with httpx.AsyncClient(**client_kw) as client:
-            prepared = await _request(
-                client, "PUT", "/aml", cfg, json={"payCurrency": cfg["pay_currency"]}
-            )
-            req_id = prepared.get("reqId")
-            if not req_id:
-                return {"available": False, "provider": PROVIDER,
-                        "reason": "Swapster: API не вернул reqId"}
+        async with asyncio.timeout(cfg["timeout"]):
+            async with httpx.AsyncClient(**client_kw) as client:
+                prepared = await _request(
+                    client, "PUT", "/aml", cfg, json={"payCurrency": cfg["pay_currency"]}
+                )
+                req_id = prepared.get("reqId")
+                if not req_id:
+                    return {"available": False, "provider": PROVIDER,
+                            "reason": "Swapster: API не вернул reqId"}
 
-            data = await _request(
-                client, "POST", "/aml", cfg,
-                json={
-                    "reqId": req_id,
-                    "checkCurrency": cfg["check_currency"],
-                    "checkNetwork": cfg["check_network"],
-                    "address": address,
-                },
-            )
+                data = await _request(
+                    client, "POST", "/aml", cfg,
+                    json={
+                        "reqId": req_id,
+                        "checkCurrency": cfg["check_currency"],
+                        "checkNetwork": cfg["check_network"],
+                        "address": address,
+                    },
+                )
+    except TimeoutError:
+        return {"available": False, "provider": PROVIDER,
+                "reason": f"Swapster: превышен бюджет проверки ({cfg['timeout']:g} с)"}
     except httpx.HTTPStatusError as e:
         code = e.response.status_code
         reason = {

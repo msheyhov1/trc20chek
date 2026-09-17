@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -15,6 +16,10 @@ from .providers import flow, goplus, local, ofac, tronscan
 from .providers.base import ProviderError
 
 log = logging.getLogger(__name__)
+
+# Версия правил скоринга. Меняется, когда меняются пороги или формула — тогда
+# старый сохранённый вердикт читается в контексте тогдашних правил, а не текущих.
+RULESET_VERSION = "2026.09.1"
 
 # Туннель: для этих типов внешний AML-API НЕ запрашивается — биржа/депозитник
 # биржи/контракт — это инфраструктура, её AML-скор ничего не говорит о владельце,
@@ -61,23 +66,42 @@ def _relabel_from_swapster(verdict: AddressVerdict, is_transit: bool) -> None:
 
 
 # Категория сущности Bitok → тип адреса в наших терминах.
+# Покрывает ВСЕ категории из aml_bitok.ENTITY_CATEGORY_RU: это проверяет
+# test_every_bitok_category_has_a_type. Раньше 13 категорий не имели маппинга и
+# падали в LABELED («Маркированный») — среди них mixer и enforcement_action,
+# которой Bitok размечает блокировку Tether, то есть самый жёсткий сигнал для USDT.
 _BITOK_CATEGORY_TYPE = {
+    # биржи и платёжные сервисы
     "exchange": EntityType.EXCHANGE,
-    "high_risk_exchange": EntityType.EXCHANGE,
-    "p2p_exchange": EntityType.EXCHANGE,
     "psp": EntityType.EXCHANGE,
-    "atm": EntityType.EXCHANGE,
     "marketplace": EntityType.PROJECT,
     "nft_marketplace": EntityType.PROJECT,
     "mining_pool": EntityType.PROJECT,
+    "mining": EntityType.PROJECT,
+    "iaas": EntityType.PROJECT,
+    "ico": EntityType.PROJECT,
+    # повышенный риск: не скам, но и не «безопасная биржа»
+    "high_risk_exchange": EntityType.HIGH_RISK_SERVICE,
+    "p2p_exchange": EntityType.HIGH_RISK_SERVICE,
+    "atm": EntityType.HIGH_RISK_SERVICE,
+    "mixer": EntityType.HIGH_RISK_SERVICE,
+    "privacy_protocol": EntityType.HIGH_RISK_SERVICE,
+    "gambling": EntityType.HIGH_RISK_SERVICE,
+    "online_pharmacy": EntityType.HIGH_RISK_SERVICE,
+    "high_risk_jurisdiction": EntityType.HIGH_RISK_SERVICE,
+    # контракты
     "token_contract": EntityType.CONTRACT,
     "smart_contract": EntityType.CONTRACT,
     "dex": EntityType.CONTRACT,
     "lending": EntityType.CONTRACT,
     "bridge": EntityType.CONTRACT,
+    # заблокированные средства
+    "enforcement_action": EntityType.FROZEN,
+    "seized_funds": EntityType.FROZEN,
+    # санкции
     "sanctions": EntityType.SANCTIONED,
     "terrorist_financing": EntityType.SANCTIONED,
-    "high_risk_jurisdiction": EntityType.SANCTIONED,
+    # криминал
     "scam": EntityType.SCAM,
     "fraud_shop": EntityType.SCAM,
     "darknet_market": EntityType.SCAM,
@@ -85,9 +109,24 @@ _BITOK_CATEGORY_TYPE = {
     "stolen_funds": EntityType.SCAM,
     "illegal_service": EntityType.SCAM,
     "cam": EntityType.SCAM,
+    # кошельки и служебное
     "personal_wallet": EntityType.WALLET,
     "custodial_wallet": EntityType.WALLET,
     "unnamed_wallet": EntityType.WALLET,
+    "unnamed_service": EntityType.LABELED,
+    "dust": EntityType.LABELED,
+    "other": EntityType.LABELED,
+    "undefined": EntityType.UNKNOWN,
+}
+
+# Типы, которые сами по себе означают серьёзный риск независимо от того, что
+# сказал внешний сервис в risk_level. Bitok может отдать категорию «sanctions»
+# с родным уровнем «low» — но тип и уровень не должны противоречить друг другу.
+_TYPE_MIN_RISK: dict[EntityType, tuple[int, RiskLevel]] = {
+    EntityType.SANCTIONED: (100, RiskLevel.DANGEROUS),
+    EntityType.FROZEN: (100, RiskLevel.DANGEROUS),
+    EntityType.SCAM: (100, RiskLevel.DANGEROUS),
+    EntityType.HIGH_RISK_SERVICE: (60, RiskLevel.CAUTION),
 }
 
 # Метки, которые считаем «пустыми» — их разрешено перезаписать данными Bitok.
@@ -112,6 +151,8 @@ def _label_from_bitok(verdict: AddressVerdict) -> None:
     category_ru = aml_bitok.category_ru(category)
     verdict.entity = f"{name} · {category_ru}" if category_ru else name
     verdict.entity_type = _BITOK_CATEGORY_TYPE.get(category, EntityType.LABELED)
+    if verdict.entity_type is EntityType.SANCTIONED:
+        verdict.sanction_source = aml_bitok.PROVIDER
     if aml_bitok.PROVIDER not in verdict.sources:
         verdict.sources.append(aml_bitok.PROVIDER)
 
@@ -308,6 +349,36 @@ SANCTIONED_EXCHANGES: dict[str, str] = {
     "tengricoin": "TengriCoin",
 }
 SANCTIONED_EXCHANGE_NAMES = set(SANCTIONED_EXCHANGES.values())
+
+# Каноническое имя → какой орган внёс биржу в список. Нужно, чтобы отчёт не
+# ссылался на OFAC там, где санкция британская или европейская: уровень риска
+# можно перепроверить, а ссылка на конкретный список читается как факт.
+# Покрытие проверяет test_every_sanctioned_exchange_has_a_source.
+SANCTIONED_EXCHANGE_SOURCE: dict[str, str] = {
+    "HTX (Huobi)": "UK · EU",
+    "EXMO": "UK · EU",
+    "Bitpapa": "UK · EU",
+    "Rapira": "UK · EU",
+    "Aifory": "UK · EU",
+    "Arvix": "UK · EU",
+    "ABCEX": "UK · EU",
+    "Garantex": "OFAC",
+    "Grinex": "OFAC",
+    "Cryptex": "OFAC",
+    "Nobitex": "OFAC",
+    "Wallex": "OFAC",
+    "Bitpin": "OFAC",
+    "Ramzinex": "OFAC",
+    "Shelbit": "OFAC",
+    "Aban Tether": "OFAC",
+    "Bitcoin Xchange": "OFAC",
+    "WhiteBird": "EU",
+    "NoOne": "EU",
+    "Tradex (Brightum)": "EU",
+    "Monease": "EU",
+    "Exnode": "EU",
+    "TengriCoin": "EU",
+}
 
 # 2-хоп анализ связанных кошельков (косвенная санкционная экспозиция).
 # Раскрываем топ-N неизвестных посредников и смотрим ИХ санкционную экспозицию.
@@ -932,6 +1003,8 @@ def _compute_aml(
 
     # Известный ЛЕГАЛЬНЫЙ сервис (биржа/контракт, НЕ санкционный): косвенная
     # экспозиция через него ОЖИДАЕМА и не делает его грязным.
+    # HIGH_RISK_SERVICE сюда НЕ входит: биржа без KYC, P2P и миксер не получают
+    # поддавка «через сервис течёт всё подряд».
     known_service = (
         verdict.entity_type in (EntityType.EXCHANGE, EntityType.CONTRACT)
         and not self_sanctioned_exch
@@ -954,6 +1027,7 @@ def _compute_aml(
     # ---- Прямое попадание в OFAC ----
     if direct:
         verdict.entity_type = EntityType.SANCTIONED
+        verdict.sanction_source = "OFAC SDN"
         if not verdict.entity or verdict.entity == "No public labels":
             verdict.entity = "Санкционный адрес (OFAC SDN)"
         verdict.risk_flags.insert(0, "🚨 Адрес в санкционном списке OFAC SDN")
@@ -962,14 +1036,17 @@ def _compute_aml(
 
     # ---- Сам адрес — кошелёк санкционной биржи ----
     elif self_sanctioned_exch:
+        exch_name = deposit_pattern.get("exchange") or verdict.entity or ""
+        src = SANCTIONED_EXCHANGE_SOURCE.get(exch_name, "UK · EU · OFAC")
         verdict.entity_type = EntityType.SANCTIONED
+        verdict.sanction_source = src
         verdict.entity = f"{verdict.entity} (санкционная биржа)"
         verdict.risk_flags.insert(
             0,
-            "🚨 Депозитный адрес санкционной биржи (UK/OFAC) — средства уходят "
-            "в санкционную инфраструктуру, могут быть заморожены"
+            f"🚨 Депозитный адрес санкционной биржи ({src}) — средства уходят "
+            f"в санкционную инфраструктуру, могут быть заморожены"
             if sanctioned_deposit
-            else "🚨 Хот-кошелёк санкционной биржи (UK/OFAC)",
+            else f"🚨 Хот-кошелёк санкционной биржи ({src})",
         )
 
     # ---- GoPlus critical на самом адресе ----
@@ -977,10 +1054,22 @@ def _compute_aml(
         verdict.entity_type = EntityType.SCAM
         verdict.entity = verdict.entity or "Вредоносный адрес (GoPlus)"
 
+    # ---- Тип сам по себе задаёт нижнюю границу риска ----
+    # Метка от внешнего сервиса может прийти с мягким уровнем (Bitok умеет отдать
+    # категорию «sanctions» с родным уровнем «low»). Тип и уровень не должны
+    # противоречить друг другу: иначе в отчёте одновременно «САНКЦИОННЫЙ» и
+    # «НЕТ ДАННЫХ · риск 0/100».
+    floor = _TYPE_MIN_RISK.get(verdict.entity_type)
+    if floor:
+        min_score, min_level = floor
+        verdict.risk_score = max(verdict.risk_score, min_score)
+        if _RISK_ORDER[min_level] > _RISK_ORDER[verdict.risk_level]:
+            verdict.risk_level = min_level
+
     # ---- Синтез risk_level ----
     direct_danger = (
         direct or self_sanctioned_exch or bool(goplus_critical)
-        or verdict.entity_type in (EntityType.SCAM, EntityType.SANCTIONED)
+        or verdict.entity_type in (EntityType.SCAM, EntityType.SANCTIONED, EntityType.FROZEN)
     )
     if direct_danger:
         verdict.risk_level = RiskLevel.DANGEROUS
@@ -989,7 +1078,10 @@ def _compute_aml(
             verdict.risk_level = RiskLevel.DANGEROUS
         elif verdict.risk_score >= 20:
             verdict.risk_level = RiskLevel.CAUTION
-    # иначе оставляем то, что выставил TronScan (SAFE для биржи и т.п.)
+    elif verdict.risk_level is RiskLevel.UNKNOWN:
+        # Опознанный легальный сервис без находок — это «безопасно», а не «нет
+        # данных». Раньше метка биржи от внешнего AML оставляла уровень UNKNOWN.
+        verdict.risk_level = RiskLevel.SAFE
 
     # ---- Поясняющие флаги экспозиции ----
     if vol["sanctions"] > 0 and not direct:
@@ -1008,6 +1100,12 @@ def _compute_aml(
             f"Косвенная связь с санкциями через {n} посредник(ов): "
             f"~{indirect_pct}% объёма (2-й хоп)"
         )
+
+    # ---- Внешние KYT — последний штрих ОДНОГО расчёта ----
+    # Раньше это был отдельный проход уже после _compute_aml, из-за чего метка от
+    # Swapster/Bitok меняла тип адреса, а скор оставался посчитанным для прежнего
+    # типа. Теперь всё считается один раз и в одном месте.
+    _apply_external_aml_risk(verdict)
 
 
 async def _apply_cluster(verdict: AddressVerdict) -> None:
@@ -1041,24 +1139,54 @@ async def _apply_cluster(verdict: AddressVerdict) -> None:
 
 
 def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
+    """Ручные метки — НАИВЫСШИЙ приоритет, поэтому вызывается последней.
+
+    Раньше вызов стоял до внешних AML, и KYT переопределял ручную метку: свой
+    доверенный адрес нельзя было пометить безопасным. Оператор, который вручную
+    разметил адрес, знает о нём больше, чем платный сервис, поэтому заданный
+    локально уровень — окончательный. Когда локальная метка понижает риск, это
+    видно в выводе отдельной строкой, а не молча."""
     if not data:
         return
     verdict.raw_labels["local"] = data
     verdict.sources.append("Local DB")
-    # Локальные метки имеют наивысший приоритет
     verdict.entity = data.get("entity") or verdict.entity
     if data.get("entity_type"):
         try:
             verdict.entity_type = EntityType(data["entity_type"])
         except ValueError:
-            pass
+            log.warning("Local label: неизвестный entity_type %r", data["entity_type"])
     if data.get("risk_level"):
         try:
-            verdict.risk_level = RiskLevel(data["risk_level"])
+            new_level = RiskLevel(data["risk_level"])
         except ValueError:
-            pass
+            log.warning("Local label: неизвестный risk_level %r", data["risk_level"])
+        else:
+            lowered = _RISK_ORDER[new_level] < _RISK_ORDER[verdict.risk_level]
+            if lowered:
+                verdict.risk_flags.append(
+                    f"📝 Уровень понижен до «{new_level.value}» ручной локальной меткой "
+                    f"(было «{verdict.risk_level.value}», скор {verdict.risk_score})"
+                )
+            verdict.risk_level = new_level
+            if new_level is RiskLevel.SAFE:
+                verdict.risk_score = min(verdict.risk_score, 10)
     if data.get("note"):
         verdict.risk_flags.append(f"Local note: {data['note']}")
+
+
+def _cache_age(checked_at: str | None) -> int | None:
+    """Возраст кешированного вердикта в секундах. None, если дата неизвестна
+    (вердикт сохранён версией без checked_at)."""
+    if not checked_at:
+        return None
+    try:
+        ts = datetime.fromisoformat(checked_at)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0, int(datetime.now(timezone.utc).timestamp() - ts.timestamp()))
 
 
 async def _guarded(name: str, coro, default):
@@ -1146,6 +1274,7 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         if cached:
             v = AddressVerdict.from_dict(cached)
             v.cached = True
+            v.cache_age_seconds = _cache_age(v.checked_at)
             return v
 
     # Параллельный запрос провайдеров. Сбой одного не отменяет остальные, но
@@ -1192,7 +1321,6 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
                 log.warning("2-й хоп недоступен: %s", e)
                 verdict.provider_status["hop2"] = "error"
 
-    _compute_aml(verdict, flow_data, sanctioned, hop2, token_summary)
     if hop2 and hop2.get("flagged"):
         verdict.sources.append("TronScan flow (2-hop)")
 
@@ -1200,19 +1328,14 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     # обогащаем вердикт числом родственных депозитников того же якоря/биржи.
     await _apply_cluster(verdict)
 
-    _apply_local(local.lookup(address), verdict)
-
-    # Fallback: нет публичной метки. risk_level НЕ трогаем — его уже выставил
-    # _compute_aml (у адреса может быть реальный риск от экспозиции/2-хопа).
-    if verdict.entity_type == EntityType.UNKNOWN and not verdict.entity:
-        verdict.entity = "No public labels"
-
-    # Баланс кошелька (из уже полученного ответа TronScan)
+    # Баланс кошелька (из уже полученного ответа TronScan). Нужен до внешних AML:
+    # по нему определяется транзитность для релейбла Swapster.
     verdict.balance_trx, verdict.balance_usdt = balance.extract_balances(ts_data)
 
-    # Туннель: биржа/контракт/скам/санкции → внешние AML не зовём.
-    # Обычный кошелёк (WALLET/UNKNOWN/LABELED) → спрашиваем ОБА внешних AML
-    # (Swapster + Bitok) параллельно: они независимы, ждём максимум одного.
+    # ---- Фаза меток: внешние KYT ----
+    # Туннель: биржа/контракт → внешние AML не зовём (их скор ничего не говорит о
+    # владельце инфраструктуры). Решение принимается по ON-CHAIN типу, до расчёта
+    # риска. Скам/санкции туннель НЕ отсекает: там второе мнение ценно.
     if verdict.entity_type in _AML_SKIP_TYPES:
         reason = "биржа/сервис — внешний AML не требуется"
         verdict.external_aml = {"skipped": True, "reason": reason}
@@ -1231,11 +1354,27 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
         _relabel_from_swapster(verdict, transit)
         # Bitok знает имя сущности off-chain — используем, если меток нет вообще.
         _label_from_bitok(verdict)
-        # Оба сервиса могут ПОВЫСИТЬ итоговый риск (понизить — никогда).
-        _apply_external_aml_risk(verdict)
+
+    # ---- Фаза расчёта: ОДИН раз, когда все метки собраны ----
+    # Порядок важен: раньше риск считался до внешних AML, и их метка меняла тип
+    # адреса уже после расчёта. Получались взаимоисключающие строки в отчёте —
+    # «Тип: САНКЦИОННЫЙ» рядом с «НЕТ ДАННЫХ · риск 0/100», а переклеймённая в
+    # биржу сущность сохраняла «кошельковый» скор.
+    _compute_aml(verdict, flow_data, sanctioned, hop2, token_summary)
+
+    # Fallback: нет публичной метки. risk_level НЕ трогаем — его уже выставил
+    # _compute_aml (у адреса может быть реальный риск от экспозиции/2-хопа).
+    if verdict.entity_type == EntityType.UNKNOWN and not verdict.entity:
+        verdict.entity = "No public labels"
+
+    # Ручные метки — последними: у них наивысший приоритет (см. _apply_local).
+    _apply_local(local.lookup(address), verdict)
 
     # Один явный флаг, если какой-то источник не ответил.
     _apply_provider_gaps(verdict)
+
+    verdict.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    verdict.ruleset_version = RULESET_VERSION
 
     # Кеш
     if use_cache:

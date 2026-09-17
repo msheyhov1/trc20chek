@@ -588,13 +588,19 @@ def _bitok(risk_level="none", score=0.0, entity=None, category=None, entities=No
 
 @pytest.mark.asyncio
 async def test_bitok_labels_unlabeled_address():
-    """У TronScan меток нет, но Bitok знает сущность → берём её имя и тип."""
+    """У TronScan меток нет, но Bitok знает сущность → берём её имя и тип.
+
+    `enforcement_action` — это категория, которой Bitok размечает блокировку
+    Tether: средства физически неподвижны, поэтому тип FROZEN, а не нейтральный
+    «Маркированный», как было раньше."""
     ext = _bitok("severe", 100.0, "Tether blacklist - TQ8a74", "enforcement_action")
     with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
          patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
          patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
         v = await check_address(VALID_ADDR, use_cache=False)
-    assert v.entity_type == EntityType.LABELED
+    assert v.entity_type == EntityType.FROZEN
+    assert v.risk_level == RiskLevel.DANGEROUS
+    assert v.risk_score == 100
     assert "Tether blacklist" in (v.entity or "")
     assert "правоохранительная блокировка" in (v.entity or "")
     assert "Bitok" in v.sources
@@ -792,8 +798,150 @@ async def test_sanctioned_iranian_exchange_hot_wallet():
     assert v.risk_level == RiskLevel.DANGEROUS
     assert v.risk_score == 100
     assert "Nobitex" in (v.entity or "")
-    # Туннель не должен отключать второе мнение для санкционного адреса
-    assert not v.external_aml.get("skipped")
+    assert v.sanction_source == "OFAC"      # не «OFAC» по умолчанию, а по факту
+    # Туннель считает адрес инфраструктурой биржи и не тратит платный KYT —
+    # но это НЕ маскирует риск: вердикт всё равно максимальный.
+    assert v.external_aml.get("skipped") is True
+
+
+@pytest.mark.asyncio
+async def test_sanctioned_exchange_source_is_not_always_ofac():
+    """UK/EU-санкции не должны подписываться ссылкой на список США."""
+    ts_resp = {"address": VALID_ADDR, "publicTag": "HTX 1"}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts_resp)), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert v.sanction_source == "UK · EU"
+    assert v.entity_type_ru() == "САНКЦИОННЫЙ (UK · EU)"
+    assert not any("OFAC" in f for f in v.risk_flags)
+
+
+def test_every_sanctioned_exchange_has_a_source():
+    from core.aggregator import SANCTIONED_EXCHANGE_NAMES, SANCTIONED_EXCHANGE_SOURCE
+    missing = SANCTIONED_EXCHANGE_NAMES - set(SANCTIONED_EXCHANGE_SOURCE)
+    assert not missing, f"не указан орган, внёсший биржу в список: {sorted(missing)}"
+
+
+def test_every_bitok_category_has_a_type():
+    """Новая категория Bitok без маппинга молча падала в «Маркированный» —
+    так терялись mixer и enforcement_action (блокировка Tether)."""
+    from core.aggregator import _BITOK_CATEGORY_TYPE
+    from core.aml_bitok import ENTITY_CATEGORY_RU
+    missing = set(ENTITY_CATEGORY_RU) - set(_BITOK_CATEGORY_TYPE)
+    assert not missing, f"категории Bitok без типа адреса: {sorted(missing)}"
+
+
+@pytest.mark.asyncio
+async def test_bitok_mixer_is_high_risk_service_not_plain_label():
+    ext = _bitok("medium", 50.0, "Some mixer", "mixer")
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.HIGH_RISK_SERVICE
+    assert v.risk_score >= 60
+    assert v.risk_level in (RiskLevel.CAUTION, RiskLevel.DANGEROUS)
+
+
+@pytest.mark.asyncio
+async def test_bitok_sanctions_category_with_soft_level_is_still_dangerous():
+    """Bitok умеет отдать категорию «sanctions» с родным уровнем «low».
+    Тип и уровень не должны противоречить друг другу в одном отчёте."""
+    ext = _bitok("low", 5.0, "OFAC-related wallet", "sanctions")
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
+        v = await check_address(VALID_ADDR, use_cache=False)
+    assert v.entity_type == EntityType.SANCTIONED
+    assert v.risk_level == RiskLevel.DANGEROUS      # было UNKNOWN + скор 0
+    assert v.risk_score == 100
+    assert v.sanction_source == "Bitok"
+    assert v.entity_type_ru() == "САНКЦИОННЫЙ (Bitok)"
+
+
+@pytest.mark.asyncio
+async def test_swapster_relabel_gets_service_score_not_wallet_score():
+    """Переклеймённая в биржу сущность должна считаться как сервис.
+    Раньше тип менялся ПОСЛЕ расчёта, и скор оставался «кошельковым»."""
+    addr = VALID_ADDR
+    transfers = [
+        _usdt("TBybit", addr, 90_000_000, from_tag="Bybit"),
+        _usdt(addr, SANCTIONED_ADDR, 10_000_000),
+        _usdt(addr, "Tsink", 80_000_000),
+    ]
+    sw = {
+        "available": True, "provider": "Swapster", "pending": False,
+        "risk_score": 3.0, "risk_level": "safe",
+        "entities": [{"entity": "EXCHANGE LICENSED", "level": "LOW_RISK", "risk_score": 99.0}],
+    }
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.ofac.fetch_sanctioned_set",
+               new=AsyncMock(return_value={SANCTIONED_ADDR})), \
+         patch("core.aggregator.aml_external.check", new=AsyncMock(return_value=sw)):
+        v = await check_address(addr, use_cache=False)
+    assert v.entity_type == EntityType.EXCHANGE
+    assert v.risk_level == RiskLevel.SAFE
+    assert v.risk_score <= 10        # правило known_service применилось
+    assert v.aml["sanctions_exposure_pct"] > 0   # но экспозиция показана честно
+
+
+# ---------- Ручные метки: наивысший приоритет ----------
+
+@pytest.mark.asyncio
+async def test_local_label_wins_over_external_aml():
+    """Свой доверенный адрес можно пометить безопасным: раньше KYT поднимал его
+    обратно, потому что _apply_local вызывался ДО внешних AML."""
+    from core.providers import local as local_provider
+
+    local_provider.LOCAL_LABELS[VALID_ADDR] = {
+        "entity": "Наш горячий кошелёк",
+        "entity_type": "labeled",
+        "risk_level": "safe",
+        "note": "внутренний адрес команды",
+    }
+    try:
+        ext = _bitok("medium", 55.0)
+        with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+             patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)), \
+             patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=ext)):
+            v = await check_address(VALID_ADDR, use_cache=False)
+    finally:
+        del local_provider.LOCAL_LABELS[VALID_ADDR]
+    assert v.entity == "Наш горячий кошелёк"
+    assert v.risk_level == RiskLevel.SAFE      # было caution
+    assert v.risk_score <= 10
+    assert any("понижен" in f for f in v.risk_flags)   # понижение не молчаливое
+
+
+# ---------- checked_at / версия правил / возраст кеша ----------
+
+@pytest.mark.asyncio
+async def test_verdict_carries_timestamp_and_ruleset(tmp_path, monkeypatch):
+    from core import cache
+    from core.aggregator import RULESET_VERSION
+    monkeypatch.setattr(cache, "CACHE_PATH", tmp_path / "cache.db")
+    await cache.init_db()
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security", new=AsyncMock(return_value=EMPTY_GP)):
+        fresh = await check_address(VALID_ADDR, use_cache=True)
+        restored = await check_address(VALID_ADDR, use_cache=True)
+    assert fresh.checked_at and fresh.checked_at.endswith("+00:00")
+    assert fresh.ruleset_version == RULESET_VERSION
+    assert fresh.cache_age_seconds is None
+    assert restored.cached is True
+    assert restored.checked_at == fresh.checked_at      # дата ПРОВЕРКИ, не выдачи
+    assert restored.cache_age_seconds is not None and restored.cache_age_seconds >= 0
+    assert "checked_at" in fresh.to_dict()
+
+
+def test_cache_age_handles_missing_and_broken_timestamp():
+    from core.aggregator import _cache_age
+    assert _cache_age(None) is None
+    assert _cache_age("не дата") is None
+    assert _cache_age("2020-01-01T00:00:00+00:00") > 0
 
 
 # ---------- provider_status: сбой источника виден в вердикте ----------
@@ -880,7 +1028,7 @@ async def test_cache_roundtrip_keeps_every_field(tmp_path, monkeypatch):
 def test_from_dict_tolerates_unknown_enum_values():
     """Старый кеш с неизвестным типом не должен ронять восстановление."""
     v = AddressVerdict.from_dict(
-        {"address": VALID_ADDR, "entity_type": "frozen", "risk_level": "extreme"}
+        {"address": VALID_ADDR, "entity_type": "quantum_wallet", "risk_level": "extreme"}
     )
     assert v.entity_type == EntityType.UNKNOWN
     assert v.risk_level == RiskLevel.UNKNOWN

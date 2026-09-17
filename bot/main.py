@@ -5,6 +5,7 @@ import asyncio
 import html
 import logging
 import os
+from datetime import datetime, timezone
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -19,7 +20,7 @@ from aiogram.types import (
 )
 
 from core import check_address
-from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
+from core.models import AddressVerdict, RiskLevel, is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -118,23 +119,11 @@ RISK_EMOJI = {
     RiskLevel.UNKNOWN: "⚪",
 }
 
-TYPE_RU = {
-    EntityType.EXCHANGE: "Биржа",
-    EntityType.CONTRACT: "Смарт-контракт",
-    EntityType.PROJECT: "Проект",
-    EntityType.SCAM: "СКАМ",
-    EntityType.SANCTIONED: "САНКЦИОННЫЙ (OFAC)",
-    EntityType.LABELED: "Маркированный",
-    EntityType.WALLET: "Кошелёк",
-    EntityType.UNKNOWN: "Неизвестно",
-}
-
-RISK_RU = {
-    RiskLevel.SAFE: "БЕЗОПАСНО",
-    RiskLevel.CAUTION: "ОСТОРОЖНО",
-    RiskLevel.DANGEROUS: "ОПАСНО",
-    RiskLevel.UNKNOWN: "НЕТ ДАННЫХ",
-}
+# Подписи типа и уровня берём из core.models (ENTITY_TYPE_RU / RISK_LEVEL_RU)
+# через verdict.entity_type_ru() / risk_level_ru(). Раньше словари дублировались
+# здесь и в web/static/app.js: они расходились при любой правке, а тип SANCTIONED
+# был жёстко подписан «(OFAC)» даже для санкций UK/EU. Плюс новый тип в перечислении
+# ронял рендер по KeyError — теперь подпись приходит из одного места.
 
 
 def _score_bar(score: int) -> str:
@@ -221,6 +210,33 @@ def _esc(x) -> str:
     return html.escape(str(x if x is not None else "—"), quote=False)
 
 
+def _fmt_when(iso: str | None) -> str:
+    """ISO-время проверки → «17.09.2026 22:19 UTC». Без даты отчёт нельзя
+    приложить к решению по операции, поэтому показываем её всегда."""
+    if not iso:
+        return "—"
+    try:
+        ts = datetime.fromisoformat(iso)
+    except ValueError:
+        return str(iso)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+
+def _fmt_age(seconds: int | None) -> str:
+    """«, 3 ч назад» — насколько устарели данные из кеша."""
+    if seconds is None:
+        return ""
+    if seconds < 60:
+        return ", только что"
+    if seconds < 3600:
+        return f", {seconds // 60} мин назад"
+    if seconds < 86400:
+        return f", {seconds // 3600} ч назад"
+    return f", {seconds // 86400} дн назад"
+
+
 def _aml_provider_lines(ext: dict, number: int) -> list[str]:
     """Блок одного внешнего AML-сервиса (Swapster/Bitok) — формат общий."""
     provider = _esc(ext.get("provider") or "AML")
@@ -292,13 +308,13 @@ def _exposure_line(aml: dict) -> list[str]:
 
 
 def format_verdict(v: AddressVerdict) -> str:
-    emoji = RISK_EMOJI[v.risk_level]
+    emoji = RISK_EMOJI.get(v.risk_level, "⚪")
     lines = [
-        f"{emoji} <b>{RISK_RU[v.risk_level]}</b> · риск {v.risk_score}/100",
+        f"{emoji} <b>{_esc(v.risk_level_ru())}</b> · риск {v.risk_score}/100",
         f"<code>{_score_bar(v.risk_score)}</code>",
         "",
         f"🏷 <b>{_esc(v.entity or '—')}</b>",
-        f"<i>Тип:</i> {TYPE_RU[v.entity_type]}",
+        f"<i>Тип:</i> {_esc(v.entity_type_ru())}",
         f"<code>{_esc(v.address)}</code>",
         f"💰 {_fmt_amount(v.balance_usdt)} USDT · {_fmt_amount(v.balance_trx)} TRX",
     ]
@@ -352,8 +368,10 @@ def format_verdict(v: AddressVerdict) -> str:
     if v.sources:
         lines.append("")
         lines.append(f"<i>Источники: {_esc(' · '.join(dict.fromkeys(v.sources)))}</i>")
+    if v.checked_at:
+        lines.append(f"<i>Проверено: {_esc(_fmt_when(v.checked_at))}</i>")
     if v.cached:
-        lines.append("<i>(из кеша)</i>")
+        lines.append(f"<i>(из кеша{_esc(_fmt_age(v.cache_age_seconds))})</i>")
     return "\n".join(lines)
 
 
