@@ -190,9 +190,9 @@ def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
             continue
         provider = ext.get("provider") or "AML"
         pct = ext.get("risk_score")
-        if isinstance(pct, (int, float)):
+        if isinstance(pct, int | float):
             verdict.risk_score = max(verdict.risk_score, int(round(pct)))
-        detail = f" — {pct:g}%" if isinstance(pct, (int, float)) else ""
+        detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
         top = (ext.get("entities") or [{}])[0].get("entity") or ext.get("entity_category_ru")
         reason = f" ({top})" if top else ""
         verdict.risk_flags.append(

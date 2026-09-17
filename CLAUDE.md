@@ -166,6 +166,9 @@ CACHE_PATH=./cache.db CLUSTER_PATH=./cluster.db HISTORY_PATH=./history.db \
 LABELS_PATH=./labels.db WATCHLIST_PATH=./watchlist.db pytest -q
 
 ruff check .                                  # линтер
+# ВАЖНО: версия ruff закреплена в requirements-dev.txt и именно она стоит в CI.
+# Другая локальная версия даёт другой набор правил: UP038 есть в 0.6.9 и убрано
+# в 0.15 — локально было «All checks passed», а CI падал. Ставьте из файла.
 coverage run -m pytest -q && coverage report  # покрытие
 
 # Локальный запуск
