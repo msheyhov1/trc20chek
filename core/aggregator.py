@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -1185,8 +1185,8 @@ def _cache_age(checked_at: str | None) -> int | None:
     except ValueError:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return max(0, int(datetime.now(timezone.utc).timestamp() - ts.timestamp()))
+        ts = ts.replace(tzinfo=UTC)
+    return max(0, int(datetime.now(UTC).timestamp() - ts.timestamp()))
 
 
 async def _guarded(name: str, coro, default):
@@ -1373,7 +1373,7 @@ async def check_address(address: str, use_cache: bool = True) -> AddressVerdict:
     # Один явный флаг, если какой-то источник не ответил.
     _apply_provider_gaps(verdict)
 
-    verdict.checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    verdict.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
     verdict.ruleset_version = RULESET_VERSION
 
     # Кеш

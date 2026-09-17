@@ -115,10 +115,13 @@ async def _init_storage(name: str, init) -> None:
         storage_status[name] = "ok"
     except Exception as e:
         storage_status[name] = "unavailable"
+        what = "кеш проверок выключен" if name == "cache" else (
+            "кластеризация депозитников выключена"
+        )
         log.error(
-            "Хранилище %s недоступно (%s): сервис работает, но %s выключено. "
+            "Хранилище %s недоступно (%s): сервис работает, но %s. "
             "Проверьте, что volume смонтирован на /data (см. DEPLOY_PLAN.md).",
-            name, e, "кеш" if name == "cache" else "кластеризация депозитников",
+            name, e, what,
         )
 
 

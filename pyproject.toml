@@ -1,0 +1,26 @@
+[tool.ruff]
+# Существующий стиль проекта: длинные строки с вложенными `with patch(...)` в
+# тестах и подробные комментарии в ядре. 120 покрывает их без переформатирования.
+line-length = 120
+target-version = "py312"
+extend-exclude = ["docs/research"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    # FastAPI-идиома: Depends() в значении по умолчанию — так устроен сам фреймворк.
+    "B008",
+    # str+Enum вместо StrEnum. Менять базовый класс перечислений в сервисе
+    # скоринга рисков ради стиля не стоит: у StrEnum другое поведение str()
+    # и f-строк, а значения этих перечислений уходят в JSON, кеш и сравнения.
+    "UP042",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["core", "api", "bot"]
+omit = ["*/__pycache__/*"]

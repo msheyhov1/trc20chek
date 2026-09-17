@@ -5,7 +5,7 @@ import asyncio
 import html
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -220,8 +220,8 @@ def _fmt_when(iso: str | None) -> str:
     except ValueError:
         return str(iso)
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC).strftime("%d.%m.%Y %H:%M UTC")
 
 
 def _fmt_age(seconds: int | None) -> str:

@@ -6,7 +6,7 @@
 | Файл | Что это | Как воспроизвести |
 |---|---|---|
 | `keccak_selectors.py` | Чистый Python Keccak-256 с самопроверкой; печатает селекторы функций контракта USDT-TRC20 | `python docs/research/keccak_selectors.py` |
-| `ofac_sanctioned_trx_2026-09-17.txt` | Снимок `sanctioned_addresses_TRX.txt` из `0xB10C/ofac-sanctioned-digital-currency-addresses` (ветка `lists`) на дату проверки: 254 адреса | `curl -sS https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_TRX.txt` |
+| `../../core/data/ofac_sanctioned_trx.txt` | Снимок `sanctioned_addresses_TRX.txt` из `0xB10C/ofac-sanctioned-digital-currency-addresses` (ветка `lists`) на дату проверки: 254 адреса. Лежит внутри пакета `core`, потому что используется как запасной список в рантайме (`core/providers/ofac.py`) и должен попадать в образ | `curl -sS https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_TRX.txt` |
 
 Ключевой результат скрипта: селектор `isBlackListed(address)` = `0xe47d6060`.
 Строчный вариант `isBlacklisted(address)` даёт `0xfe575a87` — это другая функция,

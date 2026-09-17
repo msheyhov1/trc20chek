@@ -1,0 +1,6 @@
+# Только для разработки и CI. В продакшн-образ не устанавливается.
+-r requirements.txt
+pytest==8.3.3
+pytest-asyncio==0.24.0
+coverage==7.6.1
+ruff==0.6.9

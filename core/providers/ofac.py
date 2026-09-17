@@ -30,11 +30,10 @@ SANCTIONS_URL = (
 )
 REFRESH_SECONDS = 24 * 3600
 
-# Снимок списка на дату проверки источников — запасной вариант при недоступном GitHub.
-BUNDLED_PATH = (
-    Path(__file__).resolve().parent.parent.parent
-    / "docs" / "research" / "ofac_sanctioned_trx_2026-09-17.txt"
-)
+# Снимок списка — запасной вариант при недоступном GitHub. Лежит ВНУТРИ пакета
+# core, а не в docs/: Dockerfile копирует только core/api/bot/web, поэтому из
+# docs/ файл в образ бы не попал и fallback молча не работал бы в проде.
+BUNDLED_PATH = Path(__file__).resolve().parent.parent / "data" / "ofac_sanctioned_trx.txt"
 
 # Модульный кеш: список меняется редко, тянуть на каждый запрос незачем.
 _cache: dict[str, object] = {"set": None, "ts": 0.0, "source": "none"}
