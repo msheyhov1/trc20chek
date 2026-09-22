@@ -614,7 +614,12 @@ _LABEL_USAGE = (
     "frozen, labeled, wallet, unknown\n"
     "уровень: safe, caution, dangerous, unknown\n\n"
     "Например:\n"
-    "<code>/label TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t labeled safe наш кошелёк</code>"
+    "<code>/label TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t labeled safe наш кошелёк</code>\n\n"
+    "Метка с типом <code>exchange</code> работает ещё и как разметка СЕРВИСА: "
+    "адрес будет опознаваться не только сам по себе, но и в роли контрагента "
+    "в чужих переводах. Так размечают сервисы, которых нет у TronScan "
+    "(CryptoBot, Telegram Wallet): достаточно одного хот-кошелька — его "
+    "депозитные адреса подтянет анализ переводов."
 )
 
 
