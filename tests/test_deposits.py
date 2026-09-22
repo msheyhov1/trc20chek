@@ -443,3 +443,97 @@ def test_counterparty_volume_split_by_direction():
     d = per_cp[sanctioned]
     assert (d["volume_in"], d["volume_out"], d["volume"]) == (100.0, 300.0, 400.0)
     assert total == 400.0
+
+
+# ---------- адрес без единой операции ----------
+
+def _untouched_verdict(**over):
+    v = AddressVerdict(address=A)
+    v.raw_labels["profile"] = {"tx_in": 0, "tx_out": 0}
+    status = {"tronscan": "ok", "flow": "ok"}
+    status.update(over.pop("status", {}))
+    return v, status
+
+
+def test_untouched_address_is_recognised():
+    v, status = _untouched_verdict()
+    assert agg._is_untouched(v, [], status) is True
+
+
+def test_provider_failure_is_not_an_empty_address():
+    """«Источник не ответил» не должно превращаться в «адрес пустой» — это
+    ровно та подмена, против которой заведён provider_status."""
+    for broken in ("tronscan", "flow"):
+        v, status = _untouched_verdict()
+        status[broken] = "error"
+        assert agg._is_untouched(v, [], status) is False
+
+
+def test_address_with_history_is_not_empty():
+    v, status = _untouched_verdict()
+    v.raw_labels["profile"] = {"tx_in": 3, "tx_out": 0}
+    assert agg._is_untouched(v, [], status) is False
+
+
+def test_trx_only_activity_is_not_empty():
+    """Счётчики TronScan показывают активность, которой нет в TRC20-переводах
+    (например, только TRX). Граф есть — значит адрес не пустой."""
+    v, status = _untouched_verdict()
+    v.raw_labels["profile"] = {"tx_in": 0, "tx_out": 2}
+    assert agg._is_untouched(v, [], status) is False
+
+
+def test_transfers_without_counters_are_not_empty():
+    v, status = _untouched_verdict()
+    assert agg._is_untouched(v, [_tr(USER, A, 1_000_000)], status) is False
+
+
+def test_missing_counters_are_not_treated_as_empty():
+    """Поля в ответе нет — значит мы не знаем, а не «операций не было»."""
+    v = AddressVerdict(address=A)
+    assert agg._is_untouched(v, [], {"tronscan": "ok", "flow": "ok"}) is False
+
+
+def test_labelled_address_is_not_empty():
+    v, status = _untouched_verdict()
+    v.entity = "Binance"
+    v.entity_type = EntityType.EXCHANGE
+    assert agg._is_untouched(v, [], status) is False
+
+
+@pytest.mark.asyncio
+async def test_empty_address_does_not_spend_paid_kyt():
+    """Платные KYT считают граф транзакций. У адреса без единой операции графа
+    нет, и «0% чисто» от них — не находка, а стоимость запроса."""
+    ts = {"address": A, "transactions_in": 0, "transactions_out": 0}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value=ts)), \
+         patch("core.aggregator.goplus.fetch_address_security",
+               new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])), \
+         patch("core.aggregator.aml_external.check", new=AsyncMock()) as sw, \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock()) as bt:
+        v = await agg.check_address(A, use_cache=False)
+    assert sw.await_count == 0 and bt.await_count == 0
+    assert v.provider_status["swapster"] == "skipped"
+    assert any("Адрес пустой" in f for f in v.risk_flags)
+    assert "нет ни одной операции" in v.external_aml["reason"]
+
+
+@pytest.mark.asyncio
+async def test_unreachable_tronscan_still_asks_paid_kyt():
+    """Если TronScan не ответил, адрес не «пустой», а непроверенный —
+    отказываться от второго мнения тут как раз нельзя."""
+    from core.providers.base import ProviderError
+    with patch("core.aggregator.tronscan.fetch_account",
+               new=AsyncMock(side_effect=ProviderError("нет связи"))), \
+         patch("core.aggregator.goplus.fetch_address_security",
+               new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=[])), \
+         patch("core.aggregator.aml_external.check",
+               new=AsyncMock(return_value={"available": False, "reason": "не настроен"})) as sw, \
+         patch("core.aggregator.aml_bitok.check",
+               new=AsyncMock(return_value={"available": False, "reason": "не настроен"})):
+        v = await agg.check_address(A, use_cache=False)
+    assert sw.await_count == 1
+    assert not any("Адрес пустой" in f for f in v.risk_flags)
+    assert any("НЕПОЛНАЯ" in f for f in v.risk_flags)

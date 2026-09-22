@@ -896,6 +896,31 @@ def _detect_exchange_deposit(
     }
 
 
+def _is_untouched(
+    verdict: AddressVerdict, transfers: list[dict[str, Any]], status: dict[str, str]
+) -> bool:
+    """Адрес, на котором не было НИ ОДНОЙ операции.
+
+    Это отдельное состояние, а не «ничего не нашли». По пустому адресу нечего
+    анализировать физически: нет ни контрагентов, ни объёмов, ни графа — и ни
+    один инструмент, включая платные KYT, не скажет о нём больше, чем «пусто».
+    Так выглядит и только что выданный депозитный адрес сервиса, и адрес
+    скамера до первого перевода: по самому адресу их не различить.
+
+    Условие намеренно строгое и требует СОГЛАСИЯ двух источников — счётчиков
+    TronScan и разобранной истории переводов, — плюс исправной работы обоих
+    провайдеров. Иначе «источник не ответил» превратилось бы в «адрес пустой»,
+    а это ровно та подмена, против которой заведён provider_status."""
+    if status.get("tronscan") != "ok" or status.get("flow") != "ok":
+        return False
+    profile = verdict.raw_labels.get("profile") or {}
+    if profile.get("tx_in") != 0 or profile.get("tx_out") != 0:
+        return False        # поля нет или активность была
+    if transfers:
+        return False
+    return verdict.entity_type is EntityType.UNKNOWN and not verdict.entity
+
+
 def _is_probable_deposit(verdict: AddressVerdict) -> bool:
     """Депозитник, опознанный по ОДНОМУ свипу (confidence = medium).
 
@@ -2055,7 +2080,22 @@ async def _check_address(
     # Туннель: биржа/контракт → внешние AML не зовём (их скор ничего не говорит о
     # владельце инфраструктуры). Решение принимается по ON-CHAIN типу, до расчёта
     # риска. Скам/санкции туннель НЕ отсекает: там второе мнение ценно.
-    if verdict.entity_type in _AML_SKIP_TYPES and not _is_probable_deposit(verdict):
+    untouched = _is_untouched(verdict, flow_data, verdict.provider_status)
+    if untouched:
+        # Платные KYT считают граф транзакций. У адреса без единой операции
+        # графа нет, и «0% чисто» от них — не находка, а стоимость запроса.
+        verdict.risk_flags.append(
+            "🫙 Адрес пустой: ни одной транзакции, нулевой баланс. Оценивать "
+            "нечего — on-chain истории нет. Так выглядит и только что выданный "
+            "депозитный адрес сервиса, и адрес скамера до первого перевода: "
+            "по самому адресу их не различить"
+        )
+        reason = "на адресе нет ни одной операции — анализировать нечего"
+        verdict.external_aml = {"skipped": True, "reason": reason}
+        verdict.bitok_aml = {"skipped": True, "reason": reason}
+        verdict.provider_status["swapster"] = "skipped"
+        verdict.provider_status["bitok"] = "skipped"
+    elif verdict.entity_type in _AML_SKIP_TYPES and not _is_probable_deposit(verdict):
         reason = (
             "средства заблокированы эмитентом — второе мнение ничего не добавит"
             if verdict.entity_type is EntityType.FROZEN
