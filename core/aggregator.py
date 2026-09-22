@@ -962,7 +962,12 @@ def _apply_flow(
             f"Депозитный кошелёк {exch}" if not probable
             else f"Депозитный кошелёк {exch} (вероятно)"
         )
-        verdict.risk_level = RiskLevel.SAFE  # для санкц. биржи поднимет _compute_aml
+        if not probable:
+            # Для санкционной биржи уровень поднимет _compute_aml.
+            verdict.risk_level = RiskLevel.SAFE
+        # У «вероятного» уровень не трогаем: «нет данных» честнее, чем
+        # «безопасно», когда вывод держится на одном переводе. Если проверка
+        # ничего не найдёт, так и останется UNKNOWN.
         verdict.raw_labels["flow"]["deposit_pattern"] = deposit
         conc = int(round(deposit["concentration"] * 100))
         custodial = exch in CUSTODIAL_SERVICE_NAMES
@@ -1661,7 +1666,10 @@ async def _apply_cluster(verdict: AddressVerdict) -> None:
         return
     exch = dp["exchange"]
     hot = dp.get("hot_wallet")
-    await cluster.record(verdict.address, exch, hot, bool(dp.get("sanctioned")))
+    await cluster.record(
+        verdict.address, exch, hot, bool(dp.get("sanctioned")),
+        confidence=str(dp.get("confidence") or "high"),
+    )
     info = await cluster.cluster_info(exch, hot, exclude=verdict.address)
     if not info:
         return

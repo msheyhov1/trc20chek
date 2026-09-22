@@ -39,6 +39,14 @@ async def init_db() -> None:
             )
             """
         )
+        # Миграция: уверенность атрибуции появилась позже таблицы, а том с базой
+        # на Railway переживает редеплой. Дубликат колонки — не ошибка.
+        try:
+            await db.execute(
+                "ALTER TABLE deposit_cluster ADD COLUMN confidence TEXT DEFAULT 'high'"
+            )
+        except Exception:
+            pass
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cluster_hot ON deposit_cluster(hot_wallet)"
         )
@@ -49,24 +57,35 @@ async def init_db() -> None:
 
 
 async def record(
-    address: str, exchange: str, hot_wallet: str | None, sanctioned: bool = False
+    address: str,
+    exchange: str,
+    hot_wallet: str | None,
+    sanctioned: bool = False,
+    confidence: str = "high",
 ) -> None:
-    """Атрибутировать депозитный адрес к бирже/якорю (upsert)."""
+    """Атрибутировать депозитный адрес к бирже/якорю (upsert).
+
+    `confidence` = "medium" у адресов, опознанных по одному свипу. Пишем их
+    тоже — факт «этот якорь принадлежит такой-то бирже» взят из тега и от нашей
+    догадки не зависит, — но в отчётном счётчике родственных депозитников они
+    не участвуют: подменять измерение догадкой там нельзя."""
     now = time.time()
     try:
         async with aiosqlite.connect(CLUSTER_PATH) as db:
             await db.execute(
                 """
                 INSERT INTO deposit_cluster
-                    (address, exchange, hot_wallet, sanctioned, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (address, exchange, hot_wallet, sanctioned, confidence,
+                     first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(address) DO UPDATE SET
                     exchange   = excluded.exchange,
                     hot_wallet = excluded.hot_wallet,
                     sanctioned = excluded.sanctioned,
+                    confidence = excluded.confidence,
                     last_seen  = excluded.last_seen
                 """,
-                (address, exchange, hot_wallet, int(sanctioned), now, now),
+                (address, exchange, hot_wallet, int(sanctioned), confidence, now, now),
             )
             await db.commit()
     except Exception:
@@ -87,20 +106,20 @@ async def cluster_info(
             if hot_wallet:
                 async with db.execute(
                     "SELECT address FROM deposit_cluster "
-                    "WHERE hot_wallet = ? AND address != ? "
+                    "WHERE hot_wallet = ? AND address != ? AND confidence = 'high' "
                     "ORDER BY last_seen DESC LIMIT 5",
                     (hot_wallet, exclude),
                 ) as cur:
                     siblings = [r[0] for r in await cur.fetchall()]
                 async with db.execute(
                     "SELECT COUNT(*) FROM deposit_cluster "
-                    "WHERE hot_wallet = ? AND address != ?",
+                    "WHERE hot_wallet = ? AND address != ? AND confidence = 'high'",
                     (hot_wallet, exclude),
                 ) as cur:
                     n_anchor = (await cur.fetchone())[0]
             async with db.execute(
                 "SELECT COUNT(*) FROM deposit_cluster "
-                "WHERE exchange = ? AND address != ?",
+                "WHERE exchange = ? AND address != ? AND confidence = 'high'",
                 (exchange, exclude),
             ) as cur:
                 n_exch = (await cur.fetchone())[0]

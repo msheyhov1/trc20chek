@@ -316,3 +316,87 @@ async def test_sanctioned_exchange_deposit_is_not_softened_by_confidence():
     assert v.entity_type is EntityType.SANCTIONED
     assert v.risk_score == 100
     assert v.risk_level is RiskLevel.DANGEROUS
+
+
+# ---------- «вероятно» не выдаётся за факт ----------
+
+@pytest.mark.asyncio
+async def test_probable_deposit_does_not_claim_safe():
+    """«Нет данных» честнее, чем «безопасно», когда вывод держится на одном
+    переводе. Уверенный депозитник биржи — другое дело, он безопасен."""
+    transfers = [
+        _tr(USER, A, 5_000_000_000),
+        _tr(A, HOT, 5_000_000_000, to_tag="Bybit Hot 3"),
+    ]
+    aml = {"available": False, "reason": "не настроен"}
+    with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \
+         patch("core.aggregator.goplus.fetch_address_security",
+               new=AsyncMock(return_value=EMPTY_GP)), \
+         patch("core.aggregator.flow.fetch_transfers", new=AsyncMock(return_value=transfers)), \
+         patch("core.aggregator.aml_external.check", new=AsyncMock(return_value=dict(aml))), \
+         patch("core.aggregator.aml_bitok.check", new=AsyncMock(return_value=dict(aml))):
+        v = await agg.check_address(A, use_cache=False)
+    assert v.risk_level is RiskLevel.UNKNOWN
+    assert v.risk_score == 0
+
+
+def test_high_confidence_deposit_is_marked_safe():
+    v = AddressVerdict(address=A)
+    agg._apply_flow([
+        _tr(USER, A, 1_000_000_000),
+        _tr("TUser2", A, 2_000_000_000),
+        _tr(A, HOT, 3_000_000_000, to_tag="Bybit Hot 3"),
+    ], v)
+    assert v.risk_level is RiskLevel.SAFE
+
+
+# ---------- накопительная база не подменяет измерение догадкой ----------
+
+async def _record(exchange="Bybit", **over):
+    args = {"address": "Tx", "hot_wallet": HOT, "confidence": "high"}
+    args.update(over)
+    await cluster.record(args["address"], exchange, args["hot_wallet"],
+                         confidence=args["confidence"])
+
+
+@pytest.mark.asyncio
+async def test_probable_deposits_do_not_inflate_sibling_counter(tmp_path, monkeypatch):
+    """Счётчик «ещё N родственных депозитников» — самый сильный аргумент в
+    отчёте. Догадки в него попадать не должны, а якорь учится всё равно."""
+    monkeypatch.setattr(cluster, "CLUSTER_PATH", tmp_path / "cluster.db")
+    await cluster.init_db()
+    await _record(address="Tsure1", confidence="high")
+    await _record(address="Tmaybe1", confidence="medium")
+    await _record(address="Tmaybe2", confidence="medium")
+
+    info = await cluster.cluster_info("Bybit", HOT, exclude=A)
+    assert info["siblings_on_anchor"] == 1
+    assert info["known_deposits_exchange"] == 1
+    # якорь выучен по всем записям: этот факт взят из тега, а не из догадки
+    assert await cluster.anchors_for({HOT}) == {HOT: "Bybit"}
+
+
+@pytest.mark.asyncio
+async def test_cluster_db_from_older_version_is_migrated(tmp_path, monkeypatch):
+    """Том с базой на Railway переживает редеплой, поэтому колонка confidence
+    добавляется к УЖЕ существующей таблице."""
+    import aiosqlite
+    path = tmp_path / "cluster.db"
+    monkeypatch.setattr(cluster, "CLUSTER_PATH", path)
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            "CREATE TABLE deposit_cluster (address TEXT PRIMARY KEY, exchange TEXT "
+            "NOT NULL, hot_wallet TEXT, sanctioned INTEGER DEFAULT 0, "
+            "first_seen REAL, last_seen REAL)"
+        )
+        await db.execute(
+            "INSERT INTO deposit_cluster VALUES ('Told', 'Bybit', ?, 0, 1.0, 1.0)", (HOT,)
+        )
+        await db.commit()
+
+    await cluster.init_db()          # миграция
+    await cluster.init_db()          # повторный старт не должен падать
+    await _record(address="Tnew", confidence="high")
+    info = await cluster.cluster_info("Bybit", HOT, exclude=A)
+    # старая запись получает confidence='high' по DEFAULT и остаётся в счёте
+    assert info["siblings_on_anchor"] == 2
