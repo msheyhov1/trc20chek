@@ -113,3 +113,40 @@ async def cluster_info(
         "siblings_sample": siblings,
         "known_deposits_exchange": n_exch,
     }
+
+
+async def anchors_for(addresses: set[str] | list[str]) -> dict[str, str]:
+    """Какие из этих адресов мы уже знаем как якоря (хот-кошельки) бирж.
+
+    Зачем: funnel-эвристика опознаёт биржу в оттоке по тегу TronScan из ответа
+    о переводах, а тег там есть не всегда — и тогда депозитник биржи выглядит
+    личным кошельком. Но якорь мы могли выучить на прошлой проверке, когда тег
+    был на месте. Так накопленная база начинает работать на атрибуцию, а не
+    только на счётчик родственных адресов в отчёте.
+
+    Возвращает `{адрес: биржа}`. Ошибка БД — пустой словарь: кластеризация
+    необязательна и не должна ронять проверку."""
+    addrs = [a for a in dict.fromkeys(addresses) if a]
+    if not addrs:
+        return {}
+    # Чанки: SQLite по умолчанию держит до 999 переменных в запросе, а список
+    # контрагентов упирается в число переводов и может расти.
+    out: dict[str, str] = {}
+    try:
+        async with aiosqlite.connect(CLUSTER_PATH) as db:
+            for i in range(0, len(addrs), 500):
+                chunk = addrs[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                async with db.execute(
+                    f"SELECT hot_wallet, exchange, COUNT(*) AS n FROM deposit_cluster "  # noqa: S608
+                    f"WHERE hot_wallet IN ({placeholders}) "
+                    f"GROUP BY hot_wallet, exchange ORDER BY n",
+                    chunk,
+                ) as cur:
+                    # ORDER BY n по возрастанию: при конфликте имён побеждает
+                    # биржа, к которой на этот якорь привязано больше адресов.
+                    for hot, exchange, _n in await cur.fetchall():
+                        out[hot] = exchange
+    except Exception:
+        return {}
+    return out

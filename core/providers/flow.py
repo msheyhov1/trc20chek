@@ -6,8 +6,17 @@ https://apilist.tronscanapi.com/api/token_trc20/transfers — он отдаёт 
 по одному запросу видно, с какими размеченными биржами связан адрес.
 
 По документации TronScan `limit` ≤ 50 на запрос, добор — постранично через `start`
-при `start + limit ≤ 10000`. Число страниц задаёт FLOW_PAGES (по умолчанию 1 —
-как раньше; больше страниц = глубже история, но дольше проверка).
+при `start + limit ≤ 10000`. Число страниц задаёт FLOW_PAGES (по умолчанию 2 —
+100 переводов).
+
+Почему не одна страница: окно в 50 переводов у активного адреса легко
+оказывается целиком входящим или целиком исходящим, и funnel-эвристика
+(`_detect_exchange_deposit`) просто не видит второй половины паттерна —
+депозитник биржи остаётся «личным кошельком». Вторая страница стоит один
+запрос и заметно повышает попадание.
+
+Глубину для 2-го хопа агрегатор задаёт отдельно (`pages=`): там адресов до
+двенадцати, и лишняя страница на каждого — это уже двенадцать запросов.
 
 Ключ не обязателен (эндпоинт публичный), но `TRONSCAN_API_KEY` повышает лимит.
 
@@ -26,7 +35,7 @@ from .base import ProviderError
 TRONSCAN_BASE = "https://apilist.tronscanapi.com"
 TRONSCAN_API_KEY = os.getenv("TRONSCAN_API_KEY", "")
 TRANSFERS_LIMIT = 50  # максимум TronScan на один запрос
-FLOW_PAGES = max(1, int(os.getenv("FLOW_PAGES", "1")))
+FLOW_PAGES = max(1, int(os.getenv("FLOW_PAGES", "2")))
 
 
 # Поля уровня ответа (не внутри переводов), которые несут готовые риск-признаки:
@@ -82,14 +91,20 @@ class TransferPage(list):
         self.meta: dict[str, Any] = meta or {}
 
 
-async def fetch_transfers(address: str, client: httpx.AsyncClient) -> TransferPage:
-    """Последние TRC20-переводы адреса (до FLOW_PAGES × 50) плюс метаданные.
+async def fetch_transfers(
+    address: str, client: httpx.AsyncClient, pages: int | None = None
+) -> TransferPage:
+    """Последние TRC20-переводы адреса (до `pages` × 50) плюс метаданные.
+
+    `pages` по умолчанию FLOW_PAGES; вызывающий может запросить меньше, когда
+    адресов много (2-й хоп).
 
     ProviderError, если не удалось получить даже первую страницу; неполный
     добор — не ошибка, работаем с тем, что получили."""
+    limit_pages = max(1, pages if pages is not None else FLOW_PAGES)
     items, meta = await _fetch_page(address, 0, client)
     out = TransferPage(items, meta)
-    for page in range(1, FLOW_PAGES):
+    for page in range(1, limit_pages):
         if len(out) < page * TRANSFERS_LIMIT:
             break  # история закончилась
         try:
