@@ -423,8 +423,15 @@ def format_verdict(v: AddressVerdict) -> str:
         for i, ext in enumerate(shown, 1):
             lines += _aml_provider_lines(ext, i)
     elif providers:
+        # Причина у туннеля своя: «биржа», «заблокировано эмитентом», «пустой
+        # адрес». Раньше показывалась одна и та же строка про биржу, и для
+        # пустого адреса это выглядело ошибкой.
+        reason = next((p.get("reason") for p in providers if p.get("reason")), "")
         lines.append("")
-        lines.append("<i>🔍 AML-сервисы: биржа/сервис — проверка не требуется</i>")
+        lines.append(
+            f"<i>🔍 AML-сервисы: {_esc(reason)}</i>" if reason
+            else "<i>🔍 AML-сервисы: проверка не требуется</i>"
+        )
 
     if v.sources:
         lines.append("")

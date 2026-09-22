@@ -130,13 +130,26 @@ def test_aml_providers_block_renders_both():
     assert "даркнет-маркет" in text
 
 
-def test_aml_skipped_shows_tunnel_note():
+def test_aml_skipped_shows_the_actual_reason():
+    """Причин у туннеля несколько — биржа, блокировка эмитентом, пустой адрес.
+    Раньше для всех печаталась строка про биржу, и на пустом адресе это
+    выглядело ошибкой вердикта."""
     v = _v(
-        external_aml={"skipped": True, "reason": "биржа/сервис"},
-        bitok_aml={"skipped": True, "reason": "биржа/сервис"},
+        external_aml={"skipped": True, "reason": "биржа/сервис — внешний AML не требуется"},
+        bitok_aml={"skipped": True, "reason": "биржа/сервис — внешний AML не требуется"},
     )
-    text = bm.format_verdict(v)
-    assert "проверка не требуется" in text
+    assert "биржа/сервис — внешний AML не требуется" in bm.format_verdict(v)
+
+    empty = _v(
+        external_aml={"skipped": True, "reason": "на адресе нет ни одной операции"},
+        bitok_aml={"skipped": True, "reason": "на адресе нет ни одной операции"},
+    )
+    assert "нет ни одной операции" in bm.format_verdict(empty)
+
+
+def test_aml_skipped_without_reason_falls_back():
+    v = _v(external_aml={"skipped": True}, bitok_aml={"skipped": True})
+    assert "проверка не требуется" in bm.format_verdict(v)
 
 
 def test_exposure_block_omitted_without_transfers():
