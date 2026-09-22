@@ -265,6 +265,8 @@ function render(verdict) {
     <div class="score">
       <div class="score-bar"><div class="score-fill ${escapeHtml(level)}" style="width:${Math.min(100, score)}%"></div></div>
       <div class="score-label">Риск ${score}/100 · ${escapeHtml(riskRu(verdict))}</div>
+      ${(verdict.aml || {}).score_reason && score > 0
+        ? `<div class="meta">🧮 ${escapeHtml(verdict.aml.score_reason)}</div>` : ""}
     </div>
     <div class="meta">Тип: ${escapeHtml(typeRu(verdict))}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>

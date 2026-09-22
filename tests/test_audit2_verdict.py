@@ -298,3 +298,85 @@ async def test_degraded_check_does_not_claim_verdict_change(monkeypatch):
             AsyncMock(side_effect=ProviderError("down")),
     })
     assert not any("Вердикт изменился" in f for f in v.risk_flags)
+
+
+# ---------- улучшения: скор объясняет себя ----------
+
+async def test_score_reason_for_ofac():
+    v = await _check(OFAC)
+    assert v.aml["score_reason"] == "адрес в санкционном списке OFAC SDN"
+
+
+async def test_score_reason_for_exposure_and_hop2():
+    transfers = [tr(OFAC, A, 20), tr("Tclean1", A, 80)]
+    v = await _check(A, **{"core.aggregator.flow.fetch_transfers":
+                           AsyncMock(return_value=transfers)})
+    assert v.risk_score == 20
+    assert "20% объёма — санкционные адреса и биржи" in v.aml["score_reason"]
+
+
+async def test_score_reason_when_kyt_raised_the_score():
+    bitok = {"available": True, "provider": "Bitok", "pending": False,
+             "risk_score": 85.0, "risk_level": "dangerous",
+             "entities": [{"entity": "даркнет-маркет", "level": "HIGH_RISK", "risk_score": 85.0}]}
+    v = await _check(A, **{"core.aggregator.aml_bitok.check": AsyncMock(return_value=bitok)})
+    assert v.aml["score_reason"] == "Bitok: 85% — даркнет-маркет"
+
+
+async def test_no_reason_for_zero_score():
+    v = await _check(A)
+    assert v.risk_score == 0 and v.aml["score_reason"] == ""
+
+
+def test_bot_shows_score_reason():
+    from bot.main import format_verdict
+    v = AddressVerdict(address=A)
+    v.risk_score, v.risk_level = 85, RiskLevel.DANGEROUS
+    v.aml = {"score_reason": "Bitok: 85% — даркнет-маркет"}
+    assert "🧮 Bitok: 85% — даркнет-маркет" in format_verdict(v)
+
+
+# ---------- улучшения: оценки TronScan влияют на скор ----------
+
+async def test_grey_tag_gives_a_score_not_just_caution():
+    """Серая метка давала «ОСТОРОЖНО · риск 0/100» — уровень и число спорили."""
+    v = await _check(A, **{"core.aggregator.tronscan.fetch_account":
+                           AsyncMock(return_value={"address": A, "greyTag": "Suspicious"})})
+    assert v.risk_level is RiskLevel.CAUTION
+    assert v.risk_score == agg.GREY_TAG_SCORE
+    assert "серая метка TronScan" in v.aml["score_reason"]
+
+
+async def test_tronscan_risky_volume_raises_score():
+    """Объём через рискованные по TronScan переводы был только флагом рядом с «0/100»."""
+    risky = dict(tr("TRisky111111111111111111111111111", A, 800), riskTransaction=True)
+    transfers = [risky, tr("Tclean1", A, 200)]
+    v = await _check(A, **{"core.aggregator.flow.fetch_transfers":
+                           AsyncMock(return_value=transfers)})
+    assert v.aml["tronscan_risky_exposure_pct"] == 80.0
+    assert v.risk_score == 40                 # 80% × 0.5
+    assert v.risk_level is RiskLevel.CAUTION
+
+
+async def test_tronscan_risk_does_not_touch_known_exchange():
+    risky = dict(tr("TRisky111111111111111111111111111", A, 800), riskTransaction=True)
+    v = await _check(A, **{
+        "core.aggregator.tronscan.fetch_account":
+            AsyncMock(return_value={"address": A, "publicTag": "Binance-Hot 4"}),
+        "core.aggregator.flow.fetch_transfers": AsyncMock(return_value=[risky]),
+    })
+    assert v.entity_type is EntityType.EXCHANGE and v.risk_score == 0
+
+
+# ---------- улучшения: пыль не делает депозитник уверенным ----------
+
+def test_dust_inflows_do_not_upgrade_deposit_confidence():
+    """Пара пылевых переводов от адресов-двойников превращала одноразовый свип
+    (medium) в уверенный депозитник (high) — с туннелем и нулевым риском."""
+    transfers = [
+        tr("TUser1", A, 5000),
+        tr("TPoison1", A, 0.5), tr("TPoison2", A, 0.3),
+        tr(A, "TBybit", 5000, to_tag="Bybit Hot 3"),
+    ]
+    d = agg._detect_exchange_deposit(transfers, A)
+    assert d["confidence"] == "medium"

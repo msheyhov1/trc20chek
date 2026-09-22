@@ -192,6 +192,14 @@ _TYPE_MIN_RISK: dict[EntityType, tuple[int, RiskLevel]] = {
     EntityType.HIGH_RISK_SERVICE: (60, RiskLevel.CAUTION),
 }
 
+# Как объяснить скор, если его задала нижняя граница типа.
+_TYPE_FLOOR_REASON = {
+    EntityType.SANCTIONED: "санкционная сущность",
+    EntityType.FROZEN: "средства заблокированы эмитентом USDT",
+    EntityType.SCAM: "адрес помечен как скам",
+    EntityType.HIGH_RISK_SERVICE: "высокорисковый сервис",
+}
+
 # Метки, которые считаем «пустыми» — их разрешено перезаписать данными Bitok.
 _EMPTY_ENTITY_LABELS = {"", "No public labels"}
 
@@ -251,10 +259,14 @@ def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
             continue
         provider = ext.get("provider") or "AML"
         pct = ext.get("risk_score")
-        if isinstance(pct, int | float):
-            verdict.risk_score = max(verdict.risk_score, int(round(pct)))
-        detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
         top = _top_risk_entity(ext) or ext.get("entity_category_ru")
+        if isinstance(pct, int | float) and int(round(pct)) > verdict.risk_score:
+            verdict.risk_score = int(round(pct))
+            if verdict.aml is not None:
+                verdict.aml["score_reason"] = (
+                    f"{provider}: {pct:g}%" + (f" — {top}" if top else "")
+                )
+        detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
         reason = f" ({top})" if top else ""
         verdict.risk_flags.append(
             f"{'⛔️' if level is RiskLevel.DANGEROUS else '⚠️'} {provider}: "
@@ -611,6 +623,13 @@ NEW_ADDRESS_DAYS = int(os.getenv("NEW_ADDRESS_DAYS", "30"))
 # Жалобы пользователей в TronScan — сигнал слабее скам-тега (репорт может быть и
 # ошибочным), поэтому не «опасно», а нижняя граница «осторожно».
 FEEDBACK_RISK_SCORE = float(os.getenv("FEEDBACK_RISK_SCORE", "30"))
+# Серая метка TronScan на самом адресе. Раньше она ставила «осторожно», но скор
+# оставался 0 — и в отчёте было «ОСТОРОЖНО · риск 0/100».
+GREY_TAG_SCORE = float(os.getenv("GREY_TAG_SCORE", "30"))
+# Вес объёма, прошедшего через переводы и контрагентов, которых TronScan сам
+# считает рискованными (riskTransaction, normalAddressInfo.risk). Ниже веса
+# санкций: это оценка TronScan, а не список.
+TRONSCAN_RISK_WEIGHT = float(os.getenv("TRONSCAN_RISK_WEIGHT", "0.5"))
 
 
 def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> None:
@@ -901,7 +920,11 @@ def _detect_exchange_deposit(
             else:
                 out_other += amt
         elif addr == t.get("to_address"):
-            in_tx += 1
+            # Пыль в счёт приходов не идёт: иначе пара пылевых переводов от
+            # адресов-двойников превращала одноразовый свип (medium) в
+            # уверенный депозитник (high) — с туннелем и нулевым риском.
+            if amt > POISON_DUST_MAX:
+                in_tx += 1
             src = t.get("from_address")
             exch = _counterparty_service(
                 (t.get("from_address_tag") or {}).get("from_address_tag"), src, anchors
@@ -1662,6 +1685,20 @@ def _compute_aml(
     def pct(x: float) -> float:
         return round(x / total * 100, 1) if total > 0 else 0.0
 
+    # Объём через переводы и контрагентов, рискованных по оценке самого TronScan.
+    ts_risky_cps = set((tokens or {}).get("risky_counterparties") or [])
+    ts_risky_vol = 0.0
+    for t in transfers:
+        if addr == t.get("from_address"):
+            cp = t.get("to_address")
+        elif addr == t.get("to_address"):
+            cp = t.get("from_address")
+        else:
+            continue
+        if t.get("riskTransaction") or cp in ts_risky_cps:
+            ts_risky_vol += _amount(t)
+    ts_risky_pct = pct(ts_risky_vol)
+
     flags_raised = (verdict.raw_labels.get("goplus") or {}).get("flags_raised") or []
     goplus_critical = sorted(f for f in flags_raised if f in CRITICAL_GOPLUS_FLAGS)
     # «Грязный» объём = прямые санкционные адреса + санкционные биржи
@@ -1681,6 +1718,7 @@ def _compute_aml(
         "exchange_exposure_pct": pct(vol["exchange"]),
         "other_exposure_pct": pct(vol["other"]),
         "risky_exposure_pct": risky_pct,
+        "tronscan_risky_exposure_pct": ts_risky_pct,
         "indirect_sanctions_pct": indirect_pct,
         "hop2_intermediaries_checked": (hop2 or {}).get("intermediaries_checked", 0),
         "hop2_failed": (hop2 or {}).get("failed", 0),
@@ -1705,24 +1743,58 @@ def _compute_aml(
     )
 
     # ---- Скор 0-100 ----
-    if direct or self_sanctioned_exch or verdict.entity_type == EntityType.SCAM:
-        score = 100.0  # прямой сигнал об адресе — бьёт всё
+    # Вместе со скором копится «за что» — одна строка в отчёте говорит, из какой
+    # составляющей взялось число. Раньше его приходилось угадывать по флагам.
+    reason = ""
+    if direct:
+        score, reason = 100.0, "адрес в санкционном списке OFAC SDN"
+    elif self_sanctioned_exch:
+        score, reason = 100.0, "адрес обслуживает санкционную инфраструктуру"
+    elif verdict.entity_type == EntityType.SCAM:
+        score, reason = 100.0, f"скам: {verdict.entity or 'метка источника'}"
     elif goplus_critical:
         score = 90.0
+        reason = "GoPlus: " + ", ".join(f.replace("_", " ") for f in goplus_critical)
     elif known_service:
         score = 10.0 if flags_raised else 0.0
+        if score:
+            reason = "известный сервис; флаги GoPlus: " + ", ".join(
+                f.replace("_", " ") for f in flags_raised
+            )
     else:
         # прямая экспозиция + косвенная (2-хоп) с понижающим весом
         score = risky_pct + indirect_pct * HOP2_WEIGHT
-        if flags_raised:
-            score = max(score, 20.0)
+        parts = []
+        if risky_pct:
+            parts.append(f"{_pct_str(risky_pct)}% объёма — санкционные адреса и биржи")
+        if indirect_pct:
+            parts.append(f"косвенно {_pct_str(indirect_pct)}% × {HOP2_WEIGHT:g}")
+        reason = " + ".join(parts)
+        if flags_raised and score < 20.0:
+            score = 20.0
+            reason = "GoPlus: " + ", ".join(f.replace("_", " ") for f in flags_raised)
 
-    # Жалобы пользователей в TronScan (feedbackRisk) — сигнал о САМОМ адресе,
-    # а не о его контрагентах, поэтому он задаёт нижнюю границу. Для опознанного
-    # легального сервиса игнорируем: на биржи жалуются постоянно, и репорт там
-    # говорит о споре с поддержкой, а не о природе адреса.
-    if not known_service and (verdict.raw_labels.get("profile") or {}).get("feedback_risk"):
-        score = max(score, FEEDBACK_RISK_SCORE)
+    if not known_service:
+        # Жалобы пользователей в TronScan (feedbackRisk) — сигнал о САМОМ адресе,
+        # а не о его контрагентах, поэтому он задаёт нижнюю границу. Для
+        # опознанного легального сервиса игнорируем: на биржи жалуются
+        # постоянно, и репорт там говорит о споре с поддержкой.
+        if (verdict.raw_labels.get("profile") or {}).get("feedback_risk") \
+                and FEEDBACK_RISK_SCORE > score:
+            score, reason = FEEDBACK_RISK_SCORE, "жалобы пользователей в TronScan"
+        grey = (verdict.raw_labels.get("tronscan") or {}).get("greyTag")
+        if grey and GREY_TAG_SCORE > score:
+            score, reason = GREY_TAG_SCORE, f"серая метка TronScan «{grey}»"
+        # Переводы и контрагенты, которых TronScan сам считает рискованными.
+        # Раньше это были только флаги: «⚠️ рискованные контрагенты» рядом с
+        # «0/100». Теперь — доля объёма с весом, как у санкционной экспозиции.
+        ts_weighted = ts_risky_pct * TRONSCAN_RISK_WEIGHT
+        if ts_weighted > score:
+            score = ts_weighted
+            reason = (
+                f"{_pct_str(ts_risky_pct)}% объёма — переводы и контрагенты, "
+                f"рискованные по оценке TronScan, × {TRONSCAN_RISK_WEIGHT:g}"
+            )
 
     verdict.risk_score = int(round(min(100.0, score)))
 
@@ -1773,9 +1845,14 @@ def _compute_aml(
     floor = _TYPE_MIN_RISK.get(verdict.entity_type)
     if floor:
         min_score, min_level = floor
-        verdict.risk_score = max(verdict.risk_score, min_score)
+        if min_score > verdict.risk_score:
+            verdict.risk_score = min_score
+            reason = _TYPE_FLOOR_REASON.get(verdict.entity_type, reason)
+            if verdict.entity_type is EntityType.SANCTIONED and verdict.sanction_source:
+                reason = f"{reason} ({verdict.sanction_source})"
         if _RISK_ORDER[min_level] > _RISK_ORDER[verdict.risk_level]:
             verdict.risk_level = min_level
+    verdict.aml["score_reason"] = reason if verdict.risk_score > 0 else ""
 
     # ---- Синтез risk_level ----
     direct_danger = (
@@ -1927,8 +2004,10 @@ def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
                     f"(было «{verdict.risk_level.value}», скор {verdict.risk_score})"
                 )
             verdict.risk_level = new_level
-            if new_level is RiskLevel.SAFE:
-                verdict.risk_score = min(verdict.risk_score, 10)
+            if new_level is RiskLevel.SAFE and verdict.risk_score > 10:
+                verdict.risk_score = 10
+                if verdict.aml is not None:
+                    verdict.aml["score_reason"] = "понижено ручной меткой оператора"
     if data.get("note"):
         verdict.risk_flags.append(f"Local note: {data['note']}")
 

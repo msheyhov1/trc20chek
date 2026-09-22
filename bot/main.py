@@ -371,6 +371,13 @@ def format_verdict(v: AddressVerdict) -> str:
     lines = [
         f"{emoji} <b>{_esc(v.risk_level_ru())}</b> · риск {v.risk_score}/100",
         f"<code>{_score_bar(v.risk_score)}</code>",
+    ]
+    # За что столько баллов — одной строкой, чтобы число не приходилось
+    # угадывать по списку находок.
+    reason = (v.aml or {}).get("score_reason")
+    if reason and v.risk_score > 0:
+        lines.append(f"<i>🧮 {_esc(reason)}</i>")
+    lines += [
         "",
         f"🏷 <b>{_esc(v.entity or '—')}</b>",
         f"<i>Тип:</i> {_esc(v.entity_type_ru())}",
