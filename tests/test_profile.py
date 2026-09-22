@@ -73,21 +73,56 @@ def test_profile_is_collected_for_red_tag():
 
 # ---------- приход/расход ----------
 
+def _apply_with_flow(seen_out, **fields):
+    """Профиль вместе с направлениями, разобранными по TRC20-переводам."""
+    v = AddressVerdict(address=A)
+    v.raw_labels["trc20_seen"] = {"in": 5, "out": seen_out}
+    agg._apply_tronscan({"address": A, **fields}, v)
+    return v
+
+
 def test_receive_only_address_is_flagged():
-    v = _apply(transactions_in=42, transactions_out=0)
+    v = _apply_with_flow(0, transactions_in=42, transactions_out=0)
     assert v.raw_labels["profile"] == {"tx_in": 42, "tx_out": 0}
     assert any("Только приём" in f for f in v.risk_flags)
 
 
+def test_receive_only_needs_agreement_with_transfer_history():
+    """Счётчики TronScan считают ТРАНЗАКЦИИ, и попадают ли в них TRC20 —
+    по документации не видно (in+out там не сходится с transactions). Если
+    в разобранной истории исходящие переводы есть, утверждать «средства ни
+    разу не уходили» нельзя, даже когда счётчик показывает ноль."""
+    v = _apply_with_flow(3, transactions_in=42, transactions_out=0)
+    assert not any("Только приём" in f for f in v.risk_flags)
+
+
+def test_receive_only_is_silent_without_transfer_data():
+    """Переводы не загрузились — второго источника нет, вывод не делаем."""
+    v = _apply(transactions_in=42, transactions_out=0)
+    assert v.raw_labels["profile"] == {"tx_in": 42, "tx_out": 0}
+    assert not any("Только приём" in f for f in v.risk_flags)
+
+
 def test_receive_only_needs_enough_transfers():
-    """Один входящий перевод и ноль исходящих — это просто новый адрес."""
-    v = _apply(transactions_in=1, transactions_out=0)
+    """Одна входящая транзакция и ноль исходящих — это просто новый адрес."""
+    v = _apply_with_flow(0, transactions_in=1, transactions_out=0)
     assert not any("Только приём" in f for f in v.risk_flags)
 
 
 def test_normal_address_is_not_flagged():
-    v = _apply(transactions_in=42, transactions_out=17)
+    v = _apply_with_flow(4, transactions_in=42, transactions_out=17)
     assert not any("Только приём" in f for f in v.risk_flags)
+
+
+def test_seen_directions_counts_both_ways():
+    transfers = [
+        {"from_address": "Tx", "to_address": A},
+        {"from_address": "Ty", "to_address": A},
+        {"from_address": A, "to_address": "Tz"},
+        {"from_address": "Tq", "to_address": "Tw"},   # чужой перевод в выдаче
+    ]
+    assert agg._seen_directions(transfers, A) == {"in": 2, "out": 1}
+    assert agg._seen_directions([], A) == {"in": 0, "out": 0}
 
 
 # ---------- жалобы пользователей ----------
@@ -130,7 +165,7 @@ def test_bot_renders_profile_line():
     v.raw_labels["profile"] = {"age_days": 12.4, "tx_in": 1234, "tx_out": 2}
     line = _profile_line(v)
     assert "возраст 12 дн." in line
-    assert "↓1 234" in line and "↑2" in line
+    assert "транзакций ↓1 234 ↑2" in line
 
 
 def test_bot_profile_line_empty_without_data():

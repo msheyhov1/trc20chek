@@ -230,7 +230,9 @@ function render(verdict) {
       : `возраст ${(profile.age_days / 365).toFixed(1)} г.`);
   }
   if (typeof profile.tx_in === "number" && typeof profile.tx_out === "number") {
-    profileParts.push(`переводов ↓${profile.tx_in} ↑${profile.tx_out}`);
+    // «транзакций», а не «переводов»: TronScan считает транзакции, и его
+    // собственные счётчики между собой не сходятся.
+    profileParts.push(`транзакций ↓${profile.tx_in} ↑${profile.tx_out}`);
   }
   const profileBlock = profileParts.length
     ? `<div class="meta">${escapeHtml(profileParts.join(" · "))}</div>`

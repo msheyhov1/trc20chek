@@ -346,7 +346,12 @@ def _profile_line(v: AddressVerdict) -> str:
     """Возраст адреса и соотношение приходов/расходов.
 
     Приходит бесплатно в том же ответе TronScan, что и метки, а отвечает на
-    первый вопрос про незнакомый адрес: он вчера создан или работает годами."""
+    первый вопрос про незнакомый адрес: он вчера создан или работает годами.
+
+    Именно «транзакций»: TronScan считает транзакции, а не TRC20-переводы, и
+    его собственные счётчики между собой не сходятся (в примере документации
+    in+out = 6 при transactions = 7). Подписывать их «переводами» значило бы
+    обещать точность, которой у числа нет."""
     p = (v.raw_labels or {}).get("profile") or {}
     parts: list[str] = []
     age = p.get("age_days")
@@ -354,7 +359,7 @@ def _profile_line(v: AddressVerdict) -> str:
         parts.append(f"возраст {age:.0f} дн." if age < 400 else f"возраст {age / 365:.1f} г.")
     tx_in, tx_out = p.get("tx_in"), p.get("tx_out")
     if isinstance(tx_in, int) and isinstance(tx_out, int):
-        parts.append(f"переводов ↓{tx_in:,} ↑{tx_out:,}".replace(",", " "))
+        parts.append(f"транзакций ↓{tx_in:,} ↑{tx_out:,}".replace(",", " "))
     if not parts:
         return ""
     return f"🗓 <i>{_esc(' · '.join(parts))}</i>"
