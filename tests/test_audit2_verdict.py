@@ -380,3 +380,40 @@ def test_dust_inflows_do_not_upgrade_deposit_confidence():
     ]
     d = agg._detect_exchange_deposit(transfers, A)
     assert d["confidence"] == "medium"
+
+
+# ---------- улучшения: кеш KYT ----------
+
+async def test_recheck_within_an_hour_does_not_pay_kyt_again():
+    """«Перепроверить» оплачивало оба сервиса заново, хотя их оценка за час
+    не меняется. On-chain часть при этом всё равно свежая."""
+    bitok = {"available": True, "provider": "Bitok", "pending": False,
+             "risk_score": 10.0, "risk_level": "safe", "entities": []}
+    paid = AsyncMock(return_value=bitok)
+    flow = AsyncMock(return_value=[])
+    await _check(A, **{"core.aggregator.aml_bitok.check": paid,
+                       "core.aggregator.flow.fetch_transfers": flow})
+    v = await _check(A, **{"core.aggregator.aml_bitok.check": paid,
+                           "core.aggregator.flow.fetch_transfers": flow})
+    assert paid.await_count == 1
+    assert flow.await_count == 2                       # переводы — каждый раз
+    assert isinstance(v.bitok_aml.get("cache_age_seconds"), int)
+
+
+async def test_pending_kyt_is_not_cached():
+    pending = {"available": True, "provider": "Bitok", "pending": True,
+               "risk_score": None, "risk_level": None, "entities": []}
+    paid = AsyncMock(return_value=pending)
+    await _check(A, **{"core.aggregator.aml_bitok.check": paid})
+    await _check(A, **{"core.aggregator.aml_bitok.check": paid})
+    assert paid.await_count == 2
+
+
+async def test_kyt_cache_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(agg, "KYT_CACHE_SECONDS", 0)
+    ok = {"available": True, "provider": "Bitok", "pending": False,
+          "risk_score": 10.0, "risk_level": "safe", "entities": []}
+    paid = AsyncMock(return_value=ok)
+    await _check(A, **{"core.aggregator.aml_bitok.check": paid})
+    await _check(A, **{"core.aggregator.aml_bitok.check": paid})
+    assert paid.await_count == 2

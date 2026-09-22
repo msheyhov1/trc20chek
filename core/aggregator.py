@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -993,6 +994,42 @@ def _detect_exchange_deposit(
         "hot_wallet": hot_wallet,
         "sanctioned": exch in SANCTIONED_EXCHANGE_NAMES,
     }
+
+
+# Кеш результатов платных KYT. «Перепроверить» оплачивало оба сервиса заново,
+# хотя их оценка адреса за час не меняется: они считают граф транзакций целиком.
+# On-chain часть (переводы, OFAC, блэклист Tether) по-прежнему всегда свежая —
+# это то, ради чего перепроверяют. 0 — кеш выключен.
+KYT_CACHE_SECONDS = int(os.getenv("KYT_CACHE_SECONDS", "3600"))
+_KYT_CACHE_MAX = 5000
+_kyt_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+async def _kyt_cached(key: str, address: str, fn) -> dict[str, Any]:
+    """Результат KYT из кеша или свежий. Кешируется только готовый ответ:
+    «ещё считается» и ошибки должны повторяться."""
+    now = time.monotonic()
+    if KYT_CACHE_SECONDS > 0:
+        hit = _kyt_cache.get((key, address))
+        if hit and now - hit[0] < KYT_CACHE_SECONDS:
+            res = dict(hit[1])
+            res["cache_age_seconds"] = int(now - hit[0])
+            return res
+    res = await fn(address)
+    if (
+        KYT_CACHE_SECONDS > 0
+        and isinstance(res, dict)
+        and res.get("available")
+        and not res.get("pending")
+    ):
+        if len(_kyt_cache) >= _KYT_CACHE_MAX:
+            cutoff = now - KYT_CACHE_SECONDS
+            for k in [k for k, (ts, _) in _kyt_cache.items() if ts < cutoff]:
+                del _kyt_cache[k]
+            while len(_kyt_cache) >= _KYT_CACHE_MAX:
+                _kyt_cache.pop(next(iter(_kyt_cache)))     # самый старый
+        _kyt_cache[(key, address)] = (now, res)
+    return res
 
 
 def _is_untouched(
@@ -2432,14 +2469,14 @@ async def _check_address(
         # Каждый сервис пишет результат в вердикт, как только ответил. Раньше
         # gather отдавал оба разом, и при обрыве по дедлайну терялся и тот,
         # что успел: Swapster готов за секунды, а ждали медленный Bitok.
-        async def _kyt(key: str, attr: str, coro) -> None:
-            res = await coro
+        async def _kyt(key: str, attr: str, fn) -> None:
+            res = await _kyt_cached(key, address, fn)
             setattr(verdict, attr, res)
             verdict.provider_status[key] = _aml_status(res)
 
         await asyncio.gather(
-            _kyt("swapster", "external_aml", aml_external.check(address)),
-            _kyt("bitok", "bitok_aml", aml_bitok.check(address)),
+            _kyt("swapster", "external_aml", aml_external.check),
+            _kyt("bitok", "bitok_aml", aml_bitok.check),
         )
         # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто,
         # но только если адрес ещё и ведёт себя как транзит (не личный юзер).

@@ -160,6 +160,10 @@ function amlProvider(ext) {
     + `<span class="badge ${escapeHtml(ext.risk_level || "unknown")}">`
     + `${riskEmoji(pct)} ${escapeHtml(fmtPct(pct))}${levelRu ? ` · ${escapeHtml(levelRu)}` : ""}`
     + `</span></div>`;
+  // Результат KYT мог прийти из кеша на час — показываем его возраст.
+  if (typeof ext.cache_age_seconds === "number") {
+    inner += `<div class="flag muted">результат${escapeHtml(fmtAge(ext.cache_age_seconds))}</div>`;
+  }
 
   if (ext.entity) {
     const cat = ext.entity_category_ru || ext.entity_category;

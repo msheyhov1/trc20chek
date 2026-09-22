@@ -50,3 +50,13 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "allow_network: тесту разрешены реальные сетевые запросы"
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_kyt_cache():
+    """Кеш KYT живёт в памяти процесса: без очистки результат одного теста
+    достался бы следующему, проверяющему тот же адрес с другим ответом."""
+    from core import aggregator
+    aggregator._kyt_cache.clear()
+    yield
+    aggregator._kyt_cache.clear()

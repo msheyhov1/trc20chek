@@ -66,6 +66,19 @@ ALLOWED_TG_IDS_RAW = os.getenv("ALLOWED_TG_IDS", "")
 ALLOWED_TG_IDS = _parse_ids(ALLOWED_TG_IDS_RAW)
 
 
+# Кто может ставить и снимать ручные метки. С реестром сервисов метка влияет не
+# только на свой адрес, но и на вердикты адресов, пересылающих на него, —
+# поэтому в команде её стоит доверять не каждому. Пусто — как раньше: любой
+# из белого списка.
+ADMIN_TG_IDS = _parse_ids(os.getenv("ADMIN_TG_IDS", ""))
+
+
+def _is_admin(user_id: int | None) -> bool:
+    if not ADMIN_TG_IDS:
+        return True
+    return user_id is not None and user_id in ADMIN_TG_IDS
+
+
 def _is_allowed(user_id: int | None) -> bool:
     """Fail-closed: пускаем ТОЛЬКО тех, кто явно перечислен в ALLOWED_TG_IDS.
 
@@ -272,6 +285,9 @@ def _aml_provider_lines(ext: dict, number: int) -> list[str]:
     pct = ext.get("risk_score")
     level_ru = _BITOK_LEVEL_RU.get(ext.get("level_raw") or "")
     suffix = f" · {level_ru}" if level_ru else ""
+    cached = ext.get("cache_age_seconds")
+    if isinstance(cached, int):
+        suffix += f" · <i>результат{_esc(_fmt_age(cached))}</i>"
     lines = [f"{head} — {_aml_risk_emoji(pct)} <b>{_fmt_pct(pct)}</b>{suffix}"]
 
     # Опознанная сущность (Bitok отдаёт имя + категорию)
@@ -559,6 +575,10 @@ async def cmd_status(message: Message):
         f"{mark(aml_bitok.is_configured())} Bitok",
         "",
         f"Доступ к боту: {len(ALLOWED_TG_IDS)} Telegram ID в белом списке",
+        "Ручные метки: " + (
+            f"только администраторы ({len(ADMIN_TG_IDS)})" if ADMIN_TG_IDS
+            else "любой из белого списка"
+        ),
         f"Страниц истории переводов: {flow_provider.FLOW_PAGES} "
         f"(по {flow_provider.TRANSFERS_LIMIT})",
     ]
@@ -664,6 +684,13 @@ async def cmd_label(message: Message):
 
     Метка имеет наивысший приоритет в вердикте, поэтому автор записывается в
     базу: это сильное действие, и должно быть видно, кто его сделал."""
+    if not _is_admin(_user_id(message)):
+        await message.answer(
+            "Ручные метки ставит администратор: метка меняет вердикт для всех "
+            "пользователей бота. Попросите его — или добавьте свой ID в ADMIN_TG_IDS.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     parts = (message.text or "").split()
     addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
     if not addresses:
@@ -700,6 +727,13 @@ async def cmd_label(message: Message):
 
 @dp.message(Command("unlabel"))
 async def cmd_unlabel(message: Message):
+    if not _is_admin(_user_id(message)):
+        await message.answer(
+            "Ручные метки ставит администратор: метка меняет вердикт для всех "
+            "пользователей бота. Попросите его — или добавьте свой ID в ADMIN_TG_IDS.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     parts = (message.text or "").split()
     addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
     if not addresses:
