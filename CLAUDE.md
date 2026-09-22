@@ -42,7 +42,7 @@ bot/main.py              # aiogram 3, dp на верхнем уровне
 web/                     # index.html + static/{styles.css, app.js}
 core/data/               # вшитый снимок OFAC-списка (нужен в рантайме)
 docs/research/           # артефакты проверки источников (см. ROADMAP.md §5)
-tests/                   # 327 тестов, покрытие 85%
+tests/                   # 337 тестов, покрытие 85%
 ROADMAP.md               # аудит и план развития, статус по пунктам
 ```
 
@@ -226,7 +226,7 @@ TRC20-переводов, и между собой они не сходятся:
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 
-# Тесты (должны быть все зелёные: 268/268)
+# Тесты (должны быть все зелёные: 337/337)
 CACHE_PATH=./cache.db CLUSTER_PATH=./cluster.db HISTORY_PATH=./history.db \
 LABELS_PATH=./labels.db WATCHLIST_PATH=./watchlist.db pytest -q
 
