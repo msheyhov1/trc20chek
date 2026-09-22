@@ -160,6 +160,10 @@ async def check(address: str) -> dict[str, Any]:
         for e in (data.get("entities") or [])
         if isinstance(e, dict)
     ]
+    # Тот же контракт, что у Bitok: сначала самая весомая категория. Swapster
+    # отдаёт их в произвольном порядке, а бот и веб рисуют оба провайдера одним
+    # кодом и разбивку показывают как есть.
+    entities.sort(key=lambda e: e.get("risk_score") or 0, reverse=True)
     return {
         "available": True,
         "provider": PROVIDER,

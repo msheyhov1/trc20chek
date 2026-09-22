@@ -78,3 +78,84 @@ async def test_check_maps_response(monkeypatch):
     assert res["risk_level"] == "dangerous"
     assert res["entities"][0]["entity"] == "DARK MARKET"
     assert res["entities"][0]["risk_score"] == 90.0
+
+
+# ---------- подпись вердикта внешнего KYT ----------
+
+@pytest.mark.asyncio
+async def test_swapster_entities_are_sorted_by_share(monkeypatch):
+    """Бот и веб показывают разбивку как есть и рисуют обоих провайдеров одним
+    кодом, поэтому порядок должен быть одинаковым: сначала самая весомая
+    категория. Bitok так и отдаёт, Swapster — в произвольном порядке."""
+    monkeypatch.setenv("SWAPSTER_API_TOKEN", "test-token")
+
+    class FakeResp:
+        status_code, headers = 200, {}
+
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._p
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, **kw):
+            if method == "PUT":
+                return FakeResp({"reqId": "req-1"})
+            return FakeResp({
+                "pending": False,
+                "riskScore": 0.5,
+                "entities": [
+                    {"entity": "SMALL", "level": "LOW_RISK", "riskScore": 0.05},
+                    {"entity": "STOLEN_COINS", "level": "HIGH_RISK", "riskScore": 0.7},
+                    {"entity": "EXCHANGE", "level": "LOW_RISK", "riskScore": 0.25},
+                ],
+            })
+
+    monkeypatch.setattr(ax.httpx, "AsyncClient", FakeClient)
+    res = await ax.check("T" + "z" * 33)
+    assert [e["entity"] for e in res["entities"]] == ["STOLEN COINS", "EXCHANGE", "SMALL"]
+
+
+def test_verdict_label_names_the_riskiest_category():
+    """Подпись должна объяснять вердикт. Раньше бралась первая категория из
+    списка, а Swapster отдаёт их в произвольном порядке — и рядом с «высокий
+    риск» оказывалась безобидная строка вроде «биржа»."""
+    from core.aggregator import _top_risk_entity
+    ext = {
+        "entities": [
+            {"entity": "биржа", "level": "LOW_RISK", "risk_score": 60.0},
+            {"entity": "STOLEN COINS", "level": "HIGH_RISK", "risk_score": 31.7},
+            {"entity": "p2p", "level": "MEDIUM_RISK", "risk_score": 8.0},
+        ]
+    }
+    assert _top_risk_entity(ext) == "STOLEN COINS"
+
+
+def test_verdict_label_falls_back_to_share_within_one_level():
+    from core.aggregator import _top_risk_entity
+    ext = {
+        "entities": [
+            {"entity": "мелкая", "level": "HIGH_RISK", "risk_score": 2.0},
+            {"entity": "крупная", "level": "HIGH_RISK", "risk_score": 40.0},
+        ]
+    }
+    assert _top_risk_entity(ext) == "крупная"
+
+
+def test_verdict_label_is_none_without_entities():
+    from core.aggregator import _top_risk_entity
+    assert _top_risk_entity({}) is None
+    assert _top_risk_entity({"entities": ["мусор"]}) is None

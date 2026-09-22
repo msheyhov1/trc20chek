@@ -44,6 +44,33 @@ _AML_SKIP_TYPES = frozenset({EntityType.EXCHANGE, EntityType.CONTRACT, EntityTyp
 AML_EXCHANGE_ENTITY_THRESHOLD = float(os.getenv("AML_EXCHANGE_ENTITY_THRESHOLD", "0.9"))
 
 
+# Группы риска в общем формате entities (одинаковы у Swapster и Bitok).
+_ENTITY_LEVEL_ORDER = {"HIGH_RISK": 3, "MEDIUM_RISK": 2, "LOW_RISK": 1}
+
+
+def _top_risk_entity(ext: dict[str, Any]) -> str | None:
+    """Категория, которой подписывается вердикт внешнего KYT.
+
+    Раньше бралась первая из списка. У Bitok он отсортирован по доле объёма, а
+    Swapster отдаёт категории в произвольном порядке — и в подписи «высокий
+    риск — 31.7% (…)» оказывалась случайная категория, нередко безобидная,
+    вместо той, из-за которой риск и поднялся.
+
+    Берём самую весомую из САМЫХ рисковых: подпись должна объяснять вердикт,
+    а не пересказывать крупнейшую строку разбивки."""
+    entities = [e for e in (ext.get("entities") or []) if isinstance(e, dict)]
+    if not entities:
+        return None
+    top = max(
+        entities,
+        key=lambda e: (
+            _ENTITY_LEVEL_ORDER.get(str(e.get("level") or ""), 0),
+            e.get("risk_score") or 0,
+        ),
+    )
+    return top.get("entity") or None
+
+
 def _relabel_from_swapster(verdict: AddressVerdict, is_transit: bool) -> None:
     """Помечаем неопознанный адрес как биржу/сервис ТОЛЬКО если выполнено И то, И другое:
       1) Swapster показал доминирующую биржевую сущность (EXCHANGE*) ≥ порога;
@@ -202,7 +229,7 @@ def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
         if isinstance(pct, int | float):
             verdict.risk_score = max(verdict.risk_score, int(round(pct)))
         detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
-        top = (ext.get("entities") or [{}])[0].get("entity") or ext.get("entity_category_ru")
+        top = _top_risk_entity(ext) or ext.get("entity_category_ru")
         reason = f" ({top})" if top else ""
         verdict.risk_flags.append(
             f"{'⛔️' if level is RiskLevel.DANGEROUS else '⚠️'} {provider}: "
