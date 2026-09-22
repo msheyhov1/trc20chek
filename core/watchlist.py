@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import time
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+from .models import RISK_LEVEL_RU, RiskLevel
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +38,10 @@ TICK_SECONDS = int(os.getenv("WATCHLIST_TICK_SECONDS", "300"))
 BATCH_PER_TICK = int(os.getenv("WATCHLIST_BATCH_PER_TICK", "3"))
 # Сколько адресов может вести один пользователь.
 MAX_PER_USER = int(os.getenv("WATCHLIST_MAX_PER_USER", "20"))
+# Если проверка вышла неполной (источник не ответил), повторяем раньше
+# обычного интервала, но не на каждом тике: при долгом сбое TronScan это была
+# бы платная проверка каждые пять минут.
+RETRY_SECONDS = int(os.getenv("WATCHLIST_RETRY_SECONDS", "3600"))
 
 
 def is_enabled() -> bool:
@@ -149,6 +156,38 @@ async def due(limit: int | None = None) -> list[dict[str, Any]]:
     ]
 
 
+async def watchers_of(address: str) -> list[dict[str, Any]]:
+    """Все, кто наблюдает адрес, — чтобы одна проверка обслужила всех."""
+    if not ENABLED:
+        return []
+    try:
+        async with aiosqlite.connect(WATCHLIST_PATH) as db:
+            async with db.execute(
+                "SELECT chat_id, last_level, last_score FROM watchlist WHERE address = ?",
+                (address,),
+            ) as cur:
+                rows = await cur.fetchall()
+    except Exception:
+        return []
+    return [{"chat_id": r[0], "last_level": r[1], "last_score": r[2]} for r in rows]
+
+
+async def mark_attempted(address: str) -> None:
+    """Проверка не удалась или вышла неполной: точку отсчёта НЕ трогаем, а
+    следующую попытку назначаем через RETRY_SECONDS, а не через полный интервал."""
+    if not ENABLED:
+        return
+    next_due = time.time() - max(0, INTERVAL_SECONDS - RETRY_SECONDS)
+    try:
+        async with aiosqlite.connect(WATCHLIST_PATH) as db:
+            await db.execute(
+                "UPDATE watchlist SET last_check = ? WHERE address = ?", (next_due, address)
+            )
+            await db.commit()
+    except Exception as e:
+        log.warning("Мониторинг: не удалось отметить попытку %s (%s)", address, e)
+
+
 async def mark_checked(address: str, chat_id: int, level: str, score: int) -> None:
     if not ENABLED:
         return
@@ -217,38 +256,68 @@ async def run_loop(check_fn, notify_fn, stop: asyncio.Event | None = None) -> No
 
 
 async def tick(check_fn, notify_fn) -> int:
-    """Один проход. Возвращает число отправленных уведомлений."""
+    """Один проход. Возвращает число отправленных уведомлений.
+
+    Адрес проверяется ОДИН раз на всех, кто его наблюдает: раньше каждая пара
+    (адрес, пользователь) была отдельной платной проверкой.
+
+    Неполная проверка (источник не ответил, не успел, ещё считает) не считается
+    сменой уровня. Раньше сбой TronScan на санкционном адресе давал
+    «🔻 Риск снизился: dangerous → unknown» и записывал unknown как новую точку
+    отсчёта — а на следующей удачной проверке приходило «🔺 Риск вырос»."""
     notified = 0
+    seen: set[str] = set()
     for item in await due():
-        address, chat_id = item["address"], item["chat_id"]
+        address = item["address"]
+        if address in seen:
+            continue
+        seen.add(address)
         try:
             verdict = await check_fn(address)
         except Exception as e:
             log.warning("Мониторинг: проверка %s не удалась (%s)", address, e)
+            await mark_attempted(address)
+            continue
+        if verdict.is_degraded():
+            log.info("Мониторинг: проверка %s неполная — уровень не сравниваем", address)
+            await mark_attempted(address)
             continue
         level, score = verdict.risk_level.value, verdict.risk_score
-        previous = item.get("last_level")
-        await mark_checked(address, chat_id, level, score)
-        if previous is None or previous == level:
-            continue
-        try:
-            await notify_fn(chat_id, _change_text(verdict, previous, item.get("last_score")))
-            notified += 1
-        except Exception as e:
-            log.warning("Мониторинг: не удалось уведомить chat_id=%s (%s)", chat_id, e)
+        for w in await watchers_of(address):
+            chat_id, previous = w["chat_id"], w.get("last_level")
+            await mark_checked(address, chat_id, level, score)
+            if previous is None or previous == level:
+                continue
+            try:
+                await notify_fn(chat_id, _change_text(verdict, previous, w.get("last_score")))
+                notified += 1
+            except Exception as e:
+                log.warning("Мониторинг: не удалось уведомить chat_id=%s (%s)", chat_id, e)
     return notified
 
 
 def _change_text(verdict, previous_level: str, previous_score: int | None) -> str:
+    """Текст уведомления. Всё внешнее экранируется: имя сущности приходит из
+    TronScan и KYT, и «Tom & Jerry <OTC>» ломал HTML — Telegram отклонял
+    сообщение, и уведомление молча не доходило."""
     grew = _ORDER.get(verdict.risk_level.value, 0) > _ORDER.get(previous_level, 0)
     head = "🔺 Риск вырос" if grew else "🔻 Риск снизился"
+    was = _level_ru(previous_level)
     return (
         f"<b>{head}</b> по наблюдаемому адресу\n"
-        f"<code>{verdict.address}</code>\n\n"
-        f"Было: {previous_level} ({previous_score if previous_score is not None else '?'}/100)\n"
-        f"Стало: {verdict.risk_level.value} ({verdict.risk_score}/100)\n"
-        f"Сущность: {verdict.entity or '—'}"
+        f"<code>{html.escape(verdict.address)}</code>\n\n"
+        f"Было: {html.escape(was)} "
+        f"({previous_score if previous_score is not None else '?'}/100)\n"
+        f"Стало: {html.escape(verdict.risk_level_ru())} ({verdict.risk_score}/100)\n"
+        f"Сущность: {html.escape(verdict.entity or '—')}"
     )
+
+
+def _level_ru(value: str | None) -> str:
+    try:
+        return RISK_LEVEL_RU[RiskLevel(value)]
+    except (ValueError, KeyError):
+        return value or "—"
 
 
 _ORDER = {"unknown": 0, "safe": 1, "caution": 2, "dangerous": 3}

@@ -58,8 +58,31 @@ async def init_db() -> None:
             )
             """
         )
+        # Миграция: признак полноты проверки появился позже таблицы, а том на
+        # Railway переживает редеплой. Дубликат колонки — не ошибка.
+        try:
+            await db.execute("ALTER TABLE checks ADD COLUMN complete INTEGER DEFAULT 1")
+        except Exception:
+            pass
         await db.execute("CREATE INDEX IF NOT EXISTS idx_checks_addr ON checks(address)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_checks_time ON checks(checked_at)")
+        # Кто что смотрел в боте. Отдельно от checks: общий журнал — это учёт
+        # расхода и сравнение с прошлым, а /history в боте показывал каждому
+        # проверки ВСЕХ пользователей из белого списка.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS views (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                address     TEXT NOT NULL,
+                checked_at  REAL NOT NULL,
+                risk_level  TEXT,
+                risk_score  INTEGER,
+                entity      TEXT
+            )
+            """
+        )
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_views_user ON views(user_id, id)")
         await db.commit()
 
 
@@ -71,7 +94,8 @@ async def record(verdict: Any, source: str = "api") -> None:
         async with aiosqlite.connect(HISTORY_PATH) as db:
             await db.execute(
                 "INSERT INTO checks (address, checked_at, risk_level, risk_score, "
-                "entity, entity_type, source, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "entity, entity_type, source, payload, complete) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     verdict.address,
                     time.time(),
@@ -81,11 +105,74 @@ async def record(verdict: Any, source: str = "api") -> None:
                     verdict.entity_type.value,
                     source,
                     json.dumps(verdict.to_dict(), ensure_ascii=False),
+                    0 if _degraded(verdict) else 1,
                 ),
             )
             await db.commit()
     except Exception as e:
         log.warning("Журнал проверок: не удалось записать %s (%s)", verdict.address, e)
+        return
+    await _maybe_prune()
+
+
+def _degraded(verdict: Any) -> bool:
+    check = getattr(verdict, "is_degraded", None)
+    return bool(check()) if callable(check) else False
+
+
+# Чистка раньше шла только при старте: сервис, работающий месяцами без
+# рестарта, копил журнал без ограничений. Теперь — не чаще раза в сутки.
+PRUNE_EVERY_SECONDS = 24 * 3600
+_last_prune = 0.0
+
+
+async def _maybe_prune() -> None:
+    global _last_prune
+    now = time.time()
+    if now - _last_prune < PRUNE_EVERY_SECONDS:
+        return
+    _last_prune = now
+    await prune()
+
+
+async def record_view(user_id: int, verdict: Any) -> None:
+    """Пользователь бота посмотрел вердикт — для его личного /history."""
+    if not ENABLED:
+        return
+    try:
+        async with aiosqlite.connect(HISTORY_PATH) as db:
+            await db.execute(
+                "INSERT INTO views (user_id, address, checked_at, risk_level, "
+                "risk_score, entity) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, verdict.address, time.time(), verdict.risk_level.value,
+                 verdict.risk_score, verdict.entity),
+            )
+            await db.commit()
+    except Exception as e:
+        log.warning("Журнал просмотров: не удалось записать (%s)", e)
+
+
+async def recent_views(user_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    """Последние проверки ОДНОГО пользователя, без повторов адреса."""
+    if not ENABLED:
+        return []
+    limit = max(1, min(limit, 200))
+    try:
+        async with aiosqlite.connect(HISTORY_PATH) as db:
+            async with db.execute(
+                "SELECT address, MAX(checked_at), risk_level, risk_score, entity "
+                "FROM views WHERE user_id = ? GROUP BY address "
+                "ORDER BY MAX(id) DESC LIMIT ?",
+                (user_id, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+    except Exception:
+        return []
+    return [
+        {"address": r[0], "checked_at": r[1], "risk_level": r[2],
+         "risk_score": r[3], "entity": r[4]}
+        for r in rows
+    ]
 
 
 async def previous(address: str, before_id: int | None = None) -> dict[str, Any] | None:
@@ -94,9 +181,11 @@ async def previous(address: str, before_id: int | None = None) -> dict[str, Any]
         return None
     try:
         async with aiosqlite.connect(HISTORY_PATH) as db:
+            # Только полные проверки: сравнение «было/стало» с проверкой, где
+            # TronScan не ответил, выдаёт сбой источника за смену риска.
             sql = (
                 "SELECT id, checked_at, risk_level, risk_score, entity, entity_type "
-                "FROM checks WHERE address = ?"
+                "FROM checks WHERE address = ? AND COALESCE(complete, 1) = 1"
             )
             params: list[Any] = [address]
             if before_id is not None:
@@ -193,13 +282,17 @@ async def prune() -> int:
                 cutoff = time.time() - RETENTION_DAYS * 86400
                 cur = await db.execute("DELETE FROM checks WHERE checked_at < ?", (cutoff,))
                 removed += cur.rowcount or 0
-            if MAX_ROWS > 0:
-                cur = await db.execute(
-                    "DELETE FROM checks WHERE id NOT IN "
-                    "(SELECT id FROM checks ORDER BY id DESC LIMIT ?)",
-                    (MAX_ROWS,),
-                )
+            if RETENTION_DAYS > 0:
+                cur = await db.execute("DELETE FROM views WHERE checked_at < ?", (cutoff,))
                 removed += cur.rowcount or 0
+            if MAX_ROWS > 0:
+                for table in ("checks", "views"):
+                    cur = await db.execute(
+                        f"DELETE FROM {table} WHERE id NOT IN "  # noqa: S608
+                        f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+                        (MAX_ROWS,),
+                    )
+                    removed += cur.rowcount or 0
             await db.commit()
     except Exception as e:
         log.warning("Журнал проверок: чистка не удалась (%s)", e)

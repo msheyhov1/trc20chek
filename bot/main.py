@@ -485,7 +485,7 @@ HELP_TEXT = (
     "/help — эта справка\n"
     "/id — ваш Telegram ID (нужен для белого списка)\n"
     "/status — что сконфигурировано на сервере\n"
-    "/history — последние проверки\n"
+    "/history — ваши последние проверки (/history all — всех)\n"
     "/stats — сколько проверок сделано (расход платных лимитов)\n"
     "/labels, /label, /unlabel — свои метки адресов без редеплоя\n"
     "/watch, /unwatch, /watchlist — следить за адресом и узнать об изменении\n\n"
@@ -562,14 +562,24 @@ async def cmd_status(message: Message):
 async def cmd_history(message: Message):
     """Последние проверки. Возвращаться к уже смотренному адресу приходится
     постоянно, а раньше его нужно было вводить заново."""
-    items = await history.recent(limit=10)
+    # Раньше каждый видел проверки всех пользователей из белого списка.
+    # Общий журнал остался доступен явно: /history all.
+    show_all = len((message.text or "").split()) > 1 and message.text.split()[1] == "all"
+    uid = _user_id(message)
+    if show_all or uid is None:
+        items = await history.recent(limit=10)
+        title = "<b>🕘 Последние проверки — все пользователи</b>"
+    else:
+        items = await history.recent_views(uid, limit=10)
+        title = "<b>🕘 Ваши последние проверки</b>"
     if not items:
         await message.answer(
-            "Журнал пуст. Он ведётся на диске сервера и наполняется по мере проверок.",
+            "Журнал пуст. Он ведётся на диске сервера и наполняется по мере проверок."
+            + ("" if show_all else "\nПроверки всех пользователей: /history all"),
             parse_mode=ParseMode.HTML,
         )
         return
-    lines = ["<b>🕘 Последние проверки</b>"]
+    lines = [title]
     for it in items:
         emoji = RISK_EMOJI.get(_level(it.get("risk_level")), "⚪")
         when = _fmt_age(int(time.time() - (it.get("checked_at") or 0))).lstrip(", ")
@@ -814,10 +824,19 @@ def _fit_message(text: str) -> str:
     return head + note
 
 
-async def _check_and_render(addr: str) -> str:
-    """Свежая проверка (без кеша — для AML важна актуальность транзакций)."""
+async def _check_and_render(addr: str, user_id: int | None = None) -> str:
+    """Свежая проверка (без кеша — для AML важна актуальность транзакций).
+
+    Просмотр пишется в личную историю пользователя: общий журнал хранит все
+    проверки сервиса, а /history каждому показывает только его собственные."""
     v = await check_address(addr, use_cache=False, source="bot")
+    if user_id is not None:
+        await history.record_view(user_id, v)
     return _fit_message(format_verdict(v))
+
+
+def _user_id(obj: Message | CallbackQuery) -> int | None:
+    return obj.from_user.id if obj.from_user else None
 
 
 async def _check_one(message: Message, addr: str, counter: str = "") -> None:
@@ -826,7 +845,7 @@ async def _check_one(message: Message, addr: str, counter: str = "") -> None:
         PROGRESS_TEXT.format(addr=addr, counter=counter), parse_mode=ParseMode.HTML
     )
     try:
-        text = await _check_and_render(addr)
+        text = await _check_and_render(addr, _user_id(message))
     except Exception as e:
         log.exception("check failed for %s", addr)
         await progress.edit_text(
@@ -842,7 +861,17 @@ async def _check_one(message: Message, addr: str, counter: str = "") -> None:
 @dp.message(F.text)
 async def on_text(message: Message):
     text = message.text or ""
-    addresses = extract_addresses(text, limit=MAX_ADDRESSES_PER_MESSAGE)
+    found = extract_addresses(text)
+    addresses = found[:MAX_ADDRESSES_PER_MESSAGE]
+    if len(found) > len(addresses):
+        # Раньше лишние адреса отбрасывались молча, и человек считал, что
+        # проверены все.
+        await message.answer(
+            f"Нашёл адресов: {len(found)}, за раз проверяю до "
+            f"{MAX_ADDRESSES_PER_MESSAGE}. Остальные пришлите отдельно или "
+            f"файлом — из файла проверю до {MAX_ADDRESSES_PER_FILE}.",
+            parse_mode=ParseMode.HTML,
+        )
 
     if not addresses:
         if looks_like_address_attempt(text):
@@ -875,23 +904,35 @@ async def on_text(message: Message):
 
 @dp.callback_query(F.data.startswith("recheck:"))
 async def on_recheck(callback: CallbackQuery):
+    """Перепроверка по кнопке.
+
+    На колбэк Telegram разрешает ответить ОДИН раз и недолго. Раньше при ошибке
+    отвечали второй раз — Telegram это отклонял, и пользователь не видел ни
+    ошибки, ни нового вердикта. А пока шла проверка (до полутора минут), на
+    экране висел старый вердикт без признаков работы. Теперь сообщение сразу
+    переходит в «проверяю», а результат или ошибка приходят правкой его же."""
     addr = (callback.data or "").split(":", 1)[1]
     if not is_valid_trc20_address(addr):
         await callback.answer("Невалидный адрес", show_alert=True)
         return
     await callback.answer("Проверяю заново…")
-    try:
-        text = await _check_and_render(addr)
-    except Exception as e:
-        log.exception("recheck failed")
-        await callback.answer(f"Ошибка: {e}", show_alert=True)
+    msg = callback.message
+    if msg is None:
         return
     try:
-        await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr)
+        await msg.edit_text(
+            PROGRESS_TEXT.format(addr=addr, counter=""), parse_mode=ParseMode.HTML
         )
+    except TelegramBadRequest:
+        pass  # сообщение не редактируется (слишком старое) — просто ждём результат
+    try:
+        text = await _check_and_render(addr, _user_id(callback))
+    except Exception as e:
+        log.exception("recheck failed for %s", addr)
+        text = f"⚠️ Не удалось перепроверить <code>{_esc(addr)}</code>: {_esc(e)}"
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr))
     except TelegramBadRequest as e:
-        # Telegram ругается, если текст не изменился — это нормальный исход.
         if "not modified" not in str(e):
             raise
 

@@ -91,8 +91,9 @@ def test_authorize_accepts_api_key_from_header(monkeypatch):
     """Ключ в query попадает в логи и историю браузера — заголовок предпочтительнее,
     но оба должны работать."""
     monkeypatch.setattr(am, "API_KEY", "s3cret")
-    assert am._authorize(_request({"x-api-key": "s3cret"}), None) is None
-    assert am._authorize(_request(), "s3cret") is None
+    # False — «лимиты не применяются»: клиент с ключом не тратит публичную квоту
+    assert am._authorize(_request({"x-api-key": "s3cret"}), None) is False
+    assert am._authorize(_request(), "s3cret") is False
     with pytest.raises(HTTPException) as exc:
         am._authorize(_request({"x-api-key": "wrong"}), None)
     assert exc.value.status_code == 401
@@ -113,7 +114,7 @@ def test_authorize_rate_limits_public_access(monkeypatch):
         am._authorize(_request(ip="9.9.9.9"), None)
     assert exc.value.status_code == 429
     # другой IP не задет
-    assert am._authorize(_request(ip="8.8.8.8"), None) is None
+    assert am._authorize(_request(ip="8.8.8.8"), None) is True
 
 
 def test_authorize_skips_rate_limit_for_api_key_clients(monkeypatch):
@@ -124,9 +125,54 @@ def test_authorize_skips_rate_limit_for_api_key_clients(monkeypatch):
         am._authorize(_request({"x-api-key": "k"}), None)
 
 
-def test_client_ip_prefers_forwarded_header():
-    assert am.client_ip(_request({"x-forwarded-for": "5.6.7.8, 10.0.0.1"})) == "5.6.7.8"
+def test_client_ip_trusts_only_the_proxy_appended_entry(monkeypatch):
+    """Прокси дописывает адрес в КОНЕЦ X-Forwarded-For, начало присылает клиент.
+    Раньше брался первый адрес — то есть тот, что клиент написал сам."""
+    monkeypatch.setattr(am, "TRUSTED_PROXY_HOPS", 1)
+    assert am.client_ip(_request({"x-forwarded-for": "6.6.6.6, 5.6.7.8"})) == "5.6.7.8"
+    assert am.client_ip(_request({"x-forwarded-for": "5.6.7.8"})) == "5.6.7.8"
     assert am.client_ip(_request(ip="4.4.4.4")) == "4.4.4.4"
+    monkeypatch.setattr(am, "TRUSTED_PROXY_HOPS", 2)
+    assert am.client_ip(
+        _request({"x-forwarded-for": "6.6.6.6, 5.6.7.8, 10.0.0.1"})
+    ) == "5.6.7.8"
+    monkeypatch.setattr(am, "TRUSTED_PROXY_HOPS", 0)      # без прокси — заголовку не верим
+    assert am.client_ip(_request({"x-forwarded-for": "6.6.6.6"}, ip="4.4.4.4")) == "4.4.4.4"
+
+
+def test_spoofed_forwarded_for_does_not_bypass_limit(monkeypatch):
+    """Лимит «2 проверки на IP» пропускал 10 из 10 запросов при смене заголовка."""
+    from api.ratelimit import RateLimiter
+    monkeypatch.setattr(am, "API_KEY", "")
+    monkeypatch.setattr(am, "WEB_PASSWORD", "")
+    monkeypatch.setattr(am, "WEB_PUBLIC", True)
+    monkeypatch.setattr(am, "TRUSTED_PROXY_HOPS", 1)
+    monkeypatch.setattr(am, "limiter", RateLimiter(per_ip=2, window_seconds=3600, daily_total=0))
+    passed = 0
+    for i in range(10):
+        try:
+            am._authorize(_request({"x-forwarded-for": f"6.6.6.{i}, 34.1.2.3"}), None)
+            passed += 1
+        except HTTPException:
+            pass
+    assert passed == 2
+
+
+def test_rejected_batch_does_not_burn_quota(monkeypatch):
+    """Пакет списывал квоту по адресу и падал на середине: квота уходила,
+    а проверок не было ни одной."""
+    from api.ratelimit import RateLimiter
+    monkeypatch.setattr(am, "API_KEY", "")
+    monkeypatch.setattr(am, "WEB_PASSWORD", "")
+    monkeypatch.setattr(am, "WEB_PUBLIC", True)
+    lim = RateLimiter(per_ip=3, window_seconds=3600, daily_total=0)
+    monkeypatch.setattr(am, "limiter", lim)
+    with pytest.raises(HTTPException) as exc:
+        am._authorize(_request(ip="1.1.1.1"), None, cost=5, record=False)
+    assert exc.value.status_code == 429
+    assert lim.stats()["daily_used"] == 0
+    # а пакет, который помещается, проходит
+    assert am._authorize(_request(ip="1.1.1.1"), None, cost=3, record=False) is True
 
 
 def test_openapi_schema_is_not_public():

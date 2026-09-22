@@ -814,10 +814,20 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
     if not result:
         return
 
-    raised = [
-        k for k, v in result.items()
-        if v == "1" and k not in {"data_source", "contract_address"}
-    ]
+    # Флаги GoPlus — строки «0»/«1», но часть полей — счётчики:
+    # number_of_malicious_contracts_created = «3». Раньше срабатывало только
+    # значение «1»: адрес с ОДНИМ вредоносным контрактом помечался, а с тремя — нет.
+    raised: list[str] = []
+    counts: dict[str, int] = {}
+    for k, v in result.items():
+        if k in {"data_source", "contract_address"}:
+            continue
+        sv = str(v).strip()
+        if sv == "1":
+            raised.append(k)
+        elif sv.isdigit() and int(sv) > 1:
+            raised.append(k)
+            counts[k] = int(sv)
     verdict.raw_labels["goplus"] = {
         "flags_raised": raised,
         "data_source": result.get("data_source"),
@@ -829,7 +839,8 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
     verdict.sources.append(f"GoPlus ({src})")
     for f in raised:
         mark = "⛔️ " if f in CRITICAL_GOPLUS_FLAGS else ""
-        verdict.risk_flags.append(f"{mark}GoPlus: {f.replace('_', ' ')}")
+        count = f" ({counts[f]})" if f in counts else ""
+        verdict.risk_flags.append(f"{mark}GoPlus: {f.replace('_', ' ')}{count}")
 
 
 def _detect_exchange_deposit(
@@ -1378,8 +1389,9 @@ def _apply_token_security(data: dict[str, Any] | None, verdict: AddressVerdict) 
     flags, serious = token_security.describe(data)
     verdict.risk_flags.extend(flags)
     if serious and verdict.entity_type is EntityType.CONTRACT:
-        # Контракт с функцией блокировки или помеченный небезопасным — это не
-        # «смарт-контракт, вероятно всё в порядке».
+        # Контракт, который TronScan помечает небезопасным, или токен со ссылкой
+        # в имени — это не «смарт-контракт, вероятно всё в порядке». Функция
+        # блокировки к «серьёзному» НЕ относится: она есть у USDT.
         verdict.entity_type = EntityType.HIGH_RISK_SERVICE
     if "TronScan security" not in verdict.sources:
         verdict.sources.append("TronScan security")
@@ -2011,7 +2023,9 @@ async def _apply_history(verdict: AddressVerdict, source: str) -> None:
     журнала глушатся внутри core.history: он необязательный."""
     prev = await history.previous(verdict.address)
     await history.record(verdict, source)
-    if not prev:
+    if not prev or verdict.is_degraded():
+        # Неполная проверка не сравнивается: иначе «TronScan не ответил»
+        # читается как «риск снизился», а следующая полная — как «вырос».
         return
     verdict.raw_labels["previous_check"] = prev
     old_level, new_level = prev.get("risk_level"), verdict.risk_level.value
@@ -2370,8 +2384,9 @@ async def _check_address(
     await _apply_history(verdict, source)
     _order_flags(verdict)
 
-    # Кеш
-    if use_cache:
+    # Кеш. Неполный вердикт не кешируем: иначе результат, полученный во время
+    # сбоя TronScan, неделю отдавался бы как готовый.
+    if use_cache and not verdict.is_degraded():
         await cache.put(address, verdict.to_dict())
 
     _partial.pop((address, use_cache), None)

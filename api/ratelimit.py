@@ -57,18 +57,28 @@ class RateLimiter:
             if not hits:
                 del self._hits[ip]
 
-    def check(self, ip: str) -> tuple[bool, str]:
-        """(разрешено, причина отказа). Отказ НЕ увеличивает счётчики."""
+    def check(self, ip: str, n: int = 1) -> tuple[bool, str]:
+        """(разрешено, причина отказа) для N проверок разом. Отказ НЕ
+        увеличивает счётчики.
+
+        N нужен пакетной проверке: раньше пакет списывал квоту по одному адресу
+        и падал на середине — квота уходила, а проверок не было ни одной."""
         now = time.time()
         self._prune(now)
-        if self.daily_total > 0 and len(self._day) >= self.daily_total:
+        if self.daily_total > 0 and len(self._day) + n > self.daily_total:
+            left = max(0, self.daily_total - len(self._day))
             return False, (
-                f"Суточный лимит проверок исчерпан ({self.daily_total}). "
-                f"Лимит защищает платные квоты AML-сервисов."
+                f"Суточный лимит проверок исчерпан ({self.daily_total}, осталось "
+                f"{left}). Лимит защищает платные квоты AML-сервисов."
             )
-        hits = self._hits.get(ip)
-        if self.per_ip > 0 and hits is not None and len(hits) >= self.per_ip:
-            retry_in = int(self.window - (now - hits[0])) + 1
+        hits = self._hits.get(ip) or deque()
+        if self.per_ip > 0 and len(hits) + n > self.per_ip:
+            if n > self.per_ip:
+                return False, (
+                    f"За раз можно проверить не больше {self.per_ip} адресов "
+                    f"с одного IP (лимит на {self.window // 60} мин)."
+                )
+            retry_in = int(self.window - (now - hits[0])) + 1 if hits else self.window
             return False, (
                 f"Слишком много проверок с одного адреса ({self.per_ip} за "
                 f"{self.window // 60} мин). Попробуйте через {retry_in} с."

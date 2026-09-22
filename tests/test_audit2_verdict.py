@@ -252,3 +252,49 @@ async def test_deposit_into_ofac_address_labelled_as_exchange_is_sanctioned(monk
     assert v.sanction_source == "OFAC SDN"
     assert v.risk_score == 100
     assert any("адрес из санкционного списка OFAC" in f for f in v.risk_flags)
+
+
+# ---------- GoPlus: поля-счётчики ----------
+
+def test_goplus_count_fields_are_raised():
+    """Адрес с ОДНИМ вредоносным контрактом помечался, а с тремя — нет:
+    срабатывало только значение «1»."""
+    v = AddressVerdict(address=A)
+    agg._apply_goplus({"result": {"number_of_malicious_contracts_created": "3"}}, v)
+    assert v.risk_flags == ["GoPlus: number of malicious contracts created (3)"]
+    zero = AddressVerdict(address=A)
+    agg._apply_goplus({"result": {"number_of_malicious_contracts_created": "0"}}, zero)
+    assert zero.risk_flags == []
+
+
+# ---------- кеш не хранит неполные вердикты ----------
+
+async def test_degraded_verdict_is_not_cached(monkeypatch):
+    put = AsyncMock()
+    monkeypatch.setattr(agg.cache, "get", AsyncMock(return_value=None))
+    monkeypatch.setattr(agg.cache, "put", put)
+    ctx = [patch(k, new=v) for k, v in _patches(**{
+        "core.aggregator.tronscan.fetch_account":
+            AsyncMock(side_effect=ProviderError("down")),
+    }).items()]
+    for c in ctx:
+        c.start()
+    try:
+        v = await agg.check_address(A, use_cache=True)
+    finally:
+        for c in ctx:
+            c.stop()
+    assert v.is_degraded()
+    put.assert_not_awaited()
+
+
+async def test_degraded_check_does_not_claim_verdict_change(monkeypatch):
+    """«Вердикт изменился» при неполной проверке читается как смена риска,
+    хотя это сбой источника."""
+    prev = {"risk_level": "dangerous", "risk_score": 100}
+    v = await _check(A, **{
+        "core.aggregator.history.previous": AsyncMock(return_value=prev),
+        "core.aggregator.tronscan.fetch_account":
+            AsyncMock(side_effect=ProviderError("down")),
+    })
+    assert not any("Вердикт изменился" in f for f in v.risk_flags)
