@@ -520,3 +520,13 @@ async def test_bot_edits_progress_message_twice(kyt_configured, monkeypatch):
     assert len(texts) == 2
     assert "Предварительный вердикт" in texts[0]
     assert "Предварительный вердикт" not in texts[1]
+
+
+def test_partial_hop2_does_not_make_the_check_degraded():
+    """Хронический 429 по одному посреднику не должен навсегда лишать адрес
+    мониторинга: уровень фиксируется, флаг о неполном 2-м хопе остаётся."""
+    v = AddressVerdict(address=A)
+    v.provider_status = {"tronscan": "ok", "flow": "ok", "hop2": "partial"}
+    assert v.is_degraded() is False
+    v.provider_status["bitok"] = "pending"
+    assert v.is_degraded() is True

@@ -126,7 +126,7 @@ LABELS_PATH=./labels.db WATCHLIST_PATH=./watchlist.db pytest -q
 ruff check .
 ```
 
-410 тестов, покрытие 87 %. CI (GitHub Actions) прогоняет линтер, тесты, покрытие и
+411 тестов, покрытие 87 %. CI (GitHub Actions) прогоняет линтер, тесты, покрытие и
 сборку Docker-образа с проверкой, что контейнер отвечает на `/health`.
 
 ## Кастомизация
