@@ -32,8 +32,10 @@ TRONSCAN_BASE = "https://apilist.tronscanapi.com"
 TRONSCAN_API_KEY = os.getenv("TRONSCAN_API_KEY", "")
 
 
-async def _get(path: str, address: str, client: httpx.AsyncClient) -> dict[str, Any]:
-    headers = {"TRON-PRO-API-KEY": TRONSCAN_API_KEY} if TRONSCAN_API_KEY else {}
+async def _get(
+    path: str, address: str, client: httpx.AsyncClient, with_key: bool = True
+) -> dict[str, Any]:
+    headers = {"TRON-PRO-API-KEY": TRONSCAN_API_KEY} if (TRONSCAN_API_KEY and with_key) else {}
     r = await client.get(
         f"{TRONSCAN_BASE}{path}",
         params={"address": address},
@@ -55,13 +57,16 @@ async def fetch_account(address: str, client: httpx.AsyncClient) -> dict[str, An
     ProviderError.
     """
     errors: list[str] = []
-    try:
-        return await _get("/api/account", address, client)
-    except (httpx.HTTPError, ValueError) as e:
-        errors.append(f"account: {e}")
+    attempts: list[tuple[str, bool]] = [("/api/account", True)]
     if TRONSCAN_API_KEY:
+        # Отозванный или опечатанный ключ даёт 401/403 на КАЖДЫЙ запрос, хотя
+        # без ключа /api/account работает. Раньше повтора без ключа не было, и
+        # недействительный ключ делал «НЕПОЛНОЙ» каждую проверку. Переводы
+        # (flow.py) так и устроены — теперь метки тоже.
+        attempts += [("/api/account", False), ("/api/accountv2", True)]
+    for path, with_key in attempts:
         try:
-            return await _get("/api/accountv2", address, client)
+            return await _get(path, address, client, with_key)
         except (httpx.HTTPError, ValueError) as e:
-            errors.append(f"accountv2: {e}")
+            errors.append(f"{path.rsplit('/', 1)[-1]}{'' if with_key else ' без ключа'}: {e}")
     raise ProviderError("TronScan: " + "; ".join(errors))

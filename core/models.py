@@ -55,6 +55,17 @@ RISK_LEVEL_RU: dict[RiskLevel, str] = {
 }
 
 
+# Исходы источника, при которых вердикт неполный: источник не ответил, не успел
+# или платный KYT ещё считает.
+#
+# «partial» (2-й хоп проверил не всех посредников) сюда намеренно НЕ входит.
+# Если TronScan хронически отдаёт 429 по одному посреднику, мониторинг такого
+# адреса никогда не зафиксировал бы уровень и повторял бы платную проверку
+# каждый час. Вклад 2-го хопа — не больше «косвенно × 0.6», уровень он сам
+# почти не меняет, а флаг о неполном 2-м хопе в вердикте остаётся.
+_DEGRADED_STATUSES = frozenset({"error", "timeout", "pending"})
+
+
 def _enum_or(enum_cls, value: Any, default):
     """Безопасное восстановление enum из строки: незнакомое значение → default."""
     try:
@@ -110,6 +121,12 @@ class AddressVerdict:
 
     def risk_level_ru(self) -> str:
         return RISK_LEVEL_RU.get(self.risk_level, self.risk_level.value)
+
+    def is_degraded(self) -> bool:
+        """Проверка неполная: какой-то источник не ответил, не успел или ещё
+        считает. Такой вердикт нельзя сравнивать с прошлым как равный — иначе
+        «TronScan лёг» превращается в «риск снизился» (см. watchlist, history)."""
+        return any(st in _DEGRADED_STATUSES for st in self.provider_status.values())
 
     def to_dict(self) -> dict[str, Any]:
         return {

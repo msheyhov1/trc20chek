@@ -22,6 +22,7 @@ from aiogram.types import (
 
 from core import check_address, history, labels, watchlist
 from core.addresses import extract_addresses, looks_like_address_attempt
+from core.aggregator import flag_rank
 from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +64,19 @@ def _parse_ids(raw: str) -> set[int]:
 # Сырое значение храним, чтобы отличить «не задан» от «задан, но не разобрался».
 ALLOWED_TG_IDS_RAW = os.getenv("ALLOWED_TG_IDS", "")
 ALLOWED_TG_IDS = _parse_ids(ALLOWED_TG_IDS_RAW)
+
+
+# Кто может ставить и снимать ручные метки. С реестром сервисов метка влияет не
+# только на свой адрес, но и на вердикты адресов, пересылающих на него, —
+# поэтому в команде её стоит доверять не каждому. Пусто — как раньше: любой
+# из белого списка.
+ADMIN_TG_IDS = _parse_ids(os.getenv("ADMIN_TG_IDS", ""))
+
+
+def _is_admin(user_id: int | None) -> bool:
+    if not ADMIN_TG_IDS:
+        return True
+    return user_id is not None and user_id in ADMIN_TG_IDS
 
 
 def _is_allowed(user_id: int | None) -> bool:
@@ -271,6 +285,9 @@ def _aml_provider_lines(ext: dict, number: int) -> list[str]:
     pct = ext.get("risk_score")
     level_ru = _BITOK_LEVEL_RU.get(ext.get("level_raw") or "")
     suffix = f" · {level_ru}" if level_ru else ""
+    cached = ext.get("cache_age_seconds")
+    if isinstance(cached, int):
+        suffix += f" · <i>результат{_esc(_fmt_age(cached))}</i>"
     lines = [f"{head} — {_aml_risk_emoji(pct)} <b>{_fmt_pct(pct)}</b>{suffix}"]
 
     # Опознанная сущность (Bitok отдаёт имя + категорию)
@@ -370,6 +387,13 @@ def format_verdict(v: AddressVerdict) -> str:
     lines = [
         f"{emoji} <b>{_esc(v.risk_level_ru())}</b> · риск {v.risk_score}/100",
         f"<code>{_score_bar(v.risk_score)}</code>",
+    ]
+    # За что столько баллов — одной строкой, чтобы число не приходилось
+    # угадывать по списку находок.
+    reason = (v.aml or {}).get("score_reason")
+    if reason and v.risk_score > 0:
+        lines.append(f"<i>🧮 {_esc(reason)}</i>")
+    lines += [
         "",
         f"🏷 <b>{_esc(v.entity or '—')}</b>",
         f"<i>Тип:</i> {_esc(v.entity_type_ru())}",
@@ -384,10 +408,15 @@ def format_verdict(v: AddressVerdict) -> str:
     if v.risk_flags:
         lines.append("")
         lines.append("<b>⚠️ Что нашли</b>")
-        for flag in v.risk_flags[:8]:
+        # Флаги приходят отсортированными по важности. Показываем восемь, но
+        # решающие (санкции, блокировка, «опасно») — всегда все: обрезать
+        # можно справку, а не причину вердикта.
+        decisive = sum(1 for f in v.risk_flags if flag_rank(str(f)) <= 1)
+        shown = max(8, decisive)
+        for flag in v.risk_flags[:shown]:
             lines.append(f"• {_esc(_flag_ru(str(flag)))}")
-        if len(v.risk_flags) > 8:
-            lines.append(f"<i>…и ещё {len(v.risk_flags) - 8}</i>")
+        if len(v.risk_flags) > shown:
+            lines.append(f"<i>…и ещё {len(v.risk_flags) - shown}</i>")
 
     # Связи с биржами (по контрагентам переводов)
     if v.exchange_links:
@@ -479,7 +508,7 @@ HELP_TEXT = (
     "/help — эта справка\n"
     "/id — ваш Telegram ID (нужен для белого списка)\n"
     "/status — что сконфигурировано на сервере\n"
-    "/history — последние проверки\n"
+    "/history — ваши последние проверки (/history all — всех)\n"
     "/stats — сколько проверок сделано (расход платных лимитов)\n"
     "/labels, /label, /unlabel — свои метки адресов без редеплоя\n"
     "/watch, /unwatch, /watchlist — следить за адресом и узнать об изменении\n\n"
@@ -546,6 +575,10 @@ async def cmd_status(message: Message):
         f"{mark(aml_bitok.is_configured())} Bitok",
         "",
         f"Доступ к боту: {len(ALLOWED_TG_IDS)} Telegram ID в белом списке",
+        "Ручные метки: " + (
+            f"только администраторы ({len(ADMIN_TG_IDS)})" if ADMIN_TG_IDS
+            else "любой из белого списка"
+        ),
         f"Страниц истории переводов: {flow_provider.FLOW_PAGES} "
         f"(по {flow_provider.TRANSFERS_LIMIT})",
     ]
@@ -556,14 +589,24 @@ async def cmd_status(message: Message):
 async def cmd_history(message: Message):
     """Последние проверки. Возвращаться к уже смотренному адресу приходится
     постоянно, а раньше его нужно было вводить заново."""
-    items = await history.recent(limit=10)
+    # Раньше каждый видел проверки всех пользователей из белого списка.
+    # Общий журнал остался доступен явно: /history all.
+    show_all = len((message.text or "").split()) > 1 and message.text.split()[1] == "all"
+    uid = _user_id(message)
+    if show_all or uid is None:
+        items = await history.recent(limit=10)
+        title = "<b>🕘 Последние проверки — все пользователи</b>"
+    else:
+        items = await history.recent_views(uid, limit=10)
+        title = "<b>🕘 Ваши последние проверки</b>"
     if not items:
         await message.answer(
-            "Журнал пуст. Он ведётся на диске сервера и наполняется по мере проверок.",
+            "Журнал пуст. Он ведётся на диске сервера и наполняется по мере проверок."
+            + ("" if show_all else "\nПроверки всех пользователей: /history all"),
             parse_mode=ParseMode.HTML,
         )
         return
-    lines = ["<b>🕘 Последние проверки</b>"]
+    lines = [title]
     for it in items:
         emoji = RISK_EMOJI.get(_level(it.get("risk_level")), "⚪")
         when = _fmt_age(int(time.time() - (it.get("checked_at") or 0))).lstrip(", ")
@@ -641,6 +684,13 @@ async def cmd_label(message: Message):
 
     Метка имеет наивысший приоритет в вердикте, поэтому автор записывается в
     базу: это сильное действие, и должно быть видно, кто его сделал."""
+    if not _is_admin(_user_id(message)):
+        await message.answer(
+            "Ручные метки ставит администратор: метка меняет вердикт для всех "
+            "пользователей бота. Попросите его — или добавьте свой ID в ADMIN_TG_IDS.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     parts = (message.text or "").split()
     addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
     if not addresses:
@@ -677,6 +727,13 @@ async def cmd_label(message: Message):
 
 @dp.message(Command("unlabel"))
 async def cmd_unlabel(message: Message):
+    if not _is_admin(_user_id(message)):
+        await message.answer(
+            "Ручные метки ставит администратор: метка меняет вердикт для всех "
+            "пользователей бота. Попросите его — или добавьте свой ID в ADMIN_TG_IDS.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
     parts = (message.text or "").split()
     addresses = extract_addresses(" ".join(parts[1:2]) if len(parts) > 1 else "")
     if not addresses:
@@ -808,10 +865,39 @@ def _fit_message(text: str) -> str:
     return head + note
 
 
-async def _check_and_render(addr: str) -> str:
-    """Свежая проверка (без кеша — для AML важна актуальность транзакций)."""
-    v = await check_address(addr, use_cache=False, source="bot")
+async def _check_and_render(
+    addr: str, user_id: int | None = None, progress: Message | None = None
+) -> str:
+    """Свежая проверка (без кеша — для AML важна актуальность транзакций).
+
+    Если передано сообщение-прогресс, в него сразу попадает предварительный
+    вердикт по данным блокчейна: OFAC, блэклист, метки и экспозиция готовы за
+    секунды, а платные KYT считаются десятки секунд. Раньше пользователь всё
+    это время смотрел на «⏳ Проверяю адрес…».
+
+    Просмотр пишется в личную историю пользователя: общий журнал хранит все
+    проверки сервиса, а /history каждому показывает только его собственные."""
+    async def show_preliminary(pre: AddressVerdict) -> None:
+        if progress is None:
+            return
+        try:
+            await progress.edit_text(
+                _fit_message(format_verdict(pre)), parse_mode=ParseMode.HTML
+            )
+        except TelegramBadRequest:
+            pass  # не критично: итог всё равно придёт
+
+    v = await check_address(
+        addr, use_cache=False, source="bot",
+        on_preliminary=show_preliminary if progress is not None else None,
+    )
+    if user_id is not None:
+        await history.record_view(user_id, v)
     return _fit_message(format_verdict(v))
+
+
+def _user_id(obj: Message | CallbackQuery) -> int | None:
+    return obj.from_user.id if obj.from_user else None
 
 
 async def _check_one(message: Message, addr: str, counter: str = "") -> None:
@@ -820,7 +906,7 @@ async def _check_one(message: Message, addr: str, counter: str = "") -> None:
         PROGRESS_TEXT.format(addr=addr, counter=counter), parse_mode=ParseMode.HTML
     )
     try:
-        text = await _check_and_render(addr)
+        text = await _check_and_render(addr, _user_id(message), progress)
     except Exception as e:
         log.exception("check failed for %s", addr)
         await progress.edit_text(
@@ -836,7 +922,17 @@ async def _check_one(message: Message, addr: str, counter: str = "") -> None:
 @dp.message(F.text)
 async def on_text(message: Message):
     text = message.text or ""
-    addresses = extract_addresses(text, limit=MAX_ADDRESSES_PER_MESSAGE)
+    found = extract_addresses(text)
+    addresses = found[:MAX_ADDRESSES_PER_MESSAGE]
+    if len(found) > len(addresses):
+        # Раньше лишние адреса отбрасывались молча, и человек считал, что
+        # проверены все.
+        await message.answer(
+            f"Нашёл адресов: {len(found)}, за раз проверяю до "
+            f"{MAX_ADDRESSES_PER_MESSAGE}. Остальные пришлите отдельно или "
+            f"файлом — из файла проверю до {MAX_ADDRESSES_PER_FILE}.",
+            parse_mode=ParseMode.HTML,
+        )
 
     if not addresses:
         if looks_like_address_attempt(text):
@@ -869,23 +965,35 @@ async def on_text(message: Message):
 
 @dp.callback_query(F.data.startswith("recheck:"))
 async def on_recheck(callback: CallbackQuery):
+    """Перепроверка по кнопке.
+
+    На колбэк Telegram разрешает ответить ОДИН раз и недолго. Раньше при ошибке
+    отвечали второй раз — Telegram это отклонял, и пользователь не видел ни
+    ошибки, ни нового вердикта. А пока шла проверка (до полутора минут), на
+    экране висел старый вердикт без признаков работы. Теперь сообщение сразу
+    переходит в «проверяю», а результат или ошибка приходят правкой его же."""
     addr = (callback.data or "").split(":", 1)[1]
     if not is_valid_trc20_address(addr):
         await callback.answer("Невалидный адрес", show_alert=True)
         return
     await callback.answer("Проверяю заново…")
-    try:
-        text = await _check_and_render(addr)
-    except Exception as e:
-        log.exception("recheck failed")
-        await callback.answer(f"Ошибка: {e}", show_alert=True)
+    msg = callback.message
+    if msg is None:
         return
     try:
-        await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr)
+        await msg.edit_text(
+            PROGRESS_TEXT.format(addr=addr, counter=""), parse_mode=ParseMode.HTML
         )
+    except TelegramBadRequest:
+        pass  # сообщение не редактируется (слишком старое) — просто ждём результат
+    try:
+        text = await _check_and_render(addr, _user_id(callback), msg)
+    except Exception as e:
+        log.exception("recheck failed for %s", addr)
+        text = f"⚠️ Не удалось перепроверить <code>{_esc(addr)}</code>: {_esc(e)}"
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=_verdict_kb(addr))
     except TelegramBadRequest as e:
-        # Telegram ругается, если текст не изменился — это нормальный исход.
         if "not modified" not in str(e):
             raise
 

@@ -233,7 +233,6 @@ def test_deposit_detected_through_service_registry(monkeypatch):
     [
         ("CryptoBot", "CryptoBot (Telegram)"),
         ("Crypto Bot Hot Wallet", "CryptoBot (Telegram)"),
-        ("CryptoPay", "CryptoBot (Telegram)"),
         ("Telegram Wallet", "Telegram Wallet"),
         ("wallet.tg", "Telegram Wallet"),
         ("@wallet", "Telegram Wallet"),
@@ -537,3 +536,44 @@ async def test_unreachable_tronscan_still_asks_paid_kyt():
     assert sw.await_count == 1
     assert not any("Адрес пустой" in f for f in v.risk_flags)
     assert any("НЕПОЛНАЯ" in f for f in v.risk_flags)
+
+
+def test_cryptopay_is_not_cryptobot():
+    """Cryptopay (cryptopay.me) — отдельная компания. Ключ «cryptopay»
+    приписывал её тег телеграм-боту CryptoBot."""
+    assert agg._normalize_exchange("Cryptopay") is None
+    assert agg._normalize_exchange("Crypto Pay Hot") is None
+
+
+# ---------- теги-подделки под биржу ----------
+
+@pytest.mark.parametrize(
+    "tag", ["Fake Binance", "Binance Phishing", "Scam_Bybit", "OKX Impersonator",
+            "Fake CryptoBot", "Bybit drainer"],
+)
+def test_impostor_tag_is_not_the_exchange(tag):
+    """Матчинг биржи — по вхождению подстроки, и «Fake Binance» раньше был
+    самим Binance: «биржа · безопасно · 0» и отключённые платные KYT."""
+    assert agg._normalize_exchange(tag) is None
+
+
+def test_impostor_tag_on_address_itself_is_scam():
+    v = AddressVerdict(address=A)
+    agg._apply_tronscan({"address": A, "publicTag": "Fake Binance Support"}, v)
+    assert v.entity_type is EntityType.SCAM
+    assert v.risk_level is RiskLevel.DANGEROUS
+    assert any("выдаёт себя за Binance" in f for f in v.risk_flags)
+
+
+def test_impostor_counterparty_is_not_an_exchange_link():
+    """Контрагент с тегом-подделкой не должен давать «связь с Binance» и
+    засчитываться в биржевой объём."""
+    v = AddressVerdict(address=A)
+    agg._apply_flow([_tr(A, HOT, 1_000_000, to_tag="Fake Binance")], v)
+    assert v.exchange_links == []
+
+
+def test_real_exchange_tags_still_work():
+    for tag, name in (("Binance-Hot 4", "Binance"), ("Bybit Hot 3", "Bybit"),
+                      ("Garantex", "Garantex"), ("Telegram Wallet", "Telegram Wallet")):
+        assert agg._normalize_exchange(tag) == name

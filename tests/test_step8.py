@@ -217,7 +217,8 @@ async def test_tick_notifies_only_on_change(wl):
     chat_id, text = sent[0]
     assert chat_id == 777
     assert "Риск вырос" in text
-    assert "safe" in text and "dangerous" in text
+    # уровни — теми же словами, что в вердикте, а не английскими значениями enum
+    assert "БЕЗОПАСНО" in text and "ОПАСНО" in text
 
 
 async def test_tick_survives_failing_check(wl):
@@ -322,3 +323,56 @@ def test_stats_includes_watchlist_and_inflight(client):
     body = r.json()
     assert "watchlist" in body
     assert "in_flight" in body
+
+
+# ---------- аудит 2: мониторинг ----------
+
+async def test_degraded_check_is_not_a_level_change(wl):
+    """Сбой TronScan на санкционном адресе давал «🔻 Риск снизился:
+    dangerous → unknown» и записывал unknown как новую точку отсчёта."""
+    await wl.init_db()
+    await wl.add(A, 777)
+    await wl.mark_checked(A, 777, "dangerous", 100)
+    wl.INTERVAL_SECONDS = 0
+    degraded = AddressVerdict(address=A)
+    degraded.provider_status = {"tronscan": "error"}
+    notify = AsyncMock()
+    await wl.tick(AsyncMock(return_value=degraded), notify)
+    notify.assert_not_awaited()
+    assert (await wl.list_for(777))[0]["last_level"] == "dangerous"   # база не сдвинулась
+
+
+async def test_one_check_serves_every_watcher(wl):
+    """Каждая пара (адрес, пользователь) была отдельной платной проверкой."""
+    await wl.init_db()
+    for chat in (1, 2, 3):
+        await wl.add(A, chat)
+        await wl.mark_checked(A, chat, "safe", 0)
+    wl.INTERVAL_SECONDS = 0
+    check = AsyncMock(return_value=_verdict(RiskLevel.DANGEROUS, 90))
+    sent: list[int] = []
+
+    async def notify(chat_id, text):
+        sent.append(chat_id)
+
+    await wl.tick(check, notify)
+    assert check.await_count == 1
+    assert sorted(sent) == [1, 2, 3]
+
+
+async def test_failed_check_is_retried_sooner_not_every_tick(wl, monkeypatch):
+    await wl.init_db()
+    await wl.add(A, 1)
+    monkeypatch.setattr(wl, "INTERVAL_SECONDS", 12 * 3600)
+    monkeypatch.setattr(wl, "RETRY_SECONDS", 3600)
+    await wl.tick(AsyncMock(side_effect=RuntimeError("down")), AsyncMock())
+    assert await wl.due() == []            # не на следующем же тике
+
+
+def test_notification_escapes_external_names():
+    """«Tom & Jerry <OTC>» из метки ломал HTML — Telegram отклонял сообщение."""
+    v = _verdict(RiskLevel.DANGEROUS, 90)
+    v.entity = "Tom & Jerry <OTC>"
+    text = watchlist._change_text(v, "safe", 0)
+    assert "Tom &amp; Jerry &lt;OTC&gt;" in text
+    assert "<OTC>" not in text

@@ -160,6 +160,10 @@ function amlProvider(ext) {
     + `<span class="badge ${escapeHtml(ext.risk_level || "unknown")}">`
     + `${riskEmoji(pct)} ${escapeHtml(fmtPct(pct))}${levelRu ? ` · ${escapeHtml(levelRu)}` : ""}`
     + `</span></div>`;
+  // Результат KYT мог прийти из кеша на час — показываем его возраст.
+  if (typeof ext.cache_age_seconds === "number") {
+    inner += `<div class="flag muted">результат${escapeHtml(fmtAge(ext.cache_age_seconds))}</div>`;
+  }
 
   if (ext.entity) {
     const cat = ext.entity_category_ru || ext.entity_category;
@@ -265,6 +269,8 @@ function render(verdict) {
     <div class="score">
       <div class="score-bar"><div class="score-fill ${escapeHtml(level)}" style="width:${Math.min(100, score)}%"></div></div>
       <div class="score-label">Риск ${score}/100 · ${escapeHtml(riskRu(verdict))}</div>
+      ${(verdict.aml || {}).score_reason && score > 0
+        ? `<div class="meta">🧮 ${escapeHtml(verdict.aml.score_reason)}</div>` : ""}
     </div>
     <div class="meta">Тип: ${escapeHtml(typeRu(verdict))}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>

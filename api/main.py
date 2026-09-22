@@ -46,6 +46,9 @@ WEB_PUBLIC = os.getenv("WEB_PUBLIC", "") not in ("", "0", "false", "False")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 # Сколько адресов принимает POST /check/batch за один запрос.
 BATCH_MAX = int(os.getenv("BATCH_MAX_ADDRESSES", "25"))
+# Сколько прокси перед приложением ДОПИСЫВАЮТ адрес в X-Forwarded-For. У Railway
+# это один край. 0 — заголовок не читать вовсе (прямой доступ без прокси).
+TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "1"))
 
 _basic = HTTPBasic(auto_error=False)
 limiter = RateLimiter()
@@ -84,10 +87,16 @@ def is_protected() -> bool:
 
 
 def client_ip(request: Request) -> str:
-    """IP клиента с учётом прокси Railway (X-Forwarded-For — первый в цепочке)."""
+    """IP клиента за доверенными прокси.
+
+    Каждый прокси ДОПИСЫВАЕТ адрес в конец X-Forwarded-For, а начало заголовка
+    присылает сам клиент — и может написать туда что угодно. Раньше брался
+    ПЕРВЫЙ адрес: лимит «2 проверки на IP» пропускал 10 из 10 запросов, если
+    менять заголовок. Верим только последним TRUSTED_PROXY_HOPS записям."""
     fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    parts = [p.strip() for p in fwd.split(",") if p.strip()]
+    if parts and TRUSTED_PROXY_HOPS > 0:
+        return parts[max(0, len(parts) - TRUSTED_PROXY_HOPS)]
     return request.client.host if request.client else "unknown"
 
 
@@ -266,8 +275,14 @@ def _provider_config() -> dict[str, bool]:
     }
 
 
-def _authorize(request: Request, api_key: str | None) -> None:
-    """Проверка ключа (заголовок X-API-Key или ?api_key=) и лимитов."""
+def _authorize(
+    request: Request, api_key: str | None, cost: int = 1, record: bool = True
+) -> bool:
+    """Проверка ключа (заголовок X-API-Key или ?api_key=) и лимитов.
+
+    Возвращает True, если запрос идёт под лимитами (публичный доступ), — тогда
+    вызывающий списывает квоту через _consume за каждую РЕАЛЬНУЮ проверку.
+    `cost` — сколько проверок нужно, чтобы отказать сразу, а не на середине."""
     if API_KEY:
         header_key = request.headers.get("x-api-key")
         # Query-параметр оставлен для совместимости, но он попадает в логи и
@@ -275,7 +290,7 @@ def _authorize(request: Request, api_key: str | None) -> None:
         provided = header_key or api_key
         if not provided or not secrets.compare_digest(provided, API_KEY):
             raise HTTPException(status_code=401, detail="Invalid API key")
-        return
+        return False
     if not is_protected():
         raise HTTPException(
             status_code=503,
@@ -284,9 +299,16 @@ def _authorize(request: Request, api_key: str | None) -> None:
                 "WEB_PASSWORD или API_KEY, либо WEB_PUBLIC=1, если он должен быть открыт."
             ),
         )
-    allowed, reason = limiter.check(client_ip(request))
+    allowed, reason = limiter.check(client_ip(request), max(1, cost))
     if not allowed:
         raise HTTPException(status_code=429, detail=reason)
+    if record:
+        _consume(request)
+    return True
+
+
+def _consume(request: Request) -> None:
+    """Списать одну проверку с лимитов."""
     limiter.record(client_ip(request))
 
 
@@ -316,10 +338,12 @@ async def check(
     api_key: str | None = Query(None, description="API key (лучше передавать заголовком X-API-Key)"),
     _auth: None = Depends(require_web_auth),
 ):
-    _authorize(request, api_key)
-
+    limited = _authorize(request, api_key, record=False)
     if not is_valid_trc20_address(address):
+        # Опечатка в адресе квоту не тратит: проверки не было.
         raise HTTPException(status_code=400, detail="Invalid TRC20 address format")
+    if limited:
+        _consume(request)
 
     # По умолчанию свежий запрос (AML требует актуальных транзакций).
     # Кеш — только по явному ?cache=true.
@@ -341,15 +365,19 @@ async def check_batch(
             status_code=400,
             detail=f"За раз можно проверить не больше {BATCH_MAX} адресов",
         )
-    # Лимит списывается за каждый адрес: иначе батч обходил бы защиту квоты.
-    for _ in addresses:
-        _authorize(request, api_key)
+    # Лимит списывается за каждый ПРОВЕРЕННЫЙ адрес: иначе батч обходил бы
+    # защиту квоты. Но сначала — хватит ли квоты на весь пакет: раньше пакет
+    # падал на середине, а уже списанное пропадало без единой проверки.
+    valid = [a for a in addresses if is_valid_trc20_address(a)]
+    limited = _authorize(request, api_key, cost=len(valid), record=False)
 
     results = []
     for addr in addresses:
         if not is_valid_trc20_address(addr):
             results.append({"address": addr, "error": "Invalid TRC20 address format"})
             continue
+        if limited:
+            _consume(request)
         verdict = await check_address(addr, use_cache=False, source="batch")
         results.append(verdict.to_dict())
     return {"results": results}

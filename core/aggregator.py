@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
+import time
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,7 +33,7 @@ log = logging.getLogger(__name__)
 
 # Версия правил скоринга. Меняется, когда меняются пороги или формула — тогда
 # старый сохранённый вердикт читается в контексте тогдашних правил, а не текущих.
-RULESET_VERSION = "2026.09.2"
+RULESET_VERSION = "2026.09.3"
 
 # Туннель: для этих типов внешний AML-API НЕ запрашивается — биржа/депозитник
 # биржи/контракт — это инфраструктура, её AML-скор ничего не говорит о владельце,
@@ -71,34 +74,58 @@ def _top_risk_entity(ext: dict[str, Any]) -> str | None:
     return top.get("entity") or None
 
 
+# Слова в имени категории Swapster, при которых «EXCHANGE» — не безопасная
+# биржа. Список категорий Swapster не документирован, поэтому проверяем и
+# уровень риска категории, и её имя.
+_RISKY_EXCHANGE_WORDS = ("HIGH", "RISK", "SANCTION", "P2P", "KYC", "MIXER", "DARK")
+
+
 def _relabel_from_swapster(verdict: AddressVerdict, is_transit: bool) -> None:
-    """Помечаем неопознанный адрес как биржу/сервис ТОЛЬКО если выполнено И то, И другое:
-      1) Swapster показал доминирующую биржевую сущность (EXCHANGE*) ≥ порога;
-      2) адрес ведёт себя как ТРАНЗИТ (форвардит ~всё полученное, не копит баланс).
+    """Помечаем неопознанный адрес как биржу/сервис ТОЛЬКО если выполнено всё:
+      1) Swapster показал доминирующую биржевую сущность (EXCHANGE*) ≥ порога,
+         и это категория НИЗКОГО риска;
+      2) адрес ведёт себя как ТРАНЗИТ (форвардит ~всё полученное, не копит баланс);
+      3) у самого адреса нет собственных риск-сигналов.
 
     Второе условие отсекает обычного юзера, который «всегда заводит с биржи» и
     держит/тратит средства: у него высокая биржевая экспозиция, но он НЕ транзит.
-    Инфраструктура биржи (депозитник/хаб) — именно транзит."""
-    if verdict.entity_type not in (EntityType.WALLET, EntityType.UNKNOWN, EntityType.LABELED):
+    Инфраструктура биржи (депозитник/хаб) — именно транзит.
+
+    Раньше переклейка работала и для LABELED, то есть для адреса с серой меткой
+    TronScan: серая метка + транзит + «EXCHANGE 95%» давали «биржа · безопасно
+    · 0». И любая категория со словом EXCHANGE считалась безопасной биржей,
+    а уровень риска категории не смотрелся. Внешний сервис может только
+    ПОДНЯТЬ вердикт — переклейка в биржу, которая обнуляет риск, этому правилу
+    противоречила."""
+    if verdict.entity_type not in (EntityType.WALLET, EntityType.UNKNOWN):
         return
     if not is_transit:
+        return
+    if verdict.risk_level in (RiskLevel.CAUTION, RiskLevel.DANGEROUS):
+        return
+    goplus_raised = (verdict.raw_labels.get("goplus") or {}).get("flags_raised")
+    if goplus_raised or (verdict.raw_labels.get("profile") or {}).get("feedback_risk"):
         return
     ext = verdict.external_aml or {}
     if not ext.get("available") or ext.get("pending"):
         return
-    entities = ext.get("entities") or []
+    entities = [e for e in (ext.get("entities") or []) if isinstance(e, dict)]
     if not entities:
         return
     top = max(entities, key=lambda e: e.get("risk_score") or 0)
     share = (top.get("risk_score") or 0) / 100.0
-    name = top.get("entity") or ""
-    if "EXCHANGE" in name.upper() and share >= AML_EXCHANGE_ENTITY_THRESHOLD:
+    name = str(top.get("entity") or "")
+    upper = name.upper()
+    if (
+        "EXCHANGE" in upper
+        and not any(w in upper for w in _RISKY_EXCHANGE_WORDS)
+        and str(top.get("level") or "") == "LOW_RISK"
+        and share >= AML_EXCHANGE_ENTITY_THRESHOLD
+    ):
         verdict.entity_type = EntityType.EXCHANGE
         verdict.entity = f"Биржа/сервис (Swapster: {name} {top.get('risk_score')}%)"
-        try:
-            verdict.risk_level = RiskLevel(ext.get("risk_level"))
-        except ValueError:
-            pass
+        # Уровень риска здесь не ставится: его решает _compute_aml, а внешний
+        # сервис может только поднять вердикт, но не опустить.
         if "Swapster" not in verdict.sources:
             verdict.sources.append("Swapster")
 
@@ -167,6 +194,14 @@ _TYPE_MIN_RISK: dict[EntityType, tuple[int, RiskLevel]] = {
     EntityType.HIGH_RISK_SERVICE: (60, RiskLevel.CAUTION),
 }
 
+# Как объяснить скор, если его задала нижняя граница типа.
+_TYPE_FLOOR_REASON = {
+    EntityType.SANCTIONED: "санкционная сущность",
+    EntityType.FROZEN: "средства заблокированы эмитентом USDT",
+    EntityType.SCAM: "адрес помечен как скам",
+    EntityType.HIGH_RISK_SERVICE: "высокорисковый сервис",
+}
+
 # Метки, которые считаем «пустыми» — их разрешено перезаписать данными Bitok.
 _EMPTY_ENTITY_LABELS = {"", "No public labels"}
 
@@ -226,10 +261,14 @@ def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
             continue
         provider = ext.get("provider") or "AML"
         pct = ext.get("risk_score")
-        if isinstance(pct, int | float):
-            verdict.risk_score = max(verdict.risk_score, int(round(pct)))
-        detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
         top = _top_risk_entity(ext) or ext.get("entity_category_ru")
+        if isinstance(pct, int | float) and int(round(pct)) > verdict.risk_score:
+            verdict.risk_score = int(round(pct))
+            if verdict.aml is not None:
+                verdict.aml["score_reason"] = (
+                    f"{provider}: {pct:g}%" + (f" — {top}" if top else "")
+                )
+        detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
         reason = f" ({top})" if top else ""
         verdict.risk_flags.append(
             f"{'⛔️' if level is RiskLevel.DANGEROUS else '⚠️'} {provider}: "
@@ -425,16 +464,17 @@ HIGH_RISK_EXCHANGE_NAMES = set(HIGH_RISK_EXCHANGES.values())
 #
 # Ключи — подстроки тега TronScan. Теги здесь не проверены живым запросом
 # (эндпоинт TronScan из окружения разработки недоступен), поэтому подобраны
-# так, чтобы ложное срабатывание было невозможно: совпадение только с
-# самоназванием сервиса. Если такого тега у TronScan нет, правило просто
-# никогда не сработает и ничего не испортит. Надёжный путь для этих сервисов —
+# узко: совпадение только с самоназванием сервиса. Если такого тега у TronScan
+# нет, правило просто никогда не сработает и ничего не испортит. Надёжный путь для этих сервисов —
 # разметить их хот-кошелёк по адресу: /label в боте или SERVICE_ADDRESSES
 # (см. core/services.py); дальше их депозитники опознает funnel-эвристика.
+#
+# «cryptopay» / «crypto pay» здесь намеренно НЕТ, хотя так называется платёжный
+# API CryptoBot: Cryptopay (cryptopay.me) — отдельная компания, и её тег
+# приписывался бы телеграм-боту.
 CUSTODIAL_SERVICES: dict[str, str] = {
     "cryptobot": "CryptoBot (Telegram)",
     "crypto bot": "CryptoBot (Telegram)",
-    "cryptopay": "CryptoBot (Telegram)",
-    "crypto pay": "CryptoBot (Telegram)",
     "telegram wallet": "Telegram Wallet",
     "wallet.tg": "Telegram Wallet",
     "tg wallet": "Telegram Wallet",
@@ -520,10 +560,35 @@ _ALL_EXCHANGES = {
 }
 
 
+# Слова, при которых тег описывает НЕ биржу, а подделку под неё. Матчинг
+# биржи идёт по вхождению подстроки, поэтому «Fake Binance», «Binance Phishing»
+# и «Scam_Bybit» раньше опознавались как сами Binance и Bybit — с вердиктом
+# «биржа · безопасно · 0» и отключёнными платными KYT.
+_IMPOSTOR_MARKERS = (
+    "fake", "scam", "phish", "fraud", "impersonat", "mimic", "spoof",
+    "drainer", "exploit", "hacker", "фейк", "мошен", "поддел",
+)
+
+
+def _impostor_of(tag: str | None) -> str | None:
+    """Под какую биржу маскируется тег, если он помечен как подделка."""
+    if not tag:
+        return None
+    t = tag.lower()
+    if not any(m in t for m in _IMPOSTOR_MARKERS):
+        return None
+    for key, name in _ALL_EXCHANGES.items():
+        if key in t:
+            return name
+    return None
+
+
 def _normalize_exchange(tag: str | None) -> str | None:
     if not tag:
         return None
     t = tag.lower()
+    if any(m in t for m in _IMPOSTOR_MARKERS):
+        return None            # подделка под биржу — не биржа (см. _impostor_of)
     for key, name in _ALL_EXCHANGES.items():
         if key in t:
             return name
@@ -560,6 +625,13 @@ NEW_ADDRESS_DAYS = int(os.getenv("NEW_ADDRESS_DAYS", "30"))
 # Жалобы пользователей в TronScan — сигнал слабее скам-тега (репорт может быть и
 # ошибочным), поэтому не «опасно», а нижняя граница «осторожно».
 FEEDBACK_RISK_SCORE = float(os.getenv("FEEDBACK_RISK_SCORE", "30"))
+# Серая метка TronScan на самом адресе. Раньше она ставила «осторожно», но скор
+# оставался 0 — и в отчёте было «ОСТОРОЖНО · риск 0/100».
+GREY_TAG_SCORE = float(os.getenv("GREY_TAG_SCORE", "30"))
+# Вес объёма, прошедшего через переводы и контрагентов, которых TronScan сам
+# считает рискованными (riskTransaction, normalAddressInfo.risk). Ниже веса
+# санкций: это оценка TronScan, а не список.
+TRONSCAN_RISK_WEIGHT = float(os.getenv("TRONSCAN_RISK_WEIGHT", "0.5"))
 
 
 def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> None:
@@ -694,6 +766,19 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
 
     # 2. Биржа
     main_tag = data.get("publicTag") or data.get("addressTag", "")
+    impostor = _impostor_of(main_tag)
+    if impostor:
+        # Метка TronScan прямо говорит, что адрес выдаёт себя за биржу. Это
+        # ровно тот случай, ради которого пользователь проверяет адрес перед
+        # отправкой, — и раньше он получал «биржа · безопасно».
+        verdict.entity_type = EntityType.SCAM
+        verdict.risk_level = RiskLevel.DANGEROUS
+        verdict.entity = main_tag
+        verdict.risk_flags.append(
+            f"⛔️ Метка TronScan «{main_tag}»: адрес выдаёт себя за {impostor}, "
+            f"это не сама биржа"
+        )
+        return
     exch = _normalize_exchange(main_tag)
     if exch:
         verdict.entity = exch
@@ -750,10 +835,20 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
     if not result:
         return
 
-    raised = [
-        k for k, v in result.items()
-        if v == "1" and k not in {"data_source", "contract_address"}
-    ]
+    # Флаги GoPlus — строки «0»/«1», но часть полей — счётчики:
+    # number_of_malicious_contracts_created = «3». Раньше срабатывало только
+    # значение «1»: адрес с ОДНИМ вредоносным контрактом помечался, а с тремя — нет.
+    raised: list[str] = []
+    counts: dict[str, int] = {}
+    for k, v in result.items():
+        if k in {"data_source", "contract_address"}:
+            continue
+        sv = str(v).strip()
+        if sv == "1":
+            raised.append(k)
+        elif sv.isdigit() and int(sv) > 1:
+            raised.append(k)
+            counts[k] = int(sv)
     verdict.raw_labels["goplus"] = {
         "flags_raised": raised,
         "data_source": result.get("data_source"),
@@ -764,7 +859,9 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
     src = result.get("data_source") or "GoPlus"
     verdict.sources.append(f"GoPlus ({src})")
     for f in raised:
-        verdict.risk_flags.append(f"GoPlus: {f.replace('_', ' ')}")
+        mark = "⛔️ " if f in CRITICAL_GOPLUS_FLAGS else ""
+        count = f" ({counts[f]})" if f in counts else ""
+        verdict.risk_flags.append(f"{mark}GoPlus: {f.replace('_', ' ')}{count}")
 
 
 def _detect_exchange_deposit(
@@ -825,7 +922,11 @@ def _detect_exchange_deposit(
             else:
                 out_other += amt
         elif addr == t.get("to_address"):
-            in_tx += 1
+            # Пыль в счёт приходов не идёт: иначе пара пылевых переводов от
+            # адресов-двойников превращала одноразовый свип (medium) в
+            # уверенный депозитник (high) — с туннелем и нулевым риском.
+            if amt > POISON_DUST_MAX:
+                in_tx += 1
             src = t.get("from_address")
             exch = _counterparty_service(
                 (t.get("from_address_tag") or {}).get("from_address_tag"), src, anchors
@@ -894,6 +995,42 @@ def _detect_exchange_deposit(
         "hot_wallet": hot_wallet,
         "sanctioned": exch in SANCTIONED_EXCHANGE_NAMES,
     }
+
+
+# Кеш результатов платных KYT. «Перепроверить» оплачивало оба сервиса заново,
+# хотя их оценка адреса за час не меняется: они считают граф транзакций целиком.
+# On-chain часть (переводы, OFAC, блэклист Tether) по-прежнему всегда свежая —
+# это то, ради чего перепроверяют. 0 — кеш выключен.
+KYT_CACHE_SECONDS = int(os.getenv("KYT_CACHE_SECONDS", "3600"))
+_KYT_CACHE_MAX = 5000
+_kyt_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
+async def _kyt_cached(key: str, address: str, fn) -> dict[str, Any]:
+    """Результат KYT из кеша или свежий. Кешируется только готовый ответ:
+    «ещё считается» и ошибки должны повторяться."""
+    now = time.monotonic()
+    if KYT_CACHE_SECONDS > 0:
+        hit = _kyt_cache.get((key, address))
+        if hit and now - hit[0] < KYT_CACHE_SECONDS:
+            res = dict(hit[1])
+            res["cache_age_seconds"] = int(now - hit[0])
+            return res
+    res = await fn(address)
+    if (
+        KYT_CACHE_SECONDS > 0
+        and isinstance(res, dict)
+        and res.get("available")
+        and not res.get("pending")
+    ):
+        if len(_kyt_cache) >= _KYT_CACHE_MAX:
+            cutoff = now - KYT_CACHE_SECONDS
+            for k in [k for k, (ts, _) in _kyt_cache.items() if ts < cutoff]:
+                del _kyt_cache[k]
+            while len(_kyt_cache) >= _KYT_CACHE_MAX:
+                _kyt_cache.pop(next(iter(_kyt_cache)))     # самый старый
+        _kyt_cache[(key, address)] = (now, res)
+    return res
 
 
 def _is_untouched(
@@ -1313,8 +1450,9 @@ def _apply_token_security(data: dict[str, Any] | None, verdict: AddressVerdict) 
     flags, serious = token_security.describe(data)
     verdict.risk_flags.extend(flags)
     if serious and verdict.entity_type is EntityType.CONTRACT:
-        # Контракт с функцией блокировки или помеченный небезопасным — это не
-        # «смарт-контракт, вероятно всё в порядке».
+        # Контракт, который TronScan помечает небезопасным, или токен со ссылкой
+        # в имени — это не «смарт-контракт, вероятно всё в порядке». Функция
+        # блокировки к «серьёзному» НЕ относится: она есть у USDT.
         verdict.entity_type = EntityType.HIGH_RISK_SERVICE
     if "TronScan security" not in verdict.sources:
         verdict.sources.append("TronScan security")
@@ -1486,12 +1624,30 @@ async def _fetch_hop2(
             "sanctioned_exchanges": exchs,
         }
 
-    results = await asyncio.gather(*[_one(cp, vol) for cp, vol in intermediaries])
-    flagged = [r for r in results if r]
+    # return_exceptions: сбой ОДНОГО посредника не должен выбрасывать остальные.
+    # Раньше хватало одного 429 от TronScan из двенадцати параллельных
+    # запросов, чтобы весь 2-й хоп ушёл в «error», — вместе с уже найденным
+    # «грязным» посредником. Адрес, получивший четверть объёма через кошелёк,
+    # который целиком шлёт на санкционный адрес, выходил «0/100».
+    results = await asyncio.gather(
+        *[_one(cp, vol) for cp, vol in intermediaries], return_exceptions=True
+    )
+    failed = 0
+    flagged: list[dict[str, Any]] = []
+    for (cp, _vol), r in zip(intermediaries, results, strict=True):
+        if isinstance(r, BaseException):
+            failed += 1
+            if not isinstance(r, ProviderError):
+                log.warning("2-й хоп: неожиданная ошибка по %s: %r", cp, r)
+        elif r:
+            flagged.append(r)
+    if failed == len(intermediaries):
+        raise ProviderError(f"2-й хоп: не ответил ни один из {failed} посредников")
     # Косвенная экспозиция = Σ (наша доля через посредника × его «грязность»)
     indirect = sum(r["our_share"] * (r["their_risk_pct"] / 100) for r in flagged)
     return {
-        "intermediaries_checked": len(intermediaries),
+        "intermediaries_checked": len(intermediaries) - failed,
+        "failed": failed,
         "flagged": flagged,
         "indirect_exposure_pct": round(indirect * 100, 1),
     }
@@ -1526,7 +1682,14 @@ def _compute_aml(
     # Сам адрес обслуживает санкционную биржу: либо его тег = санкц. биржа
     # (хот-кошелёк), либо sweep-паттерн опознал депозитник санкц. биржи.
     deposit_pattern = (verdict.raw_labels.get("flow") or {}).get("deposit_pattern") or {}
-    sanctioned_deposit = bool(deposit_pattern.get("sanctioned"))
+    # Якорь депозита сам в OFAC — депозит обслуживает санкционный адрес, как
+    # бы якорь ни назывался. Раньше учитывалось только имя биржи: адрес,
+    # пересылающий всё на OFAC-адрес с тегом или ручной меткой «биржа»,
+    # получал «депозитный кошелёк · безопасно · 0» при 50 % санкционного объёма.
+    anchor_ofac = bool(deposit_pattern.get("hot_wallet")) and (
+        deposit_pattern.get("hot_wallet") in sanctioned
+    )
+    sanctioned_deposit = bool(deposit_pattern.get("sanctioned")) or anchor_ofac
     self_sanctioned_exch = sanctioned_deposit or (
         verdict.entity_type == EntityType.EXCHANGE
         and verdict.entity in SANCTIONED_EXCHANGE_NAMES
@@ -1560,6 +1723,20 @@ def _compute_aml(
     def pct(x: float) -> float:
         return round(x / total * 100, 1) if total > 0 else 0.0
 
+    # Объём через переводы и контрагентов, рискованных по оценке самого TronScan.
+    ts_risky_cps = set((tokens or {}).get("risky_counterparties") or [])
+    ts_risky_vol = 0.0
+    for t in transfers:
+        if addr == t.get("from_address"):
+            cp = t.get("to_address")
+        elif addr == t.get("to_address"):
+            cp = t.get("from_address")
+        else:
+            continue
+        if t.get("riskTransaction") or cp in ts_risky_cps:
+            ts_risky_vol += _amount(t)
+    ts_risky_pct = pct(ts_risky_vol)
+
     flags_raised = (verdict.raw_labels.get("goplus") or {}).get("flags_raised") or []
     goplus_critical = sorted(f for f in flags_raised if f in CRITICAL_GOPLUS_FLAGS)
     # «Грязный» объём = прямые санкционные адреса + санкционные биржи
@@ -1579,8 +1756,10 @@ def _compute_aml(
         "exchange_exposure_pct": pct(vol["exchange"]),
         "other_exposure_pct": pct(vol["other"]),
         "risky_exposure_pct": risky_pct,
+        "tronscan_risky_exposure_pct": ts_risky_pct,
         "indirect_sanctions_pct": indirect_pct,
         "hop2_intermediaries_checked": (hop2 or {}).get("intermediaries_checked", 0),
+        "hop2_failed": (hop2 or {}).get("failed", 0),
         "hop2_flagged": (hop2 or {}).get("flagged", []),
         "transfers_analyzed": len(transfers),
         "sanctioned_counterparties": sorted(sanctioned_cps),
@@ -1602,24 +1781,64 @@ def _compute_aml(
     )
 
     # ---- Скор 0-100 ----
-    if direct or self_sanctioned_exch or verdict.entity_type == EntityType.SCAM:
-        score = 100.0  # прямой сигнал об адресе — бьёт всё
+    # Вместе со скором копится «за что» — одна строка в отчёте говорит, из какой
+    # составляющей взялось число. Раньше его приходилось угадывать по флагам.
+    reason = ""
+    if direct:
+        score, reason = 100.0, "адрес в санкционном списке OFAC SDN"
+    elif self_sanctioned_exch:
+        score, reason = 100.0, "адрес обслуживает санкционную инфраструктуру"
+    elif verdict.entity_type == EntityType.SCAM:
+        score, reason = 100.0, f"скам: {verdict.entity or 'метка источника'}"
     elif goplus_critical:
         score = 90.0
+        reason = "GoPlus: " + ", ".join(f.replace("_", " ") for f in goplus_critical)
     elif known_service:
         score = 10.0 if flags_raised else 0.0
+        if score:
+            reason = "известный сервис; флаги GoPlus: " + ", ".join(
+                f.replace("_", " ") for f in flags_raised
+            )
     else:
         # прямая экспозиция + косвенная (2-хоп) с понижающим весом
         score = risky_pct + indirect_pct * HOP2_WEIGHT
-        if flags_raised:
-            score = max(score, 20.0)
+        parts = []
+        if risky_pct:
+            what = (
+                "санкционные адреса и биржи"
+                if vol["sanctions"] and vol["sanctioned_exchange"]
+                else "санкционные адреса" if vol["sanctions"]
+                else "санкционные биржи"
+            )
+            parts.append(f"{_pct_str(risky_pct)}% объёма — {what}")
+        if indirect_pct:
+            parts.append(f"косвенно {_pct_str(indirect_pct)}% × {HOP2_WEIGHT:g}")
+        reason = " + ".join(parts)
+        if flags_raised and score < 20.0:
+            score = 20.0
+            reason = "GoPlus: " + ", ".join(f.replace("_", " ") for f in flags_raised)
 
-    # Жалобы пользователей в TronScan (feedbackRisk) — сигнал о САМОМ адресе,
-    # а не о его контрагентах, поэтому он задаёт нижнюю границу. Для опознанного
-    # легального сервиса игнорируем: на биржи жалуются постоянно, и репорт там
-    # говорит о споре с поддержкой, а не о природе адреса.
-    if not known_service and (verdict.raw_labels.get("profile") or {}).get("feedback_risk"):
-        score = max(score, FEEDBACK_RISK_SCORE)
+    if not known_service:
+        # Жалобы пользователей в TronScan (feedbackRisk) — сигнал о САМОМ адресе,
+        # а не о его контрагентах, поэтому он задаёт нижнюю границу. Для
+        # опознанного легального сервиса игнорируем: на биржи жалуются
+        # постоянно, и репорт там говорит о споре с поддержкой.
+        if (verdict.raw_labels.get("profile") or {}).get("feedback_risk") \
+                and FEEDBACK_RISK_SCORE > score:
+            score, reason = FEEDBACK_RISK_SCORE, "жалобы пользователей в TronScan"
+        grey = (verdict.raw_labels.get("tronscan") or {}).get("greyTag")
+        if grey and GREY_TAG_SCORE > score:
+            score, reason = GREY_TAG_SCORE, f"серая метка TronScan «{grey}»"
+        # Переводы и контрагенты, которых TronScan сам считает рискованными.
+        # Раньше это были только флаги: «⚠️ рискованные контрагенты» рядом с
+        # «0/100». Теперь — доля объёма с весом, как у санкционной экспозиции.
+        ts_weighted = ts_risky_pct * TRONSCAN_RISK_WEIGHT
+        if ts_weighted > score:
+            score = ts_weighted
+            reason = (
+                f"{_pct_str(ts_risky_pct)}% объёма — переводы и контрагенты, "
+                f"рискованные по оценке TronScan, × {TRONSCAN_RISK_WEIGHT:g}"
+            )
 
     verdict.risk_score = int(round(min(100.0, score)))
 
@@ -1636,17 +1855,26 @@ def _compute_aml(
     # ---- Сам адрес — кошелёк санкционной биржи ----
     elif self_sanctioned_exch:
         exch_name = deposit_pattern.get("exchange") or verdict.entity or ""
-        src = SANCTIONED_EXCHANGE_SOURCE.get(exch_name, "UK · EU · OFAC")
+        if anchor_ofac and exch_name not in SANCTIONED_EXCHANGE_SOURCE:
+            src = "OFAC SDN"
+            verdict.entity = f"{verdict.entity} (якорь в санкционном списке)"
+            message = (
+                "🚨 Средства с адреса уходят на адрес из санкционного списка OFAC "
+                f"SDN ({deposit_pattern.get('hot_wallet')}) — как бы он ни был помечен, "
+                "это санкционная инфраструктура"
+            )
+        else:
+            src = SANCTIONED_EXCHANGE_SOURCE.get(exch_name, "UK · EU · OFAC")
+            verdict.entity = f"{verdict.entity} (санкционная биржа)"
+            message = (
+                f"🚨 Депозитный адрес санкционной биржи ({src}) — средства уходят "
+                f"в санкционную инфраструктуру, могут быть заморожены"
+                if sanctioned_deposit
+                else f"🚨 Хот-кошелёк санкционной биржи ({src})"
+            )
         verdict.entity_type = EntityType.SANCTIONED
         verdict.sanction_source = src
-        verdict.entity = f"{verdict.entity} (санкционная биржа)"
-        verdict.risk_flags.insert(
-            0,
-            f"🚨 Депозитный адрес санкционной биржи ({src}) — средства уходят "
-            f"в санкционную инфраструктуру, могут быть заморожены"
-            if sanctioned_deposit
-            else f"🚨 Хот-кошелёк санкционной биржи ({src})",
-        )
+        verdict.risk_flags.insert(0, message)
 
     # ---- GoPlus critical на самом адресе ----
     if goplus_critical and not direct and verdict.entity_type == EntityType.UNKNOWN:
@@ -1661,9 +1889,14 @@ def _compute_aml(
     floor = _TYPE_MIN_RISK.get(verdict.entity_type)
     if floor:
         min_score, min_level = floor
-        verdict.risk_score = max(verdict.risk_score, min_score)
+        if min_score > verdict.risk_score:
+            verdict.risk_score = min_score
+            reason = _TYPE_FLOOR_REASON.get(verdict.entity_type, reason)
+            if verdict.entity_type is EntityType.SANCTIONED and verdict.sanction_source:
+                reason = f"{reason} ({verdict.sanction_source})"
         if _RISK_ORDER[min_level] > _RISK_ORDER[verdict.risk_level]:
             verdict.risk_level = min_level
+    verdict.aml["score_reason"] = reason if verdict.risk_score > 0 else ""
 
     # ---- Синтез risk_level ----
     direct_danger = (
@@ -1749,6 +1982,26 @@ async def _apply_cluster(verdict: AddressVerdict) -> None:
         )
 
 
+def _hard_fact(verdict: AddressVerdict) -> str | None:
+    """Факт об адресе, который ручная метка отменить не может.
+
+    Только юридически или технически установленное: санкционные списки
+    (OFAC, UK, EU — но не мнение платного KYT) и блокировка средств на
+    контракте Tether. Красная метка TronScan и флаги GoPlus сюда НЕ входят:
+    это оценки, и оператор вправе с ними не согласиться."""
+    if (verdict.aml or {}).get("direct_sanctioned"):
+        return "адрес в санкционном списке OFAC SDN"
+    if (verdict.raw_labels.get("tether") or {}).get("blacklisted"):
+        return "средства на адресе заблокированы эмитентом USDT"
+    if (
+        verdict.entity_type is EntityType.SANCTIONED
+        and verdict.sanction_source
+        and verdict.sanction_source != aml_bitok.PROVIDER
+    ):
+        return f"адрес обслуживает санкционную инфраструктуру ({verdict.sanction_source})"
+    return None
+
+
 def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
     """Ручные метки — НАИВЫСШИЙ приоритет, поэтому вызывается последней.
 
@@ -1761,6 +2014,21 @@ def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
         return
     verdict.raw_labels["local"] = data
     verdict.sources.append("Local DB")
+    fact = _hard_fact(verdict)
+    if fact:
+        # Оператор может знать об адресе больше, чем платный KYT, — но не больше,
+        # чем санкционный список или контракт Tether. Это факты, а не мнения:
+        # отправленный на такой адрес USDT будет заморожен, что бы ни думал
+        # разметивший. Раньше метка «safe» давала адресу из OFAC «безопасно ·
+        # 10», а ставить метки может любой пользователь из белого списка.
+        name = data.get("entity") or data.get("risk_level") or "без названия"
+        verdict.risk_flags.append(
+            f"📝 Ручная метка «{name}» не применена: {fact}. Метка не может "
+            f"отменить санкции или блокировку эмитентом"
+        )
+        if data.get("note"):
+            verdict.risk_flags.append(f"Local note: {data['note']}")
+        return
     verdict.entity = data.get("entity") or verdict.entity
     if data.get("entity_type"):
         try:
@@ -1780,8 +2048,10 @@ def _apply_local(data: dict[str, str] | None, verdict: AddressVerdict) -> None:
                     f"(было «{verdict.risk_level.value}», скор {verdict.risk_score})"
                 )
             verdict.risk_level = new_level
-            if new_level is RiskLevel.SAFE:
-                verdict.risk_score = min(verdict.risk_score, 10)
+            if new_level is RiskLevel.SAFE and verdict.risk_score > 10:
+                verdict.risk_score = 10
+                if verdict.aml is not None:
+                    verdict.aml["score_reason"] = "понижено ручной меткой оператора"
     if data.get("note"):
         verdict.risk_flags.append(f"Local note: {data['note']}")
 
@@ -1854,6 +2124,13 @@ def _apply_provider_gaps(verdict: AddressVerdict) -> None:
             f"❗ Проверка НЕПОЛНАЯ: недоступны источники — {names}. "
             f"Отсутствие находок здесь не означает отсутствие риска",
         )
+    if verdict.provider_status.get("hop2") == "partial":
+        hop2 = verdict.aml or {}
+        verdict.risk_flags.append(
+            f"⚠️ 2-й хоп неполный: из {hop2.get('hop2_intermediaries_checked', 0) + hop2.get('hop2_failed', 0)} "
+            f"посредников не удалось проверить {hop2.get('hop2_failed', 0)}. Косвенная "
+            f"экспозиция посчитана по остальным и может быть занижена"
+        )
     if verdict.provider_status.get("ofac") == "bundled":
         verdict.risk_flags.append(
             "ℹ️ Санкционный список взят из вшитого снимка (GitHub недоступен) — "
@@ -1869,7 +2146,9 @@ async def _apply_history(verdict: AddressVerdict, source: str) -> None:
     журнала глушатся внутри core.history: он необязательный."""
     prev = await history.previous(verdict.address)
     await history.record(verdict, source)
-    if not prev:
+    if not prev or verdict.is_degraded():
+        # Неполная проверка не сравнивается: иначе «TronScan не ответил»
+        # читается как «риск снизился», а следующая полная — как «вырос».
         return
     verdict.raw_labels["previous_check"] = prev
     old_level, new_level = prev.get("risk_level"), verdict.risk_level.value
@@ -1903,10 +2182,19 @@ def inflight_count() -> int:
 
 
 async def check_address(
-    address: str, use_cache: bool = True, source: str = "api"
+    address: str,
+    use_cache: bool = True,
+    source: str = "api",
+    on_preliminary=None,
 ) -> AddressVerdict:
     """Главная точка входа. Дедуплицирует одновременные проверки одного адреса
-    и ограничивает проверку общим бюджетом времени."""
+    и ограничивает проверку общим бюджетом времени.
+
+    `on_preliminary(verdict)` — необязательный колбэк: получает предварительный
+    вердикт по данным блокчейна до того, как запрошены платные KYT. Бот
+    показывает его сразу, а итоговый — правкой того же сообщения. Колбэк
+    получает только проверка, которая реально выполняется: ждущий её дубль
+    сразу получит итог."""
     if not is_valid_trc20_address(address):
         return AddressVerdict(
             address=address,
@@ -1923,7 +2211,9 @@ async def check_address(
         # shield: отмена ожидающего не должна ронять проверку, которую ждут другие.
         return await asyncio.shield(running)
 
-    task = asyncio.create_task(_check_address_guarded(address, use_cache, source))
+    task = asyncio.create_task(
+        _check_address_guarded(address, use_cache, source, on_preliminary)
+    )
     _inflight[key] = task
     try:
         return await asyncio.shield(task)
@@ -1933,42 +2223,153 @@ async def check_address(
 
 
 async def _check_address_guarded(
-    address: str, use_cache: bool, source: str
+    address: str, use_cache: bool, source: str, on_preliminary=None
 ) -> AddressVerdict:
     """Проверка под общим дедлайном."""
     if CHECK_BUDGET_SECONDS <= 0:
-        return await _check_address(address, use_cache, source)
+        return await _check_address(address, use_cache, source, on_preliminary)
     try:
         async with asyncio.timeout(CHECK_BUDGET_SECONDS):
-            return await _check_address(address, use_cache, source)
+            return await _check_address(address, use_cache, source, on_preliminary)
     except TimeoutError:
         log.warning(
-            "Проверка %s не уложилась в бюджет %.0f с — отдаём частичный результат",
+            "Проверка %s не уложилась в бюджет %g с — отдаём частичный результат",
             address, CHECK_BUDGET_SECONDS,
         )
-        partial = _partial.pop(address, None)
-        if partial is None:
-            partial = AddressVerdict(address=address, entity="Проверка не завершилась")
-        partial.risk_flags.insert(
-            0,
-            f"⏳ Проверка прервана по таймауту ({CHECK_BUDGET_SECONDS:.0f} с): часть "
-            f"источников не успела ответить. Повторите — платные KYT иногда "
-            f"считаются дольше обычного",
-        )
+        return _finish_partial(address, _partial.pop((address, use_cache), None))
+
+
+@dataclass
+class _Progress:
+    """Всё, что уже известно о проверке, — на случай обрыва по общему дедлайну.
+
+    Раньше при обрыве отдавался вердикт БЕЗ расчёта риска: `_compute_aml`
+    вызывается в самом конце, а прямое попадание в OFAC определяется только
+    в нём. Санкционный адрес, на котором медленно отвечал Bitok, выходил как
+    «НЕТ ДАННЫХ · 0/100» — худший возможный исход для AML-инструмента.
+    Теперь входные данные расчёта сохраняются по мере получения, и риск
+    считается по тому, что успели собрать."""
+
+    verdict: AddressVerdict
+    transfers: list[dict[str, Any]] = field(default_factory=list)
+    sanctioned: set[str] = field(default_factory=set)
+    tokens: dict[str, Any] = field(default_factory=dict)
+    hop2: dict[str, Any] | None = None
+    finalized: bool = False     # риск уже посчитан — повторять нельзя
+
+
+# Ключ тот же, что у _inflight: одновременные проверки с кешем и без кеша —
+# разные проверки, и частичный результат одной не должен достаться другой.
+_partial: dict[tuple[str, bool], _Progress] = {}
+
+
+def _finalize_risk(verdict: AddressVerdict, prog: _Progress) -> None:
+    """Единственный расчёт риска и всё, что должно идти после него.
+
+    Общий для обычного пути и для обрыва по дедлайну: вердикт не может
+    выйти наружу без `_compute_aml`, ручных меток и флага о пробелах."""
+    _compute_aml(verdict, prog.transfers, prog.sanctioned, prog.hop2, prog.tokens)
+    # Fallback: нет публичной метки. risk_level НЕ трогаем — его уже выставил
+    # _compute_aml (у адреса может быть реальный риск от экспозиции/2-хопа).
+    if verdict.entity_type == EntityType.UNKNOWN and not verdict.entity:
+        verdict.entity = "No public labels"
+    # Ручные метки — последними: у них наивысший приоритет (см. _apply_local).
+    # Приоритет источников: БД меток (правится оператором без редеплоя) выше
+    # предзаданных в local.py — в БД они и так засеяны при старте.
+    _apply_local(labels.lookup(verdict.address) or local.lookup(verdict.address), verdict)
+    # Один явный флаг, если какой-то источник не ответил.
+    _apply_provider_gaps(verdict)
+    prog.finalized = True
+
+
+# Важность флага по его началу. Флаги — строки (так они уходят в API), поэтому
+# ранг определяется префиксом; неизвестный префикс получает средний ранг, а не
+# последний, чтобы новая находка без эмодзи не утонула в справке.
+_FLAG_RANKS: tuple[tuple[tuple[str, ...], int], ...] = (
+    # 0 — проверка неполная или жёсткий факт: санкции, блокировка эмитентом
+    (("❗", "⏳", "🚫", "🚨"), 0),
+    # 1 — опасность и всё, что меняет прочтение вердикта
+    (("⛔", "🚩", "TronScan red tag", "Экспозиция к санкционным", "🎭",
+      "⬆️", "⬇️", "📝"), 1),
+    # 3 — справка: объясняет тип и профиль, но не про риск
+    (("ℹ️", "🆕", "📥", "🏦", "💬", "🔗", "🫙", "Exchange hot wallet",
+      "Exchange cold wallet", "Local note"), 3),
+)
+
+
+def flag_rank(flag: str) -> int:
+    """0 — важнее всего, 3 — справка. Остальное (⚠️ и прочее) — 2."""
+    for prefixes, rank in _FLAG_RANKS:
+        if flag.startswith(prefixes):
+            return rank
+    return 2
+
+
+def _order_flags(verdict: AddressVerdict) -> None:
+    """Флаги по важности, внутри ранга — в порядке появления.
+
+    Раньше порядок был порядком фаз проверки, а внешние AML добавляются
+    последними. Бот показывает первые восемь — и на обычном «шумном»
+    кошельке «⛔️ Bitok: высокий риск — 85% (даркнет)» уходил за «…и ещё 3»:
+    пользователь видел «ОПАСНО 85/100» и восемь строк, ни одна из которых
+    этих 85 не объясняла."""
+    verdict.risk_flags.sort(key=flag_rank)
+
+
+PRELIMINARY_FLAG = (
+    "⏳ Предварительный вердикт по данным блокчейна: платные AML-сервисы ещё "
+    "считаются, итог придёт следующим обновлением"
+)
+
+
+async def _send_preliminary(prog: _Progress, callback) -> None:
+    """Отдать вердикт по уже собранным on-chain данным.
+
+    Считается на КОПИИ: у итогового вердикта расчёт риска должен выполниться
+    ровно один раз и уже с учётом KYT. Сбой колбэка (например, Telegram не
+    принял правку) проверку не останавливает."""
+    try:
+        pre = copy.deepcopy(prog.verdict)
+        pre_prog = _Progress(pre, prog.transfers, prog.sanctioned,
+                             copy.deepcopy(prog.tokens), prog.hop2)
+        _finalize_risk(pre, pre_prog)
+        pre.risk_flags.insert(0, PRELIMINARY_FLAG)
+        _order_flags(pre)
+        pre.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
+        pre.ruleset_version = RULESET_VERSION
+        await callback(pre)
+    except Exception:
+        log.exception("Предварительный вердикт для %s не отправлен", prog.verdict.address)
+
+
+def _finish_partial(address: str, prog: _Progress | None) -> AddressVerdict:
+    """Вердикт из того, что успели собрать до дедлайна."""
+    if prog is None:
+        # Дедлайн сработал раньше, чем пришли даже базовые источники.
+        partial = AddressVerdict(address=address, entity="Проверка не завершилась")
+    else:
+        partial = prog.verdict
         for name in ("swapster", "bitok", "hop2"):
             partial.provider_status.setdefault(name, "timeout")
-        partial.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
-        partial.ruleset_version = RULESET_VERSION
-        return partial
-
-
-# Частично собранные вердикты: если проверка не уложится в бюджет, отдаём то,
-# что успели узнать, вместо пустого ответа.
-_partial: dict[str, AddressVerdict] = {}
+        if not prog.finalized:
+            # Метка Bitok может только ПОДНЯТЬ тип (санкции, скам), поэтому её
+            # безопасно применить и к частичному результату, если он успел.
+            _label_from_bitok(partial)
+            _finalize_risk(partial, prog)
+    partial.risk_flags.insert(
+        0,
+        f"⏳ Проверка прервана по таймауту ({CHECK_BUDGET_SECONDS:g} с): часть "
+        f"источников не успела ответить. Риск посчитан по тому, что успели "
+        f"получить; повторите проверку — платные KYT иногда считаются дольше",
+    )
+    _order_flags(partial)
+    partial.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
+    partial.ruleset_version = RULESET_VERSION
+    return partial
 
 
 async def _check_address(
-    address: str, use_cache: bool, source: str
+    address: str, use_cache: bool, source: str, on_preliminary=None
 ) -> AddressVerdict:
     """Собственно проверка.
 
@@ -2016,12 +2417,16 @@ async def _check_address(
 
         verdict = AddressVerdict(address=address)
         verdict.provider_status = status
-        # Держим ссылку: при срабатывании общего дедлайна отдаём собранное,
-        # а не пустой вердикт.
-        _partial[address] = verdict
+        # Держим ссылку и входные данные расчёта: при срабатывании общего
+        # дедлайна риск досчитывается по собранному (см. _Progress).
         token_summary = _apply_token_hygiene(flow_data, verdict)
+        prog = _Progress(verdict, flow_data, sanctioned, token_summary)
+        _partial[(address, use_cache)] = prog
         token_summary.update(_apply_transfer_signals(flow_data, flow_meta, verdict))
         token_summary["poisoning_suspects"] = _detect_poisoning(flow_data, verdict)
+        # Баланс — из уже полученного ответа TronScan. Сразу, а не в конце:
+        # он нужен и частичному вердикту, и решению о транзитности для Swapster.
+        verdict.balance_trx, verdict.balance_usdt = balance.extract_balances(ts_data)
         # Свои направления по переводам — до _apply_tronscan: профиль адреса
         # сверяет с ними счётчики транзакций TronScan.
         verdict.raw_labels["trc20_seen"] = _seen_directions(flow_data, address)
@@ -2060,7 +2465,10 @@ async def _check_address(
             total_h, per_cp_h = _parse_transfers(address, flow_data, sanctioned)
             try:
                 hop2 = await _fetch_hop2(per_cp_h, total_h, sanctioned, client)
-                verdict.provider_status["hop2"] = "ok"
+                prog.hop2 = hop2
+                verdict.provider_status["hop2"] = (
+                    "partial" if (hop2 or {}).get("failed") else "ok"
+                )
             except ProviderError as e:
                 log.warning("2-й хоп недоступен: %s", e)
                 verdict.provider_status["hop2"] = "error"
@@ -2071,10 +2479,6 @@ async def _check_address(
     # Кластеризация: опознан депозитник биржи → пишем в накопительную БД и
     # обогащаем вердикт числом родственных депозитников того же якоря/биржи.
     await _apply_cluster(verdict)
-
-    # Баланс кошелька (из уже полученного ответа TronScan). Нужен до внешних AML:
-    # по нему определяется транзитность для релейбла Swapster.
-    verdict.balance_trx, verdict.balance_usdt = balance.extract_balances(ts_data)
 
     # ---- Фаза меток: внешние KYT ----
     # Туннель: биржа/контракт → внешние AML не зовём (их скор ничего не говорит о
@@ -2106,11 +2510,24 @@ async def _check_address(
         verdict.provider_status["swapster"] = "skipped"
         verdict.provider_status["bitok"] = "skipped"
     else:
-        verdict.external_aml, verdict.bitok_aml = await asyncio.gather(
-            aml_external.check(address), aml_bitok.check(address)
+        # On-chain часть готова за секунды, а платные KYT считаются десятки
+        # секунд. Показываем её сразу, а не держим пользователя до конца.
+        if on_preliminary is not None and (
+            aml_external.is_configured() or aml_bitok.is_configured()
+        ):
+            await _send_preliminary(prog, on_preliminary)
+        # Каждый сервис пишет результат в вердикт, как только ответил. Раньше
+        # gather отдавал оба разом, и при обрыве по дедлайну терялся и тот,
+        # что успел: Swapster готов за секунды, а ждали медленный Bitok.
+        async def _kyt(key: str, attr: str, fn) -> None:
+            res = await _kyt_cached(key, address, fn)
+            setattr(verdict, attr, res)
+            verdict.provider_status[key] = _aml_status(res)
+
+        await asyncio.gather(
+            _kyt("swapster", "external_aml", aml_external.check),
+            _kyt("bitok", "bitok_aml", aml_bitok.check),
         )
-        for key, ext in (("swapster", verdict.external_aml), ("bitok", verdict.bitok_aml)):
-            verdict.provider_status[key] = _aml_status(ext)
         # Swapster может опознать биржу/сервис там, где TronScan/on-chain пусто,
         # но только если адрес ещё и ведёт себя как транзит (не личный юзер).
         transit = _is_transit(flow_data, address, verdict.balance_usdt)
@@ -2123,20 +2540,7 @@ async def _check_address(
     # адреса уже после расчёта. Получались взаимоисключающие строки в отчёте —
     # «Тип: САНКЦИОННЫЙ» рядом с «НЕТ ДАННЫХ · риск 0/100», а переклеймённая в
     # биржу сущность сохраняла «кошельковый» скор.
-    _compute_aml(verdict, flow_data, sanctioned, hop2, token_summary)
-
-    # Fallback: нет публичной метки. risk_level НЕ трогаем — его уже выставил
-    # _compute_aml (у адреса может быть реальный риск от экспозиции/2-хопа).
-    if verdict.entity_type == EntityType.UNKNOWN and not verdict.entity:
-        verdict.entity = "No public labels"
-
-    # Ручные метки — последними: у них наивысший приоритет (см. _apply_local).
-    # Приоритет источников: БД меток (правится оператором без редеплоя) выше
-    # предзаданных в local.py — в БД они и так засеяны при старте.
-    _apply_local(labels.lookup(address) or local.lookup(address), verdict)
-
-    # Один явный флаг, если какой-то источник не ответил.
-    _apply_provider_gaps(verdict)
+    _finalize_risk(verdict, prog)
 
     verdict.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
     verdict.ruleset_version = RULESET_VERSION
@@ -2144,10 +2548,12 @@ async def _check_address(
     # Сравнение с прошлым результатом — то, зачем журнал и нужен: повторная
     # проверка контрагента отвечает на вопрос «изменилось ли что-нибудь».
     await _apply_history(verdict, source)
+    _order_flags(verdict)
 
-    # Кеш
-    if use_cache:
+    # Кеш. Неполный вердикт не кешируем: иначе результат, полученный во время
+    # сбоя TronScan, неделю отдавался бы как готовый.
+    if use_cache and not verdict.is_degraded():
         await cache.put(address, verdict.to_dict())
 
-    _partial.pop(address, None)
+    _partial.pop((address, use_cache), None)
     return verdict

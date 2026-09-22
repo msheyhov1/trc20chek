@@ -70,12 +70,29 @@ async def test_tronscan_raises_when_endpoint_fails_without_key(monkeypatch):
 async def test_tronscan_falls_back_to_accountv2_with_key(monkeypatch):
     monkeypatch.setattr(tronscan, "TRONSCAN_API_KEY", "key")
     client = FakeClient([
-        FakeResponse(status_code=404),                 # /api/account недоступен
+        FakeResponse(status_code=404),                 # /api/account с ключом
+        FakeResponse(status_code=404),                 # /api/account без ключа
         FakeResponse({"address": "T1", "accountType": 2}),  # /api/accountv2 ответил
     ])
     data = await tronscan.fetch_account("T1", client)
     assert data["accountType"] == 2
-    assert "/api/accountv2" in client.calls[1]["url"]
+    assert "/api/accountv2" in client.calls[2]["url"]
+
+
+@pytest.mark.asyncio
+async def test_tronscan_retries_without_revoked_key(monkeypatch):
+    """Отозванный ключ даёт 401 на каждый запрос, хотя без ключа /api/account
+    работает. Раньше повтора без ключа не было, и каждая проверка выходила
+    «НЕПОЛНОЙ»."""
+    monkeypatch.setattr(tronscan, "TRONSCAN_API_KEY", "revoked")
+    client = FakeClient([
+        FakeResponse(status_code=401),
+        FakeResponse({"address": "T1", "publicTag": "Binance-Hot 4"}),
+    ])
+    data = await tronscan.fetch_account("T1", client)
+    assert data["publicTag"] == "Binance-Hot 4"
+    assert "TRON-PRO-API-KEY" in client.calls[0]["headers"]
+    assert "TRON-PRO-API-KEY" not in client.calls[1]["headers"]
 
 
 @pytest.mark.asyncio

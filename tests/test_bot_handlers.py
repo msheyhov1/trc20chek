@@ -125,3 +125,76 @@ def test_fit_message_truncates_and_warns():
 
 def test_fit_message_keeps_short_text_intact():
     assert bm._fit_message("коротко") == "коротко"
+
+
+# ---------- аудит 2: бот ----------
+
+async def test_label_is_admin_only_when_admins_configured(monkeypatch):
+    """Метка меняет вердикт для всех пользователей — а с реестром сервисов и
+    для адресов, пересылающих на размеченный. В команде это право стоит
+    ограничить."""
+    monkeypatch.setattr(bm, "ADMIN_TG_IDS", {1})
+    put = AsyncMock()
+    monkeypatch.setattr(bm.labels, "put", put)
+    m = _message(f"/label {USDT} exchange safe Telegram Wallet", user_id=2)
+    await bm.cmd_label(m)
+    put.assert_not_awaited()
+    assert "администратор" in m.answer.await_args.args[0]
+
+    m = _message(f"/unlabel {USDT}", user_id=2)
+    delete = AsyncMock()
+    monkeypatch.setattr(bm.labels, "delete", delete)
+    await bm.cmd_unlabel(m)
+    delete.assert_not_awaited()
+
+
+async def test_label_open_to_whitelist_without_admins(monkeypatch):
+    monkeypatch.setattr(bm, "ADMIN_TG_IDS", set())
+    put = AsyncMock(return_value={"entity_type": "exchange", "risk_level": "safe"})
+    monkeypatch.setattr(bm.labels, "put", put)
+    await bm.cmd_label(_message(f"/label {USDT} exchange safe Telegram Wallet", user_id=2))
+    put.assert_awaited_once()
+
+
+async def test_history_shows_only_own_checks(monkeypatch):
+    """/history показывал каждому проверки всех пользователей из белого списка."""
+    own = AsyncMock(return_value=[{"address": USDT, "checked_at": 0, "risk_level": "safe",
+                                   "risk_score": 0, "entity": "мой"}])
+    everyone = AsyncMock(return_value=[])
+    monkeypatch.setattr(bm.history, "recent_views", own)
+    monkeypatch.setattr(bm.history, "recent", everyone)
+    m = _message("/history", user_id=555)
+    await bm.cmd_history(m)
+    own.assert_awaited_once()
+    assert own.await_args.args[0] == 555
+    everyone.assert_not_awaited()
+
+    m = _message("/history all", user_id=555)
+    await bm.cmd_history(m)
+    everyone.assert_awaited_once()
+
+
+async def test_on_text_tells_about_skipped_addresses(monkeypatch):
+    """Из 10 адресов в сообщении молча проверялись 5."""
+    monkeypatch.setattr(bm, "MAX_ADDRESSES_PER_MESSAGE", 1)
+    m = _message(f"{USDT} {OTHER}")
+    with patch.object(bm, "_check_one", new=AsyncMock()) as one:
+        await bm.on_text(m)
+    assert one.await_count == 1
+    texts = " ".join(c.args[0] for c in m.answer.await_args_list)
+    assert "Нашёл адресов: 2" in texts
+
+
+async def test_recheck_error_is_shown_in_the_message(monkeypatch):
+    """При ошибке на колбэк отвечали второй раз — Telegram это отклоняет, и
+    пользователь не видел ни ошибки, ни нового вердикта."""
+    cb = MagicMock()
+    cb.data = f"recheck:{USDT}"
+    cb.from_user = MagicMock(id=1)
+    cb.answer = AsyncMock()
+    cb.message = MagicMock(edit_text=AsyncMock())
+    monkeypatch.setattr(bm, "_check_and_render", AsyncMock(side_effect=RuntimeError("boom")))
+    await bm.on_recheck(cb)
+    assert cb.answer.await_count == 1                        # ответ на колбэк — один
+    last = cb.message.edit_text.await_args_list[-1].args[0]
+    assert "Не удалось перепроверить" in last and "boom" in last
