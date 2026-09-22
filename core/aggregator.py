@@ -10,7 +10,16 @@ from typing import Any
 
 import httpx
 
-from . import aml_bitok, aml_external, balance, cache, cluster, history, labels
+from . import (
+    aml_bitok,
+    aml_external,
+    balance,
+    cache,
+    cluster,
+    history,
+    labels,
+    services,
+)
 from .models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 from .providers import flow, goplus, local, ofac, tether, token_security, tronscan
 from .providers.base import ProviderError
@@ -21,7 +30,7 @@ log = logging.getLogger(__name__)
 
 # Версия правил скоринга. Меняется, когда меняются пороги или формула — тогда
 # старый сохранённый вердикт читается в контексте тогдашних правил, а не текущих.
-RULESET_VERSION = "2026.09.1"
+RULESET_VERSION = "2026.09.2"
 
 # Туннель: для этих типов внешний AML-API НЕ запрашивается — биржа/депозитник
 # биржи/контракт — это инфраструктура, её AML-скор ничего не говорит о владельце,
@@ -33,6 +42,33 @@ _AML_SKIP_TYPES = frozenset({EntityType.EXCHANGE, EntityType.CONTRACT, EntityTyp
 # считаем биржей/сервисом. Swapster видит off-chain принадлежность, которой нет
 # у TronScan/on-chain (напр. транзитный хаб биржи без публичной метки). Тюнится env.
 AML_EXCHANGE_ENTITY_THRESHOLD = float(os.getenv("AML_EXCHANGE_ENTITY_THRESHOLD", "0.9"))
+
+
+# Группы риска в общем формате entities (одинаковы у Swapster и Bitok).
+_ENTITY_LEVEL_ORDER = {"HIGH_RISK": 3, "MEDIUM_RISK": 2, "LOW_RISK": 1}
+
+
+def _top_risk_entity(ext: dict[str, Any]) -> str | None:
+    """Категория, которой подписывается вердикт внешнего KYT.
+
+    Раньше бралась первая из списка. У Bitok он отсортирован по доле объёма, а
+    Swapster отдаёт категории в произвольном порядке — и в подписи «высокий
+    риск — 31.7% (…)» оказывалась случайная категория, нередко безобидная,
+    вместо той, из-за которой риск и поднялся.
+
+    Берём самую весомую из САМЫХ рисковых: подпись должна объяснять вердикт,
+    а не пересказывать крупнейшую строку разбивки."""
+    entities = [e for e in (ext.get("entities") or []) if isinstance(e, dict)]
+    if not entities:
+        return None
+    top = max(
+        entities,
+        key=lambda e: (
+            _ENTITY_LEVEL_ORDER.get(str(e.get("level") or ""), 0),
+            e.get("risk_score") or 0,
+        ),
+    )
+    return top.get("entity") or None
 
 
 def _relabel_from_swapster(verdict: AddressVerdict, is_transit: bool) -> None:
@@ -193,7 +229,7 @@ def _apply_external_aml_risk(verdict: AddressVerdict) -> None:
         if isinstance(pct, int | float):
             verdict.risk_score = max(verdict.risk_score, int(round(pct)))
         detail = f" — {pct:g}%" if isinstance(pct, int | float) else ""
-        top = (ext.get("entities") or [{}])[0].get("entity") or ext.get("entity_category_ru")
+        top = _top_risk_entity(ext) or ext.get("entity_category_ru")
         reason = f" ({top})" if top else ""
         verdict.risk_flags.append(
             f"{'⛔️' if level is RiskLevel.DANGEROUS else '⚠️'} {provider}: "
@@ -378,6 +414,35 @@ def _parse_high_risk_exchanges() -> dict[str, str]:
 HIGH_RISK_EXCHANGES: dict[str, str] = _parse_high_risk_exchanges()
 HIGH_RISK_EXCHANGE_NAMES = set(HIGH_RISK_EXCHANGES.values())
 
+# Кастодиальные кошельки внутри мессенджеров. Для TRC20-потоков это такие же
+# держатели средств, как биржа: адрес принадлежит СЕРВИСУ, а не пользователю,
+# которому он выдан, и дальше этого адреса перевод не проследить.
+#
+# Отдельный словарь, а не строка в EXCHANGE_KEYWORDS, нужен ради формулировки:
+# «Депозитный кошелёк Binance» и «кошелёк телеграм-бота» читаются по-разному,
+# и пользователю важно знать, что он имеет дело с кастодиальным сервисом
+# с минимальной верификацией.
+#
+# Ключи — подстроки тега TronScan. Теги здесь не проверены живым запросом
+# (эндпоинт TronScan из окружения разработки недоступен), поэтому подобраны
+# так, чтобы ложное срабатывание было невозможно: совпадение только с
+# самоназванием сервиса. Если такого тега у TronScan нет, правило просто
+# никогда не сработает и ничего не испортит. Надёжный путь для этих сервисов —
+# разметить их хот-кошелёк по адресу: /label в боте или SERVICE_ADDRESSES
+# (см. core/services.py); дальше их депозитники опознает funnel-эвристика.
+CUSTODIAL_SERVICES: dict[str, str] = {
+    "cryptobot": "CryptoBot (Telegram)",
+    "crypto bot": "CryptoBot (Telegram)",
+    "cryptopay": "CryptoBot (Telegram)",
+    "crypto pay": "CryptoBot (Telegram)",
+    "telegram wallet": "Telegram Wallet",
+    "wallet.tg": "Telegram Wallet",
+    "tg wallet": "Telegram Wallet",
+    "@wallet": "Telegram Wallet",
+    "xrocket": "xRocket (Telegram)",
+}
+CUSTODIAL_SERVICE_NAMES = set(CUSTODIAL_SERVICES.values())
+
 # Каноническое имя → какой орган внёс биржу в список. Нужно, чтобы отчёт не
 # ссылался на OFAC там, где санкция британская или европейская: уровень риска
 # можно перепроверить, а ссылка на конкретный список читается как факт.
@@ -415,6 +480,9 @@ HOP2_LIMIT = int(os.getenv("AML_HOP2_LIMIT", "12"))  # сколько посре
 HOP2_WEIGHT = float(os.getenv("AML_HOP2_WEIGHT", "0.6"))  # вес косвенной экспозиции
 # Ограничение параллелизма hop2, чтобы не бить в QPS-лимит TronScan-ключа.
 HOP2_CONCURRENCY = int(os.getenv("AML_HOP2_CONCURRENCY", "4"))
+# Глубина истории для посредников 2-го хопа. Отдельно от FLOW_PAGES: у главного
+# адреса лишняя страница — один запрос, а здесь адресов до двенадцати.
+HOP2_FLOW_PAGES = max(1, int(os.getenv("AML_HOP2_FLOW_PAGES", "1")))
 
 # Депозитный/транзитный адрес биржи (funnel-эвристика, см. _detect_exchange_deposit).
 # Концентрация оттока на одну биржу и доля пересылаемого — пороги распознавания.
@@ -423,6 +491,12 @@ HOP2_CONCURRENCY = int(os.getenv("AML_HOP2_CONCURRENCY", "4"))
 DEPOSIT_CONCENTRATION = float(os.getenv("DEPOSIT_CONCENTRATION", "0.9"))
 DEPOSIT_FORWARD_RATIO = float(os.getenv("DEPOSIT_FORWARD_RATIO", "0.5"))
 DEPOSIT_BACKFLOW_RATIO = float(os.getenv("DEPOSIT_BACKFLOW_RATIO", "0.15"))
+# Одноразовый депозитный адрес: получил ОДИН перевод и свипнул его на биржу.
+# Так работают Binance и Bybit — адрес выдаётся пользователю под один депозит,
+# и требование «минимум два прихода» отбрасывало именно их. Свидетельств
+# меньше, поэтому пороги жёстче, а вывод помечается как вероятный.
+DEPOSIT_SWEEP_CONCENTRATION = float(os.getenv("DEPOSIT_SWEEP_CONCENTRATION", "0.99"))
+DEPOSIT_SWEEP_FORWARD_RATIO = float(os.getenv("DEPOSIT_SWEEP_FORWARD_RATIO", "0.9"))
 # Порог «очень высокая активность» → возможно нетегированный сервис.
 UNTAGGED_SERVICE_TX = int(os.getenv("UNTAGGED_SERVICE_TX", "50000"))
 
@@ -438,7 +512,12 @@ CRITICAL_GOPLUS_FLAGS = {
 }
 
 
-_ALL_EXCHANGES = {**EXCHANGE_KEYWORDS, **SANCTIONED_EXCHANGES, **HIGH_RISK_EXCHANGES}
+_ALL_EXCHANGES = {
+    **EXCHANGE_KEYWORDS,
+    **SANCTIONED_EXCHANGES,
+    **HIGH_RISK_EXCHANGES,
+    **CUSTODIAL_SERVICES,
+}
 
 
 def _normalize_exchange(tag: str | None) -> str | None:
@@ -449,6 +528,99 @@ def _normalize_exchange(tag: str | None) -> str | None:
         if key in t:
             return name
     return None
+
+
+def _counterparty_service(
+    tag: str | None, address: str | None, anchors: dict[str, str] | None = None
+) -> str | None:
+    """Какой сервис стоит за контрагентом перевода.
+
+    Тремя слоями, от надёжного к накопленному:
+      1. тег TronScan в самом переводе;
+      2. реестр сервисных адресов (env SERVICE_ADDRESSES и ручные метки) —
+         так опознаются сервисы, которых TronScan не размечает вовсе;
+      3. якоря из накопительного кластера — хот-кошельки, выученные на прошлых
+         проверках, когда тег в ответе был.
+
+    Второй и третий слой и есть ответ на вопрос, почему депозитники Bybit и
+    Binance оставались «личными кошельками»: без тега на контрагенте
+    funnel-эвристика не видела в оттоке биржу и не срабатывала вообще."""
+    return (
+        _normalize_exchange(tag)
+        or services.service_name(address)
+        or (anchors or {}).get(address or "")
+        or None
+    )
+
+
+# Возраст адреса: моложе этого — «свежий». Не риск сам по себе (адреса создают
+# каждый день), но в паре с крупным приходом это другой профиль: у долгоживущего
+# кошелька есть история, у вчерашнего её нет и проверять нечего.
+NEW_ADDRESS_DAYS = int(os.getenv("NEW_ADDRESS_DAYS", "30"))
+# Жалобы пользователей в TronScan — сигнал слабее скам-тега (репорт может быть и
+# ошибочным), поэтому не «опасно», а нижняя граница «осторожно».
+FEEDBACK_RISK_SCORE = float(os.getenv("FEEDBACK_RISK_SCORE", "30"))
+
+
+def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> None:
+    """Поля ответа /api/account, которые раньше отбрасывались.
+
+    Всё это уже приходит в том же ответе, что и метки: дополнительных запросов
+    не делается, а бюджет проверки (~20 внешних запросов на 90 с) не трогается.
+
+      date_created                    — когда адрес активирован (мс)
+      feedbackRisk                    — TronScan получал жалобы на адрес
+      transactions_in/transactions_out — чистый получатель или отправитель
+
+    Функция только собирает данные и объясняющие флаги; решение о риске
+    принимает _compute_aml (единственный расчёт)."""
+    profile: dict[str, Any] = {}
+
+    created = data.get("date_created")
+    if isinstance(created, int | float) and created > 0:
+        # TronScan отдаёт миллисекунды. Секунды тоже встречаются в зеркалах API,
+        # поэтому различаем по порядку величины, а не по вере в документацию.
+        seconds = created / 1000 if created > 1e11 else float(created)
+        age_days = max(0.0, (datetime.now(UTC).timestamp() - seconds) / 86400)
+        profile["created_at"] = datetime.fromtimestamp(seconds, UTC).isoformat(
+            timespec="seconds"
+        )
+        profile["age_days"] = round(age_days, 1)
+        if age_days < NEW_ADDRESS_DAYS:
+            verdict.risk_flags.append(
+                f"🆕 Адрес создан {age_days:.0f} дн. назад — истории, по которой "
+                f"его можно оценить, почти нет"
+            )
+
+    tx_in = data.get("transactions_in")
+    tx_out = data.get("transactions_out")
+    if isinstance(tx_in, int):
+        profile["tx_in"] = tx_in
+    if isinstance(tx_out, int):
+        profile["tx_out"] = tx_out
+    if isinstance(tx_in, int) and isinstance(tx_out, int) and tx_in >= 5 and tx_out == 0:
+        verdict.risk_flags.append(
+            f"📥 Только приём: {tx_in} входящих переводов и ни одного исходящего — "
+            f"средства с адреса ещё ни разу не уходили"
+        )
+
+    if data.get("feedbackRisk"):
+        profile["feedback_risk"] = True
+        verdict.risk_flags.append(
+            "⚠️ TronScan: на адрес поступали жалобы пользователей (feedbackRisk)"
+        )
+
+    if profile:
+        verdict.raw_labels["profile"] = profile
+
+
+def _custodial_note(name: str) -> str:
+    """Что значит «адрес кастодиального сервиса» для того, кто его проверяет."""
+    return (
+        f"💬 {name} — кастодиальный сервис: адрес принадлежит сервису, а не "
+        f"пользователю, которому он выдан. Дальше этого адреса перевод "
+        f"не прослеживается, а верификация личности у таких сервисов минимальна"
+    )
 
 
 def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
@@ -470,6 +642,11 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
     activity = data.get("totalTransactionCount") or data.get("transactions")
     if isinstance(activity, int):
         verdict.raw_labels["activity_tx"] = activity
+
+    # Профиль адреса из того же ответа — ни одного лишнего запроса.
+    # Ставится ДО ветвлений: ниже каждая ветка делает return, и для биржи,
+    # контракта или скама профиль бы не собрался.
+    _apply_account_profile(data, verdict)
 
     # 1. Красный тег = скам/опасный
     if data.get("redTag"):
@@ -495,6 +672,9 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
             return
         verdict.entity_type = EntityType.EXCHANGE
         verdict.risk_level = RiskLevel.SAFE
+        if exch in CUSTODIAL_SERVICE_NAMES:
+            verdict.risk_flags.append(_custodial_note(exch))
+            return
         if "hot" in main_tag.lower():
             verdict.risk_flags.append("Exchange hot wallet")
         elif "cold" in main_tag.lower():
@@ -552,7 +732,7 @@ def _apply_goplus(data: dict[str, Any], verdict: AddressVerdict) -> None:
 
 
 def _detect_exchange_deposit(
-    transfers: list[dict[str, Any]], addr: str
+    transfers: list[dict[str, Any]], addr: str, anchors: dict[str, str] | None = None
 ) -> dict[str, Any] | None:
     """Депозитный / транзитный адрес биржи (funnel-паттерн).
 
@@ -568,6 +748,17 @@ def _detect_exchange_deposit(
     приходов в один вывод (4129.33 + 10 + 20 → 4159.33 на Bybit). Поэтому
     смотрим не совпадение сумм, а концентрацию и пересылку по объёму.
 
+    Два исхода различаются уверенностью (`confidence`):
+      • `high`   — несколько приходов, классический funnel;
+      • `medium` — ОДИН приход и свип почти всей суммы на биржу. Так устроены
+        одноразовые депозитные адреса Binance/Bybit, и раньше они не
+        опознавались вовсе. Отличить такой адрес от личного кошелька, который
+        разово отправил всё на биржу, on-chain нельзя, поэтому вывод помечается
+        как вероятный и НЕ включает поддавки для известного сервиса: платные
+        KYT для него по-прежнему запрашиваются, а риск считается как обычно.
+
+    `anchors` — выученные ранее хот-кошельки (см. `_counterparty_service`).
+
     Возвращает dict с деталями или None."""
     out_exch: dict[str, float] = {}   # отток на биржи, по биржам
     out_other = 0.0                   # отток на не-биржи
@@ -578,33 +769,38 @@ def _detect_exchange_deposit(
     in_amounts: list[float] = []
     out_pairs: list[tuple[float, str]] = []
     # Якоря кластера: адреса хот/сборных кошельков биржи, куда уходит отток
-    anchors: dict[str, dict[str, float]] = {}  # exch -> {hot_wallet_addr: volume}
+    anchor_volume: dict[str, dict[str, float]] = {}  # exch -> {hot_wallet: volume}
     for t in transfers:
         amt = _amount(t)
         if amt <= 0:
             continue
         if addr == t.get("from_address"):
-            exch = _normalize_exchange((t.get("to_address_tag") or {}).get("to_address_tag"))
+            dst = t.get("to_address")
+            exch = _counterparty_service(
+                (t.get("to_address_tag") or {}).get("to_address_tag"), dst, anchors
+            )
             if exch:
                 out_exch[exch] = out_exch.get(exch, 0.0) + amt
                 out_pairs.append((amt, exch))
-                dst = t.get("to_address")
                 if dst:
-                    anchors.setdefault(exch, {})[dst] = (
-                        anchors.setdefault(exch, {}).get(dst, 0.0) + amt
+                    anchor_volume.setdefault(exch, {})[dst] = (
+                        anchor_volume.setdefault(exch, {}).get(dst, 0.0) + amt
                     )
             else:
                 out_other += amt
         elif addr == t.get("to_address"):
             in_tx += 1
-            exch = _normalize_exchange((t.get("from_address_tag") or {}).get("from_address_tag"))
+            src = t.get("from_address")
+            exch = _counterparty_service(
+                (t.get("from_address_tag") or {}).get("from_address_tag"), src, anchors
+            )
             if exch:
                 in_exch[exch] = in_exch.get(exch, 0.0) + amt
             else:
                 in_other += amt
                 in_amounts.append(amt)
-                if t.get("from_address"):
-                    in_sources.add(t["from_address"])
+                if src:
+                    in_sources.add(src)
 
     if not out_exch:
         return None
@@ -617,17 +813,25 @@ def _detect_exchange_deposit(
     # ДРУГИХ бирж (напр. вывел с Bybit/Binance → форварднул на MEXC) — в обоих
     # случаях адрес funnel'ит на одну биржу.
     total_in = in_other + sum(in_exch.values())
-    is_deposit = (
-        concentration >= DEPOSIT_CONCENTRATION   # почти весь отток — на одну биржу
-        # от ЭТОЙ биржи приходит мало относительно оттока на неё: газ-пополнения
-        # для sweep — норма, а сопоставимый обратный поток = личный торговый
-        # кошелёк (и заводит, и выводит), это НЕ депозитник.
-        and in_exch.get(exch, 0.0) <= DEPOSIT_BACKFLOW_RATIO * out_e
-        and in_tx >= 2                            # активный получатель, не одиночный перевод
-        and total_in > 0
-        and out_e >= DEPOSIT_FORWARD_RATIO * total_in  # форвардит бóльшую часть полученного
-    )
-    if not is_deposit:
+    backflow = in_exch.get(exch, 0.0)
+    if total_in <= 0 or concentration < DEPOSIT_CONCENTRATION:
+        return None
+    # от ЭТОЙ биржи приходит мало относительно оттока на неё: газ-пополнения
+    # для sweep — норма, а сопоставимый обратный поток = личный торговый
+    # кошелёк (и заводит, и выводит), это НЕ депозитник.
+    if backflow > DEPOSIT_BACKFLOW_RATIO * out_e:
+        return None
+
+    if in_tx >= 2 and out_e >= DEPOSIT_FORWARD_RATIO * total_in:
+        confidence = "high"
+    elif (
+        in_tx == 1
+        and backflow <= 0
+        and concentration >= DEPOSIT_SWEEP_CONCENTRATION
+        and out_e >= DEPOSIT_SWEEP_FORWARD_RATIO * total_in
+    ):
+        confidence = "medium"
+    else:
         return None
 
     # sweep-пары 1:1 по центам — необязательны, но усиливают вывод (для UI)
@@ -640,21 +844,59 @@ def _detect_exchange_deposit(
             pairs += 1
 
     # Якорь кластера — хот/сборный кошелёк биржи, на который уходит больше всего.
-    exch_anchors = anchors.get(exch, {})
+    exch_anchors = anchor_volume.get(exch, {})
     hot_wallet = max(exch_anchors, key=lambda a: exch_anchors[a]) if exch_anchors else None
 
     return {
         "exchange": exch,
+        "confidence": confidence,
         "concentration": round(concentration, 2),
         "forwarded_pct": round(min(out_e / total_in, 9.99) * 100, 1) if total_in else 0.0,
         "in_sources": len(in_sources),
+        "in_transfers": in_tx,
         "matched_pairs": pairs,
         "hot_wallet": hot_wallet,
         "sanctioned": exch in SANCTIONED_EXCHANGE_NAMES,
     }
 
 
-def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> None:
+def _is_probable_deposit(verdict: AddressVerdict) -> bool:
+    """Депозитник, опознанный по ОДНОМУ свипу (confidence = medium).
+
+    Вывод вероятный, поэтому поддавков «известного сервиса» он не получает: ни
+    обнуления риска, ни туннеля, отключающего платные KYT, ни пропуска 2-го
+    хопа. Иначе одна разовая отправка на биржу превращала бы личный кошелёк в
+    «безопасную биржу» — ровно та ошибка, из-за которой санкционные биржи
+    когда-то выдавали «exchange / safe / 0»."""
+    dp = (verdict.raw_labels.get("flow") or {}).get("deposit_pattern") or {}
+    return dp.get("confidence") == "medium"
+
+
+async def _anchor_map(transfers: list[dict[str, Any]], addr: str) -> dict[str, str]:
+    """Контрагенты переводов, которых мы уже знаем как хот-кошельки бирж.
+
+    Один локальный SQLite-запрос: внешних вызовов не добавляет и в бюджет
+    проверки не вмешивается."""
+    cps: set[str] = set()
+    for t in transfers:
+        if addr == t.get("from_address"):
+            cp = t.get("to_address")
+        elif addr == t.get("to_address"):
+            cp = t.get("from_address")
+        else:
+            continue
+        if cp:
+            cps.add(cp)
+    if not cps:
+        return {}
+    return await cluster.anchors_for(cps)
+
+
+def _apply_flow(
+    transfers: list[dict[str, Any]],
+    verdict: AddressVerdict,
+    anchors: dict[str, str] | None = None,
+) -> None:
     """Анализ контрагентов: с какими биржами и как часто взаимодействует адрес.
 
     Не утверждает «адрес = биржа» — определяет, что это кошелёк, связанный с
@@ -668,13 +910,15 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
     for t in transfers:
         if addr == t.get("from_address"):
             tag = (t.get("to_address_tag") or {}).get("to_address_tag")
+            cp = t.get("to_address")
             direction = "deposits"  # адрес отправил на контрагента
         elif addr == t.get("to_address"):
             tag = (t.get("from_address_tag") or {}).get("from_address_tag")
+            cp = t.get("from_address")
             direction = "withdrawals"  # адрес получил от контрагента
         else:
             continue
-        exch = _normalize_exchange(tag)
+        exch = _counterparty_service(tag, cp, anchors)
         if not exch:
             continue
         c = counts.setdefault(exch, {"deposits": 0, "withdrawals": 0})
@@ -709,20 +953,40 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
     # Это адрес инфраструктуры биржи, а не личный кошелёк — помечаем как биржу.
     # Для САНКЦИОННОЙ биржи риск не маскируем: deposit_pattern.sanctioned поднимет
     # его в _compute_aml до SANCTIONED (адрес обслуживает санкционную биржу).
-    deposit = _detect_exchange_deposit(transfers, addr)
+    deposit = _detect_exchange_deposit(transfers, addr, anchors)
     if deposit:
         exch = deposit["exchange"]
+        probable = deposit.get("confidence") == "medium"
         verdict.entity_type = EntityType.EXCHANGE
-        verdict.entity = f"Депозитный кошелёк {exch}"
-        verdict.risk_level = RiskLevel.SAFE  # для санкц. биржи поднимет _compute_aml
+        verdict.entity = (
+            f"Депозитный кошелёк {exch}" if not probable
+            else f"Депозитный кошелёк {exch} (вероятно)"
+        )
+        if not probable:
+            # Для санкционной биржи уровень поднимет _compute_aml.
+            verdict.risk_level = RiskLevel.SAFE
+        # У «вероятного» уровень не трогаем: «нет данных» честнее, чем
+        # «безопасно», когда вывод держится на одном переводе. Если проверка
+        # ничего не найдёт, так и останется UNKNOWN.
         verdict.raw_labels["flow"]["deposit_pattern"] = deposit
         conc = int(round(deposit["concentration"] * 100))
+        custodial = exch in CUSTODIAL_SERVICE_NAMES
         if deposit["sanctioned"]:
             verdict.risk_flags.append(
                 f"🚨 Депозитный адрес САНКЦИОННОЙ биржи {exch}: {conc}% оттока идёт "
                 f"на {exch}, средства приходят извне ({deposit['in_sources']} источн.) "
                 f"и пересылаются на биржу. Это не личный кошелёк — адрес обслуживает "
                 f"санкционную биржу, средства уходят в санкционную инфраструктуру"
+            )
+        elif probable:
+            # Честно про объём свидетельств: один приход и один свип — это
+            # ровно то, как выглядит одноразовый депозитник, но точно так же
+            # выглядит личный кошелёк, разово отправивший всё на биржу.
+            verdict.risk_flags.append(
+                f"🏦 Похоже на одноразовый депозитный адрес {exch}: получил один "
+                f"перевод и переслал {deposit['forwarded_pct']:.0f}% суммы на {exch}. "
+                f"Так выдаются адреса под разовый депозит; личный кошелёк, разово "
+                f"отправивший всё на биржу, выглядит так же — вывод вероятный"
             )
         else:
             verdict.risk_flags.append(
@@ -731,6 +995,8 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
                 f"и пересылаются на биржу (funnel-паттерн) — инфраструктура биржи, "
                 f"а не личный кошелёк"
             )
+        if custodial:
+            verdict.risk_flags.append(_custodial_note(exch))
         return
 
     # Иначе это ЛИЧНЫЙ кошелёк (у самого адреса нет биржевой метки — иначе он был
@@ -738,6 +1004,8 @@ def _apply_flow(transfers: list[dict[str, Any]], verdict: AddressVerdict) -> Non
     top = links[0]["name"]
     verdict.entity_type = EntityType.WALLET
     verdict.entity = f"Личный кошелёк (связан с {top})"
+    if top in CUSTODIAL_SERVICE_NAMES:
+        verdict.risk_flags.append(_custodial_note(top))
     verdict.risk_flags.append(
         "ℹ️ Личный кошелёк, не биржа: на самом адресе нет биржевой метки, "
         "связь определена по контрагентам переводов"
@@ -1104,7 +1372,7 @@ def _parse_transfers(
         d["volume"] += amt
         d[f"volume_{direction}"] += amt
         if d["exch"] is None:
-            d["exch"] = _normalize_exchange(tag)
+            d["exch"] = _counterparty_service(tag, cp)
     return total, per_cp
 
 
@@ -1136,7 +1404,7 @@ async def _fetch_hop2(
 
     async def _one(cp: str, vol: float) -> dict[str, Any] | None:
         async with sem:
-            sub_transfers = await flow.fetch_transfers(cp, client)
+            sub_transfers = await flow.fetch_transfers(cp, client, pages=HOP2_FLOW_PAGES)
         sub_total, sub_cp = _parse_transfers(cp, sub_transfers, sanctioned)
         if sub_total <= 0:
             return None
@@ -1269,6 +1537,7 @@ def _compute_aml(
     known_service = (
         verdict.entity_type in (EntityType.EXCHANGE, EntityType.CONTRACT)
         and not self_sanctioned_exch
+        and not _is_probable_deposit(verdict)
     )
 
     # ---- Скор 0-100 ----
@@ -1283,6 +1552,14 @@ def _compute_aml(
         score = risky_pct + indirect_pct * HOP2_WEIGHT
         if flags_raised:
             score = max(score, 20.0)
+
+    # Жалобы пользователей в TronScan (feedbackRisk) — сигнал о САМОМ адресе,
+    # а не о его контрагентах, поэтому он задаёт нижнюю границу. Для опознанного
+    # легального сервиса игнорируем: на биржи жалуются постоянно, и репорт там
+    # говорит о споре с поддержкой, а не о природе адреса.
+    if not known_service and (verdict.raw_labels.get("profile") or {}).get("feedback_risk"):
+        score = max(score, FEEDBACK_RISK_SCORE)
+
     verdict.risk_score = int(round(min(100.0, score)))
 
     # ---- Прямое попадание в OFAC ----
@@ -1389,7 +1666,10 @@ async def _apply_cluster(verdict: AddressVerdict) -> None:
         return
     exch = dp["exchange"]
     hot = dp.get("hot_wallet")
-    await cluster.record(verdict.address, exch, hot, bool(dp.get("sanctioned")))
+    await cluster.record(
+        verdict.address, exch, hot, bool(dp.get("sanctioned")),
+        confidence=str(dp.get("confidence") or "high"),
+    )
     info = await cluster.cluster_info(exch, hot, exclude=verdict.address)
     if not info:
         return
@@ -1683,7 +1963,10 @@ async def _check_address(
         token_summary["poisoning_suspects"] = _detect_poisoning(flow_data, verdict)
         _apply_tronscan(ts_data, verdict)
         _apply_goplus(gp_data, verdict)
-        _apply_flow(flow_data, verdict)
+        # Якоря из накопительного кластера: хот-кошельки, выученные на прошлых
+        # проверках. Без них депозитник биржи, у контрагента которого в ответе
+        # не оказалось тега, оставался «личным кошельком».
+        _apply_flow(flow_data, verdict, await _anchor_map(flow_data, address))
         # Блокировка эмитентом бьёт всё остальное, поэтому применяется до
         # решения о туннеле: для FROZEN платные KYT уже ничего не добавят.
         _apply_tether(tether_result, verdict)
@@ -1703,7 +1986,12 @@ async def _check_address(
         if (
             HOP2_ENABLED
             and address not in sanctioned
-            and verdict.entity_type not in (EntityType.EXCHANGE, EntityType.CONTRACT)
+            and (
+                verdict.entity_type not in (EntityType.EXCHANGE, EntityType.CONTRACT)
+                # Для «вероятного» депозитника как раз интересно, кто на него
+                # прислал: вывод держится на одном переводе.
+                or _is_probable_deposit(verdict)
+            )
         ):
             total_h, per_cp_h = _parse_transfers(address, flow_data, sanctioned)
             try:
@@ -1728,7 +2016,7 @@ async def _check_address(
     # Туннель: биржа/контракт → внешние AML не зовём (их скор ничего не говорит о
     # владельце инфраструктуры). Решение принимается по ON-CHAIN типу, до расчёта
     # риска. Скам/санкции туннель НЕ отсекает: там второе мнение ценно.
-    if verdict.entity_type in _AML_SKIP_TYPES:
+    if verdict.entity_type in _AML_SKIP_TYPES and not _is_probable_deposit(verdict):
         reason = (
             "средства заблокированы эмитентом — второе мнение ничего не добавит"
             if verdict.entity_type is EntityType.FROZEN

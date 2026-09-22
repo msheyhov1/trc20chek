@@ -538,7 +538,7 @@ async def test_hop2_indirect_sanction():
     hop2 = [_tr(mid, SANCTIONED_ADDR, 1_000_000_000)]
     transfers_by_addr = {VALID_ADDR: hop1, mid: hop2}
 
-    async def fake_transfers(addr, client):
+    async def fake_transfers(addr, client, pages=None):
         return transfers_by_addr.get(addr, [])
 
     with patch("core.aggregator.tronscan.fetch_account", new=AsyncMock(return_value={})), \

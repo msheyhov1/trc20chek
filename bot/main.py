@@ -342,6 +342,24 @@ def _exposure_line(aml: dict) -> list[str]:
     return lines
 
 
+def _profile_line(v: AddressVerdict) -> str:
+    """Возраст адреса и соотношение приходов/расходов.
+
+    Приходит бесплатно в том же ответе TronScan, что и метки, а отвечает на
+    первый вопрос про незнакомый адрес: он вчера создан или работает годами."""
+    p = (v.raw_labels or {}).get("profile") or {}
+    parts: list[str] = []
+    age = p.get("age_days")
+    if isinstance(age, int | float):
+        parts.append(f"возраст {age:.0f} дн." if age < 400 else f"возраст {age / 365:.1f} г.")
+    tx_in, tx_out = p.get("tx_in"), p.get("tx_out")
+    if isinstance(tx_in, int) and isinstance(tx_out, int):
+        parts.append(f"переводов ↓{tx_in:,} ↑{tx_out:,}".replace(",", " "))
+    if not parts:
+        return ""
+    return f"🗓 <i>{_esc(' · '.join(parts))}</i>"
+
+
 def format_verdict(v: AddressVerdict) -> str:
     emoji = RISK_EMOJI.get(v.risk_level, "⚪")
     lines = [
@@ -353,6 +371,9 @@ def format_verdict(v: AddressVerdict) -> str:
         f"<code>{_esc(v.address)}</code>",
         f"💰 {_fmt_amount(v.balance_usdt)} USDT · {_fmt_amount(v.balance_trx)} TRX",
     ]
+    profile_line = _profile_line(v)
+    if profile_line:
+        lines.append(profile_line)
 
     # Что нашли (флаги провайдеров + пояснения агрегатора)
     if v.risk_flags:
@@ -593,7 +614,12 @@ _LABEL_USAGE = (
     "frozen, labeled, wallet, unknown\n"
     "уровень: safe, caution, dangerous, unknown\n\n"
     "Например:\n"
-    "<code>/label TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t labeled safe наш кошелёк</code>"
+    "<code>/label TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t labeled safe наш кошелёк</code>\n\n"
+    "Метка с типом <code>exchange</code> работает ещё и как разметка СЕРВИСА: "
+    "адрес будет опознаваться не только сам по себе, но и в роли контрагента "
+    "в чужих переводах. Так размечают сервисы, которых нет у TronScan "
+    "(CryptoBot, Telegram Wallet): достаточно одного хот-кошелька — его "
+    "депозитные адреса подтянет анализ переводов."
 )
 
 

@@ -176,29 +176,87 @@ async def test_flow_keeps_first_page_when_later_page_fails(monkeypatch):
 
 # ---------- OFAC ----------
 
+# Реальные адреса из снимка — с тех пор как провайдер фильтрует строки через
+# is_valid_trc20_address, выдуманные «TAddr1» отбрасываются как чужая сеть.
+A1 = "TA3rH2A7iHnm6pKH8gr9cK1EZnShnmZdFg"
+A2 = "TA82wQ77kb9DieW4C8q7C4KwMfnCzfziqN"
+ETH_ADDR = "0x7f367cc41522ce07553e823bf3be79a889debe1b"
+
+
+class AssetClient:
+    """Фид разложен по активам, поэтому фейку нужен не список ответов по
+    порядку, а карта «актив → тело файла»: запросы идут параллельно."""
+
+    def __init__(self, bodies: dict[str, str | Exception]):
+        self.bodies = bodies
+        self.calls: list[str] = []
+
+    async def get(self, url, **kw):
+        asset = url.rsplit("_", 1)[-1].removesuffix(".txt")
+        self.calls.append(asset)
+        item = self.bodies.get(asset, httpx.ConnectError("no file"))
+        if isinstance(item, Exception):
+            raise item
+        return FakeResponse(text=item)
+
+
+def _all_assets(**over: str | Exception) -> dict[str, str | Exception]:
+    bodies: dict[str, str | Exception] = dict.fromkeys(ofac.ASSETS, "")
+    bodies.update(over)
+    return bodies
+
+
 @pytest.fixture(autouse=True)
 def _reset_ofac_cache():
-    ofac._cache.update({"set": None, "ts": 0.0, "source": "none"})
+    ofac._cache.update({"set": None, "ts": 0.0, "source": "none", "assets": ()})
     yield
-    ofac._cache.update({"set": None, "ts": 0.0, "source": "none"})
+    ofac._cache.update({"set": None, "ts": 0.0, "source": "none", "assets": ()})
 
 
 @pytest.mark.asyncio
 async def test_ofac_live_list():
-    client = FakeClient([FakeResponse(text="TAddr1\nTAddr2\n\n# комментарий\n")])
+    client = AssetClient(_all_assets(TRX=f"{A1}\n{A2}\n\n# комментарий\n"))
     addrs = await ofac.fetch_sanctioned_set(client)
-    assert addrs == {"TAddr1", "TAddr2"}
+    assert addrs == {A1, A2}
     assert ofac.last_source() == "live"
 
 
 @pytest.mark.asyncio
+async def test_ofac_unions_addresses_from_all_asset_files():
+    """Фид разложен по активам, а не по сетям: 80 санкционных TRON-адресов
+    лежали в файлах USDT и XBT и при чтении одного TRX были невидимы."""
+    client = AssetClient(_all_assets(TRX=f"{A1}\n", USDT=f"{A2}\n"))
+    addrs = await ofac.fetch_sanctioned_set(client)
+    assert addrs == {A1, A2}
+    assert set(client.calls) == set(ofac.ASSETS)
+
+
+@pytest.mark.asyncio
+async def test_ofac_ignores_addresses_of_other_networks():
+    """В файлах по активам лежат адреса всех сетей — чужие не должны попасть
+    в множество «санкционных TRON»."""
+    client = AssetClient(_all_assets(TRX=f"{A1}\n", USDT=f"{ETH_ADDR}\nbc1qxyz\n"))
+    assert await ofac.fetch_sanctioned_set(client) == {A1}
+
+
+@pytest.mark.asyncio
+async def test_ofac_partial_download_is_not_live():
+    """Недокачанный файл — это молча пропавшие сотни адресов. Устаревший
+    снимок честнее неполного живого списка."""
+    client = AssetClient(_all_assets(TRX=f"{A1}\n", USDT=httpx.ConnectError("down")))
+    addrs = await ofac.fetch_sanctioned_set(client)
+    assert ofac.last_source() == "bundled"
+    assert len(addrs) > 300
+
+
+@pytest.mark.asyncio
 async def test_ofac_uses_memory_cache_on_failure():
-    ok = FakeClient([FakeResponse(text="TAddr1\n")])
+    ok = AssetClient(_all_assets(TRX=f"{A1}\n"))
     await ofac.fetch_sanctioned_set(ok)
     ofac._cache["ts"] = 0.0          # протухло — пойдёт в сеть и упадёт
-    broken = FakeClient([httpx.ConnectError("no github")])
+    broken = AssetClient({})
     addrs = await ofac.fetch_sanctioned_set(broken)
-    assert addrs == {"TAddr1"}
+    assert addrs == {A1}
     assert ofac.last_source() == "cache"
 
 
@@ -206,18 +264,16 @@ async def test_ofac_uses_memory_cache_on_failure():
 async def test_ofac_falls_back_to_bundled_snapshot():
     """GitHub недоступен на холодном старте — проверка санкций не должна
     молча выключаться: берём вшитый снимок."""
-    client = FakeClient([httpx.ConnectError("no github")])
-    addrs = await ofac.fetch_sanctioned_set(client)
-    assert len(addrs) > 200
+    addrs = await ofac.fetch_sanctioned_set(AssetClient({}))
+    assert len(addrs) > 300
     assert ofac.last_source() == "bundled"
 
 
 @pytest.mark.asyncio
 async def test_ofac_raises_only_when_nothing_available(monkeypatch, tmp_path):
     monkeypatch.setattr(ofac, "BUNDLED_PATH", tmp_path / "missing.txt")
-    client = FakeClient([httpx.ConnectError("no github")])
     with pytest.raises(ProviderError):
-        await ofac.fetch_sanctioned_set(client)
+        await ofac.fetch_sanctioned_set(AssetClient({}))
     assert ofac.last_source() == "none"
 
 
@@ -226,4 +282,19 @@ def test_bundled_snapshot_is_shipped_inside_package():
     Dockerfile копирует только core/api/bot/web."""
     assert ofac.BUNDLED_PATH.exists()
     assert "core" in ofac.BUNDLED_PATH.parts
-    assert len(ofac._bundled()) > 200
+    # 334 на 22.09.2026; порог отражает объединение файлов, а не один TRX (254)
+    assert len(ofac._bundled()) > 300
+
+
+def test_bundled_snapshot_has_only_valid_tron_addresses():
+    """Снимок пересобирается объединением файлов по активам — в нём легко
+    оставить адрес чужой сети, и тогда он никогда ни с чем не совпадёт."""
+    from core.models import is_valid_trc20_address
+    assert all(is_valid_trc20_address(a) for a in ofac._bundled())
+
+
+def test_ofac_assets_are_configurable(monkeypatch):
+    monkeypatch.setenv("OFAC_ASSETS", "TRX, USDT ;usdd")
+    assert ofac._assets() == ("TRX", "USDT", "USDD")
+    monkeypatch.setenv("OFAC_ASSETS", "")
+    assert "TRX" in ofac._assets() and "USDT" in ofac._assets()
