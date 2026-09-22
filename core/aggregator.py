@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import time
@@ -1803,7 +1804,13 @@ def _compute_aml(
         score = risky_pct + indirect_pct * HOP2_WEIGHT
         parts = []
         if risky_pct:
-            parts.append(f"{_pct_str(risky_pct)}% объёма — санкционные адреса и биржи")
+            what = (
+                "санкционные адреса и биржи"
+                if vol["sanctions"] and vol["sanctioned_exchange"]
+                else "санкционные адреса" if vol["sanctions"]
+                else "санкционные биржи"
+            )
+            parts.append(f"{_pct_str(risky_pct)}% объёма — {what}")
         if indirect_pct:
             parts.append(f"косвенно {_pct_str(indirect_pct)}% × {HOP2_WEIGHT:g}")
         reason = " + ".join(parts)
@@ -2175,10 +2182,19 @@ def inflight_count() -> int:
 
 
 async def check_address(
-    address: str, use_cache: bool = True, source: str = "api"
+    address: str,
+    use_cache: bool = True,
+    source: str = "api",
+    on_preliminary=None,
 ) -> AddressVerdict:
     """Главная точка входа. Дедуплицирует одновременные проверки одного адреса
-    и ограничивает проверку общим бюджетом времени."""
+    и ограничивает проверку общим бюджетом времени.
+
+    `on_preliminary(verdict)` — необязательный колбэк: получает предварительный
+    вердикт по данным блокчейна до того, как запрошены платные KYT. Бот
+    показывает его сразу, а итоговый — правкой того же сообщения. Колбэк
+    получает только проверка, которая реально выполняется: ждущий её дубль
+    сразу получит итог."""
     if not is_valid_trc20_address(address):
         return AddressVerdict(
             address=address,
@@ -2195,7 +2211,9 @@ async def check_address(
         # shield: отмена ожидающего не должна ронять проверку, которую ждут другие.
         return await asyncio.shield(running)
 
-    task = asyncio.create_task(_check_address_guarded(address, use_cache, source))
+    task = asyncio.create_task(
+        _check_address_guarded(address, use_cache, source, on_preliminary)
+    )
     _inflight[key] = task
     try:
         return await asyncio.shield(task)
@@ -2205,14 +2223,14 @@ async def check_address(
 
 
 async def _check_address_guarded(
-    address: str, use_cache: bool, source: str
+    address: str, use_cache: bool, source: str, on_preliminary=None
 ) -> AddressVerdict:
     """Проверка под общим дедлайном."""
     if CHECK_BUDGET_SECONDS <= 0:
-        return await _check_address(address, use_cache, source)
+        return await _check_address(address, use_cache, source, on_preliminary)
     try:
         async with asyncio.timeout(CHECK_BUDGET_SECONDS):
-            return await _check_address(address, use_cache, source)
+            return await _check_address(address, use_cache, source, on_preliminary)
     except TimeoutError:
         log.warning(
             "Проверка %s не уложилась в бюджет %g с — отдаём частичный результат",
@@ -2298,6 +2316,32 @@ def _order_flags(verdict: AddressVerdict) -> None:
     verdict.risk_flags.sort(key=flag_rank)
 
 
+PRELIMINARY_FLAG = (
+    "⏳ Предварительный вердикт по данным блокчейна: платные AML-сервисы ещё "
+    "считаются, итог придёт следующим обновлением"
+)
+
+
+async def _send_preliminary(prog: _Progress, callback) -> None:
+    """Отдать вердикт по уже собранным on-chain данным.
+
+    Считается на КОПИИ: у итогового вердикта расчёт риска должен выполниться
+    ровно один раз и уже с учётом KYT. Сбой колбэка (например, Telegram не
+    принял правку) проверку не останавливает."""
+    try:
+        pre = copy.deepcopy(prog.verdict)
+        pre_prog = _Progress(pre, prog.transfers, prog.sanctioned,
+                             copy.deepcopy(prog.tokens), prog.hop2)
+        _finalize_risk(pre, pre_prog)
+        pre.risk_flags.insert(0, PRELIMINARY_FLAG)
+        _order_flags(pre)
+        pre.checked_at = datetime.now(UTC).isoformat(timespec="seconds")
+        pre.ruleset_version = RULESET_VERSION
+        await callback(pre)
+    except Exception:
+        log.exception("Предварительный вердикт для %s не отправлен", prog.verdict.address)
+
+
 def _finish_partial(address: str, prog: _Progress | None) -> AddressVerdict:
     """Вердикт из того, что успели собрать до дедлайна."""
     if prog is None:
@@ -2325,7 +2369,7 @@ def _finish_partial(address: str, prog: _Progress | None) -> AddressVerdict:
 
 
 async def _check_address(
-    address: str, use_cache: bool, source: str
+    address: str, use_cache: bool, source: str, on_preliminary=None
 ) -> AddressVerdict:
     """Собственно проверка.
 
@@ -2466,6 +2510,12 @@ async def _check_address(
         verdict.provider_status["swapster"] = "skipped"
         verdict.provider_status["bitok"] = "skipped"
     else:
+        # On-chain часть готова за секунды, а платные KYT считаются десятки
+        # секунд. Показываем её сразу, а не держим пользователя до конца.
+        if on_preliminary is not None and (
+            aml_external.is_configured() or aml_bitok.is_configured()
+        ):
+            await _send_preliminary(prog, on_preliminary)
         # Каждый сервис пишет результат в вердикт, как только ответил. Раньше
         # gather отдавал оба разом, и при обрыве по дедлайну терялся и тот,
         # что успел: Swapster готов за секунды, а ждали медленный Bitok.

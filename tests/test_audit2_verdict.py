@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -312,7 +312,7 @@ async def test_score_reason_for_exposure_and_hop2():
     v = await _check(A, **{"core.aggregator.flow.fetch_transfers":
                            AsyncMock(return_value=transfers)})
     assert v.risk_score == 20
-    assert "20% объёма — санкционные адреса и биржи" in v.aml["score_reason"]
+    assert v.aml["score_reason"] == "20% объёма — санкционные адреса"
 
 
 async def test_score_reason_when_kyt_raised_the_score():
@@ -417,3 +417,106 @@ async def test_kyt_cache_can_be_disabled(monkeypatch):
     await _check(A, **{"core.aggregator.aml_bitok.check": paid})
     await _check(A, **{"core.aggregator.aml_bitok.check": paid})
     assert paid.await_count == 2
+
+
+# ---------- улучшения: вердикт в два шага ----------
+
+@pytest.fixture
+def kyt_configured(monkeypatch):
+    monkeypatch.setattr(agg.aml_external, "is_configured", lambda: True)
+
+
+async def test_preliminary_verdict_arrives_before_paid_kyt(kyt_configured):
+    """OFAC, блэклист и экспозиция готовы за секунды, а KYT считаются десятки
+    секунд: пользователь видел «⏳ Проверяю адрес…» всё это время."""
+    seen: list[AddressVerdict] = []
+    order: list[str] = []
+
+    async def on_pre(v):
+        order.append("preliminary")
+        seen.append(v)
+
+    async def slow_kyt(addr):
+        order.append("kyt")
+        return dict(NO_AML)
+
+    ctx = [patch(k, new=v) for k, v in _patches(**{
+        "core.aggregator.aml_bitok.check": slow_kyt}).items()]
+    for c in ctx:
+        c.start()
+    try:
+        final = await agg.check_address(OFAC, use_cache=False, on_preliminary=on_pre)
+    finally:
+        for c in ctx:
+            c.stop()
+    assert order[0] == "preliminary"
+    pre = seen[0]
+    assert pre.entity_type is EntityType.SANCTIONED and pre.risk_score == 100
+    assert pre.risk_flags[0] == agg.PRELIMINARY_FLAG or agg.PRELIMINARY_FLAG in pre.risk_flags
+    # итог — отдельный объект, без пометки «предварительный» и без дублей
+    assert agg.PRELIMINARY_FLAG not in final.risk_flags
+    assert sum("санкционном списке OFAC" in f for f in final.risk_flags) == 1
+
+
+async def test_no_preliminary_when_kyt_is_skipped(kyt_configured):
+    """Биржа идёт через туннель: итог готов сразу, промежуточный не нужен."""
+    on_pre = AsyncMock()
+    ctx = [patch(k, new=v) for k, v in _patches(**{
+        "core.aggregator.tronscan.fetch_account":
+            AsyncMock(return_value={"address": A, "publicTag": "Binance-Hot 4"})}).items()]
+    for c in ctx:
+        c.start()
+    try:
+        await agg.check_address(A, use_cache=False, on_preliminary=on_pre)
+    finally:
+        for c in ctx:
+            c.stop()
+    on_pre.assert_not_awaited()
+
+
+async def test_no_preliminary_without_configured_kyt():
+    on_pre = AsyncMock()
+    ctx = [patch(k, new=v) for k, v in _patches().items()]
+    for c in ctx:
+        c.start()
+    try:
+        await agg.check_address(A, use_cache=False, on_preliminary=on_pre)
+    finally:
+        for c in ctx:
+            c.stop()
+    on_pre.assert_not_awaited()
+
+
+async def test_failing_preliminary_callback_does_not_break_the_check(kyt_configured):
+    on_pre = AsyncMock(side_effect=RuntimeError("Telegram не принял правку"))
+    ctx = [patch(k, new=v) for k, v in _patches().items()]
+    for c in ctx:
+        c.start()
+    try:
+        v = await agg.check_address(OFAC, use_cache=False, on_preliminary=on_pre)
+    finally:
+        for c in ctx:
+            c.stop()
+    on_pre.assert_awaited_once()
+    assert v.entity_type is EntityType.SANCTIONED
+
+
+async def test_bot_edits_progress_message_twice(kyt_configured, monkeypatch):
+    """Бот: сначала предварительный вердикт, затем итог — в одном сообщении."""
+    import bot.main as bm
+    progress = MagicMock(edit_text=AsyncMock())
+    message = MagicMock(from_user=MagicMock(id=1),
+                        answer=AsyncMock(return_value=progress))
+    monkeypatch.setattr(bm.history, "record_view", AsyncMock())
+    ctx = [patch(k, new=v) for k, v in _patches().items()]
+    for c in ctx:
+        c.start()
+    try:
+        await bm._check_one(message, OFAC)
+    finally:
+        for c in ctx:
+            c.stop()
+    texts = [c.args[0] for c in progress.edit_text.await_args_list]
+    assert len(texts) == 2
+    assert "Предварительный вердикт" in texts[0]
+    assert "Предварительный вердикт" not in texts[1]

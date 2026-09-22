@@ -865,12 +865,32 @@ def _fit_message(text: str) -> str:
     return head + note
 
 
-async def _check_and_render(addr: str, user_id: int | None = None) -> str:
+async def _check_and_render(
+    addr: str, user_id: int | None = None, progress: Message | None = None
+) -> str:
     """Свежая проверка (без кеша — для AML важна актуальность транзакций).
+
+    Если передано сообщение-прогресс, в него сразу попадает предварительный
+    вердикт по данным блокчейна: OFAC, блэклист, метки и экспозиция готовы за
+    секунды, а платные KYT считаются десятки секунд. Раньше пользователь всё
+    это время смотрел на «⏳ Проверяю адрес…».
 
     Просмотр пишется в личную историю пользователя: общий журнал хранит все
     проверки сервиса, а /history каждому показывает только его собственные."""
-    v = await check_address(addr, use_cache=False, source="bot")
+    async def show_preliminary(pre: AddressVerdict) -> None:
+        if progress is None:
+            return
+        try:
+            await progress.edit_text(
+                _fit_message(format_verdict(pre)), parse_mode=ParseMode.HTML
+            )
+        except TelegramBadRequest:
+            pass  # не критично: итог всё равно придёт
+
+    v = await check_address(
+        addr, use_cache=False, source="bot",
+        on_preliminary=show_preliminary if progress is not None else None,
+    )
     if user_id is not None:
         await history.record_view(user_id, v)
     return _fit_message(format_verdict(v))
@@ -886,7 +906,7 @@ async def _check_one(message: Message, addr: str, counter: str = "") -> None:
         PROGRESS_TEXT.format(addr=addr, counter=counter), parse_mode=ParseMode.HTML
     )
     try:
-        text = await _check_and_render(addr, _user_id(message))
+        text = await _check_and_render(addr, _user_id(message), progress)
     except Exception as e:
         log.exception("check failed for %s", addr)
         await progress.edit_text(
@@ -967,7 +987,7 @@ async def on_recheck(callback: CallbackQuery):
     except TelegramBadRequest:
         pass  # сообщение не редактируется (слишком старое) — просто ждём результат
     try:
-        text = await _check_and_render(addr, _user_id(callback))
+        text = await _check_and_render(addr, _user_id(callback), msg)
     except Exception as e:
         log.exception("recheck failed for %s", addr)
         text = f"⚠️ Не удалось перепроверить <code>{_esc(addr)}</code>: {_esc(e)}"
