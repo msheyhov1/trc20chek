@@ -570,7 +570,19 @@ def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> Non
 
       date_created                    — когда адрес активирован (мс)
       feedbackRisk                    — TronScan получал жалобы на адрес
-      transactions_in/transactions_out — чистый получатель или отправитель
+      transactions_in/transactions_out — сколько ТРАНЗАКЦИЙ пришло и ушло
+
+    Про счётчики транзакций. Это именно транзакции, а не TRC20-переводы, и
+    между собой они не сходятся: в примере официальной документации
+    `totalTransactionCount` 8, `transactions` 7, а in+out = 4+2 = 6. Поэтому
+    показываем их как есть, «транзакций», и не выдаём сумму in+out за полную
+    картину активности адреса.
+
+    Вывод «средства ни разу не уходили» по одному счётчику делать нельзя:
+    неизвестно, попадают ли в него TRC20-переводы, а если нет, то адрес,
+    гонявший один USDT, покажет out = 0. Поэтому такой флаг ставится только
+    при СОГЛАСИИ двух источников: счётчик TronScan равен нулю И в разобранной
+    истории переводов нет ни одного исходящего.
 
     Функция только собирает данные и объясняющие флаги; решение о риске
     принимает _compute_aml (единственный расчёт)."""
@@ -598,10 +610,18 @@ def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> Non
         profile["tx_in"] = tx_in
     if isinstance(tx_out, int):
         profile["tx_out"] = tx_out
-    if isinstance(tx_in, int) and isinstance(tx_out, int) and tx_in >= 5 and tx_out == 0:
+    # Второй источник: направления, которые мы разобрали сами по TRC20-переводам.
+    seen = verdict.raw_labels.get("trc20_seen") or {}
+    seen_out = seen.get("out")
+    if (
+        isinstance(tx_in, int) and isinstance(tx_out, int)
+        and tx_in >= 5 and tx_out == 0
+        and seen_out == 0          # история переводов подтверждает, а не просто молчит
+    ):
         verdict.risk_flags.append(
-            f"📥 Только приём: {tx_in} входящих переводов и ни одного исходящего — "
-            f"средства с адреса ещё ни разу не уходили"
+            f"📥 Только приём: {tx_in} входящих транзакций и ни одной исходящей, "
+            f"в истории переводов исходящих тоже нет — средства с адреса ещё "
+            f"ни разу не уходили"
         )
 
     if data.get("feedbackRisk"):
@@ -612,6 +632,22 @@ def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> Non
 
     if profile:
         verdict.raw_labels["profile"] = profile
+
+
+def _seen_directions(transfers: list[dict[str, Any]], addr: str) -> dict[str, int]:
+    """Сколько TRC20-переводов адреса мы РЕАЛЬНО разобрали в каждую сторону.
+
+    Нужно как второй источник к счётчикам TronScan: их семантика по документации
+    не сходится (см. `_apply_account_profile`), и утверждение «с адреса ничего
+    не уходило» по одному счётчику было бы догадкой. Здесь — не догадка, а то,
+    что видно в разобранной истории, пусть и в пределах окна."""
+    inc = out = 0
+    for t in transfers:
+        if addr == t.get("from_address"):
+            out += 1
+        elif addr == t.get("to_address"):
+            inc += 1
+    return {"in": inc, "out": out}
 
 
 def _custodial_note(name: str) -> str:
@@ -1961,6 +1997,9 @@ async def _check_address(
         token_summary = _apply_token_hygiene(flow_data, verdict)
         token_summary.update(_apply_transfer_signals(flow_data, flow_meta, verdict))
         token_summary["poisoning_suspects"] = _detect_poisoning(flow_data, verdict)
+        # Свои направления по переводам — до _apply_tronscan: профиль адреса
+        # сверяет с ними счётчики транзакций TronScan.
+        verdict.raw_labels["trc20_seen"] = _seen_directions(flow_data, address)
         _apply_tronscan(ts_data, verdict)
         _apply_goplus(gp_data, verdict)
         # Якоря из накопительного кластера: хот-кошельки, выученные на прошлых

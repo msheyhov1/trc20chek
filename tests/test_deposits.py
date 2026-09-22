@@ -400,3 +400,46 @@ async def test_cluster_db_from_older_version_is_migrated(tmp_path, monkeypatch):
     info = await cluster.cluster_info("Bybit", HOT, exclude=A)
     # старая запись получает confidence='high' по DEFAULT и остаётся в счёте
     assert info["siblings_on_anchor"] == 2
+
+
+# ---------- направления переводов ----------
+
+def test_exchange_links_directions():
+    """«Депозиты» — адрес ОТПРАВИЛ на биржу, «выводы» — ПОЛУЧИЛ с неё.
+    Перепутать их означает поменять местами «заводил» и «выводил»."""
+    v = AddressVerdict(address=A)
+    agg._apply_flow([
+        _tr("Tbnc", A, 600_000_000, from_tag="Binance-Hot 4"),   # получил с Binance
+        _tr(A, "Tbyb", 1_000_000_000, to_tag="Bybit Hot 3"),     # отправил на Bybit
+    ], v)
+    links = {e["name"]: e for e in v.exchange_links}
+    assert (links["Binance"]["deposits"], links["Binance"]["withdrawals"]) == (0, 1)
+    assert (links["Bybit"]["deposits"], links["Bybit"]["withdrawals"]) == (1, 0)
+
+
+def test_sanctions_exposure_direction_split():
+    """Получить от санкционного адреса и отправить на него — разные обвинения,
+    и в отчёте они идут раздельно (↓получено ↑отправлено)."""
+    sanctioned = "TBADaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    transfers = [
+        _tr(sanctioned, A, 100_000_000),        # получил 100
+        _tr(A, sanctioned, 300_000_000),        # отправил 300
+        _tr(A, "Tbyb", 1_600_000_000, to_tag="Bybit Hot 3"),
+    ]
+    v = AddressVerdict(address=A)
+    agg._compute_aml(v, transfers, {sanctioned})
+    assert v.aml["sanctions_exposure_pct"] == 20.0      # 400 из 2000
+    assert v.aml["sanctions_received_pct"] == 5.0       # 100 из 2000
+    assert v.aml["sanctions_sent_pct"] == 15.0          # 300 из 2000
+    assert v.aml["exchange_exposure_pct"] == 80.0
+
+
+def test_counterparty_volume_split_by_direction():
+    sanctioned = "TBADaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    total, per_cp = agg._parse_transfers(A, [
+        _tr(sanctioned, A, 100_000_000),
+        _tr(A, sanctioned, 300_000_000),
+    ], {sanctioned})
+    d = per_cp[sanctioned]
+    assert (d["volume_in"], d["volume_out"], d["volume"]) == (100.0, 300.0, 400.0)
+    assert total == 400.0
