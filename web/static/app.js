@@ -219,6 +219,23 @@ function render(verdict) {
     return `<div class="flag">${escapeHtml(e.name)}${mark}: ${escapeHtml(parts.join(", "))}</div>`;
   }).join("");
 
+  // Профиль адреса: приходит бесплатно в ответе TronScan вместе с метками и
+  // отвечает на первый вопрос про незнакомый адрес — он вчера создан или
+  // работает годами.
+  const profile = (verdict.raw_labels || {}).profile || {};
+  const profileParts = [];
+  if (typeof profile.age_days === "number") {
+    profileParts.push(profile.age_days < 400
+      ? `возраст ${Math.round(profile.age_days)} дн.`
+      : `возраст ${(profile.age_days / 365).toFixed(1)} г.`);
+  }
+  if (typeof profile.tx_in === "number" && typeof profile.tx_out === "number") {
+    profileParts.push(`переводов ↓${profile.tx_in} ↑${profile.tx_out}`);
+  }
+  const profileBlock = profileParts.length
+    ? `<div class="meta">${escapeHtml(profileParts.join(" · "))}</div>`
+    : "";
+
   const cluster = (verdict.raw_labels || {}).cluster || {};
   const clusterBlock = (cluster.siblings_on_anchor || cluster.known_deposits_exchange)
     ? section(`Кластер ${escapeHtml(cluster.exchange || "")}`,
@@ -250,6 +267,7 @@ function render(verdict) {
     <div class="meta">Тип: ${escapeHtml(typeRu(verdict))}</div>
     <div class="address-mono">${escapeHtml(verdict.address)}</div>
     <div class="meta">Баланс: ${fmtAmount(verdict.balance_usdt)} USDT · ${fmtAmount(verdict.balance_trx)} TRX</div>
+    ${profileBlock}
     ${section("Что нашли", flags)}
     ${section("Связи с биржами", links)}
     ${exposureBlock(verdict.aml)}

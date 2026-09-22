@@ -451,6 +451,67 @@ def _normalize_exchange(tag: str | None) -> str | None:
     return None
 
 
+# Возраст адреса: моложе этого — «свежий». Не риск сам по себе (адреса создают
+# каждый день), но в паре с крупным приходом это другой профиль: у долгоживущего
+# кошелька есть история, у вчерашнего её нет и проверять нечего.
+NEW_ADDRESS_DAYS = int(os.getenv("NEW_ADDRESS_DAYS", "30"))
+# Жалобы пользователей в TronScan — сигнал слабее скам-тега (репорт может быть и
+# ошибочным), поэтому не «опасно», а нижняя граница «осторожно».
+FEEDBACK_RISK_SCORE = float(os.getenv("FEEDBACK_RISK_SCORE", "30"))
+
+
+def _apply_account_profile(data: dict[str, Any], verdict: AddressVerdict) -> None:
+    """Поля ответа /api/account, которые раньше отбрасывались.
+
+    Всё это уже приходит в том же ответе, что и метки: дополнительных запросов
+    не делается, а бюджет проверки (~20 внешних запросов на 90 с) не трогается.
+
+      date_created                    — когда адрес активирован (мс)
+      feedbackRisk                    — TronScan получал жалобы на адрес
+      transactions_in/transactions_out — чистый получатель или отправитель
+
+    Функция только собирает данные и объясняющие флаги; решение о риске
+    принимает _compute_aml (единственный расчёт)."""
+    profile: dict[str, Any] = {}
+
+    created = data.get("date_created")
+    if isinstance(created, int | float) and created > 0:
+        # TronScan отдаёт миллисекунды. Секунды тоже встречаются в зеркалах API,
+        # поэтому различаем по порядку величины, а не по вере в документацию.
+        seconds = created / 1000 if created > 1e11 else float(created)
+        age_days = max(0.0, (datetime.now(UTC).timestamp() - seconds) / 86400)
+        profile["created_at"] = datetime.fromtimestamp(seconds, UTC).isoformat(
+            timespec="seconds"
+        )
+        profile["age_days"] = round(age_days, 1)
+        if age_days < NEW_ADDRESS_DAYS:
+            verdict.risk_flags.append(
+                f"🆕 Адрес создан {age_days:.0f} дн. назад — истории, по которой "
+                f"его можно оценить, почти нет"
+            )
+
+    tx_in = data.get("transactions_in")
+    tx_out = data.get("transactions_out")
+    if isinstance(tx_in, int):
+        profile["tx_in"] = tx_in
+    if isinstance(tx_out, int):
+        profile["tx_out"] = tx_out
+    if isinstance(tx_in, int) and isinstance(tx_out, int) and tx_in >= 5 and tx_out == 0:
+        verdict.risk_flags.append(
+            f"📥 Только приём: {tx_in} входящих переводов и ни одного исходящего — "
+            f"средства с адреса ещё ни разу не уходили"
+        )
+
+    if data.get("feedbackRisk"):
+        profile["feedback_risk"] = True
+        verdict.risk_flags.append(
+            "⚠️ TronScan: на адрес поступали жалобы пользователей (feedbackRisk)"
+        )
+
+    if profile:
+        verdict.raw_labels["profile"] = profile
+
+
 def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
     tags = {
         "publicTag": data.get("publicTag", ""),
@@ -470,6 +531,11 @@ def _apply_tronscan(data: dict[str, Any], verdict: AddressVerdict) -> None:
     activity = data.get("totalTransactionCount") or data.get("transactions")
     if isinstance(activity, int):
         verdict.raw_labels["activity_tx"] = activity
+
+    # Профиль адреса из того же ответа — ни одного лишнего запроса.
+    # Ставится ДО ветвлений: ниже каждая ветка делает return, и для биржи,
+    # контракта или скама профиль бы не собрался.
+    _apply_account_profile(data, verdict)
 
     # 1. Красный тег = скам/опасный
     if data.get("redTag"):
@@ -1283,6 +1349,14 @@ def _compute_aml(
         score = risky_pct + indirect_pct * HOP2_WEIGHT
         if flags_raised:
             score = max(score, 20.0)
+
+    # Жалобы пользователей в TronScan (feedbackRisk) — сигнал о САМОМ адресе,
+    # а не о его контрагентах, поэтому он задаёт нижнюю границу. Для опознанного
+    # легального сервиса игнорируем: на биржи жалуются постоянно, и репорт там
+    # говорит о споре с поддержкой, а не о природе адреса.
+    if not known_service and (verdict.raw_labels.get("profile") or {}).get("feedback_risk"):
+        score = max(score, FEEDBACK_RISK_SCORE)
+
     verdict.risk_score = int(round(min(100.0, score)))
 
     # ---- Прямое попадание в OFAC ----
