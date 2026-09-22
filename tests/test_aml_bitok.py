@@ -1,4 +1,6 @@
 """Тесты интеграции Bitok KYT (core/aml_bitok) — без реальных сетевых вызовов."""
+import asyncio
+
 import pytest
 
 from core import aml_bitok as bk
@@ -199,3 +201,76 @@ async def test_check_service_error_status(configured):
     res = await bk.check("T" + "z" * 33)
     assert res["available"] is False
     assert "ошибкой" in res["reason"]
+
+
+# ---------- настенный бюджет проверки ----------
+
+class SlowClient(FakeClient):
+    """Как FakeClient, но выбранные пути отвечают с задержкой."""
+
+    slow: dict = {}
+
+    async def request(self, method, url, **kw):
+        path = url.split(".org", 1)[-1]
+        delay = SlowClient.slow.get((method, path), 0)
+        if delay:
+            await asyncio.sleep(delay)
+        return await super().request(method, url, **kw)
+
+
+@pytest.fixture
+def slow(monkeypatch):
+    monkeypatch.setenv("BITOK_API_KEY_ID", "key-1")
+    monkeypatch.setenv("BITOK_API_SECRET", "secret")
+    monkeypatch.setenv("BITOK_TIMEOUT_SECONDS", "0.3")
+    monkeypatch.setattr(bk, "POLL_DELAY", 0.01)
+    monkeypatch.setattr(bk.httpx, "AsyncClient", SlowClient)
+    FakeClient.calls, SlowClient.slow = [], {}
+    yield
+
+
+@pytest.mark.asyncio
+async def test_budget_is_wall_clock_while_polling(slow):
+    """Раньше бюджет проверялся только между запросами, а сам запрос мог
+    идти до 15 с — замер показал 8 с при бюджете 6. Этого хватало, чтобы вся
+    проверка вылетала за CHECK_BUDGET_SECONDS, и санкционный адрес выдавался
+    как «нет данных»."""
+    import time
+    FakeClient.routes = {
+        ("POST", "/v1/manual-checks/check-address/"):
+            FakeResp({"id": "a", "check_status": "checking"}),
+        ("GET", "/v1/manual-checks/a/"): FakeResp({"id": "a", "check_status": "checking"}),
+    }
+    SlowClient.slow = {("GET", "/v1/manual-checks/a/"): 5}
+    t0 = time.monotonic()
+    res = await bk.check("T" + "q" * 33)
+    assert time.monotonic() - t0 < 1.0
+    assert res["available"] is True and res["pending"] is True   # «ещё считается», не «чисто»
+
+
+@pytest.mark.asyncio
+async def test_budget_keeps_score_when_entity_lookup_is_slow(slow):
+    """Скор уже получен, а сущность не успела — отдаём скор без имени."""
+    FakeClient.routes = {
+        ("POST", "/v1/manual-checks/check-address/"):
+            FakeResp({"id": "b", "check_status": "checked",
+                      "risk_level": "high", "risk_score": 0.9}),
+        ("GET", "/v1/manual-checks/b/address-exposure/"): FakeResp({"entity_name": "X"}),
+        ("GET", "/v1/manual-checks/b/risks/"): FakeResp([]),
+    }
+    SlowClient.slow = {("GET", "/v1/manual-checks/b/address-exposure/"): 5}
+    res = await bk.check("T" + "q" * 33)
+    assert res["available"] is True and res["pending"] is False
+    assert res["risk_level"] == "dangerous" and res["risk_score"] == 90.0
+    assert res["entity"] is None
+
+
+@pytest.mark.asyncio
+async def test_budget_before_any_answer_is_unavailable(slow):
+    FakeClient.routes = {
+        ("POST", "/v1/manual-checks/check-address/"): FakeResp({"id": "c"}),
+    }
+    SlowClient.slow = {("POST", "/v1/manual-checks/check-address/"): 5}
+    res = await bk.check("T" + "q" * 33)
+    assert res["available"] is False
+    assert "бюджет" in res["reason"]

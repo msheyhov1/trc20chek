@@ -22,6 +22,7 @@ from aiogram.types import (
 
 from core import check_address, history, labels, watchlist
 from core.addresses import extract_addresses, looks_like_address_attempt
+from core.aggregator import flag_rank
 from core.models import AddressVerdict, EntityType, RiskLevel, is_valid_trc20_address
 
 logging.basicConfig(level=logging.INFO)
@@ -384,10 +385,15 @@ def format_verdict(v: AddressVerdict) -> str:
     if v.risk_flags:
         lines.append("")
         lines.append("<b>⚠️ Что нашли</b>")
-        for flag in v.risk_flags[:8]:
+        # Флаги приходят отсортированными по важности. Показываем восемь, но
+        # решающие (санкции, блокировка, «опасно») — всегда все: обрезать
+        # можно справку, а не причину вердикта.
+        decisive = sum(1 for f in v.risk_flags if flag_rank(str(f)) <= 1)
+        shown = max(8, decisive)
+        for flag in v.risk_flags[:shown]:
             lines.append(f"• {_esc(_flag_ru(str(flag)))}")
-        if len(v.risk_flags) > 8:
-            lines.append(f"<i>…и ещё {len(v.risk_flags) - 8}</i>")
+        if len(v.risk_flags) > shown:
+            lines.append(f"<i>…и ещё {len(v.risk_flags) - shown}</i>")
 
     # Связи с биржами (по контрагентам переводов)
     if v.exchange_links:

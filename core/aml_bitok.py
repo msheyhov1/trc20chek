@@ -212,71 +212,81 @@ async def check(address: str) -> dict[str, Any]:
         return {"available": False, "provider": PROVIDER,
                 "reason": "Bitok не настроен (BITOK_API_KEY_ID / BITOK_API_SECRET пусты)"}
 
-    # BITOK_TIMEOUT_SECONDS — НАСТЕННЫЙ бюджет всей проверки, как и обещает
-    # .env.example. Раньше значение уходило только в таймаут httpx и умножалось на
-    # число попыток поллинга: на дефолтах худший случай был ~940 с, и бот всё это
-    # время держал пользователя. Теперь считаем дедлайн от одной точки старта, а
-    # на отдельный запрос даём меньшую долю бюджета.
-    deadline = time.monotonic() + cfg["timeout"]
+    # BITOK_TIMEOUT_SECONDS — НАСТЕННЫЙ бюджет всей проверки. Его держит
+    # asyncio.timeout вокруг всего флоу, как у Swapster.
+    #
+    # Раньше бюджет проверялся только между шагами: «осталось больше 3 с —
+    # делаем ещё запрос», а сам запрос мог идти до 15 с, и после поллинга шли
+    # ещё два запроса за сущностью и рисками. Замер: бюджет 6 с, проверка 8 с;
+    # на дефолтах перерасход доходил до десятков секунд. Этого хватало, чтобы
+    # проверка целиком не укладывалась в CHECK_BUDGET_SECONDS, — и тогда
+    # санкционный адрес выдавался как «нет данных».
     request_timeout = max(5.0, min(cfg["timeout"], 15.0))
-
-    def _left() -> float:
-        return deadline - time.monotonic()
+    # Всё, что успели узнать, сохраняется при обрыве по бюджету: готовый скор
+    # полезнее, чем «не успели», даже если имя сущности подтянуть не удалось.
+    check_data: dict[str, Any] | None = None
+    entity = entity_category = None
+    risks: list[dict[str, Any]] = []
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout) as client:
-            check_data = await _request(
-                client, cfg, "POST", "/v1/manual-checks/check-address/",
-                {"network": cfg["network"], "address": address},
-            )
-            check_id = check_data.get("id")
-            if not check_id:
-                return {"available": False, "provider": PROVIDER,
-                        "reason": "Bitok: API не вернул id проверки"}
+        async with asyncio.timeout(cfg["timeout"]):
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
+                check_data = await _request(
+                    client, cfg, "POST", "/v1/manual-checks/check-address/",
+                    {"network": cfg["network"], "address": address},
+                )
+                check_id = check_data.get("id")
+                if not check_id:
+                    return {"available": False, "provider": PROVIDER,
+                            "reason": "Bitok: API не вернул id проверки"}
 
-            while check_data.get("check_status") == "checking":
-                # Нужен запас на сам запрос статуса, иначе выйдем за бюджет.
-                if _left() <= POLL_DELAY + 1.0:
-                    break
-                await asyncio.sleep(POLL_DELAY)
-                check_data = await _request(client, cfg, "GET", f"/v1/manual-checks/{check_id}/")
+                while check_data.get("check_status") == "checking":
+                    await asyncio.sleep(POLL_DELAY)
+                    check_data = await _request(
+                        client, cfg, "GET", f"/v1/manual-checks/{check_id}/"
+                    )
 
-            status = check_data.get("check_status")
-            if status == "error":
-                return {"available": False, "provider": PROVIDER,
-                        "reason": "Bitok: проверка завершилась ошибкой на стороне сервиса"}
-            if status != "checked":
-                return {"available": True, "provider": PROVIDER, "pending": True,
-                        "risk_score": None, "risk_level": None, "entities": [],
-                        "details": check_data}
-
-            # Сущность и детальные риски — best-effort: их сбой не ломает результат.
-            # Если бюджет исчерпан, отдаём риск без них: скор важнее имени.
-            entity = entity_category = None
-            risks: list[dict[str, Any]] = []
-            if _left() <= 1.0:
-                return _result(check_data, None, None, [])
-            try:
-                exposure = await _request(
-                    client, cfg, "GET", f"/v1/manual-checks/{check_id}/address-exposure/")
-                if isinstance(exposure, dict):
-                    entity = exposure.get("entity_name")
-                    entity_category = exposure.get("entity_category")
-            except (_BitokHTTPError, httpx.HTTPError, ValueError):
-                pass
-            try:
-                risks_data = await _request(
-                    client, cfg, "GET", f"/v1/manual-checks/{check_id}/risks/")
-                if isinstance(risks_data, list):
-                    risks = [r for r in risks_data if isinstance(r, dict)]
-            except (_BitokHTTPError, httpx.HTTPError, ValueError):
-                pass
+                if check_data.get("check_status") == "checked":
+                    # Сущность и детальные риски — best-effort: их сбой не
+                    # ломает результат, скор важнее имени.
+                    try:
+                        exposure = await _request(
+                            client, cfg, "GET",
+                            f"/v1/manual-checks/{check_id}/address-exposure/",
+                        )
+                        if isinstance(exposure, dict):
+                            entity = exposure.get("entity_name")
+                            entity_category = exposure.get("entity_category")
+                    except (_BitokHTTPError, httpx.HTTPError, ValueError):
+                        pass
+                    try:
+                        risks_data = await _request(
+                            client, cfg, "GET", f"/v1/manual-checks/{check_id}/risks/"
+                        )
+                        if isinstance(risks_data, list):
+                            risks = [r for r in risks_data if isinstance(r, dict)]
+                    except (_BitokHTTPError, httpx.HTTPError, ValueError):
+                        pass
+    except TimeoutError:
+        if check_data is None:
+            return {"available": False, "provider": PROVIDER,
+                    "reason": f"Bitok: превышен бюджет проверки ({cfg['timeout']:g} с)"}
     except _BitokHTTPError as e:
         return {"available": False, "provider": PROVIDER, "reason": f"Bitok: {e}"}
     except (httpx.HTTPError, ValueError) as e:
         return {"available": False, "provider": PROVIDER,
                 "reason": f"Bitok: ошибка соединения ({e})"}
 
+    status = (check_data or {}).get("check_status")
+    if status == "error":
+        return {"available": False, "provider": PROVIDER,
+                "reason": "Bitok: проверка завершилась ошибкой на стороне сервиса"}
+    if status != "checked":
+        # Бюджет кончился, а сервис ещё считает: это «ещё не готово», а не
+        # «чисто» — агрегатор покажет это как pending.
+        return {"available": True, "provider": PROVIDER, "pending": True,
+                "risk_score": None, "risk_level": None, "entities": [],
+                "details": check_data}
     return _result(check_data, entity, entity_category, risks)
 
 
